@@ -21,6 +21,18 @@ videoinfo-gengui/config.local.json
 videoinfo-gengui/config.*.json
 !videoinfo-gengui/config.example.json
 
+# -----------------------------------------------------------------------------
+# 大文件 / 不该进 git 的资源
+# -----------------------------------------------------------------------------
+# 词典库 (SQLite, 800MB+, 走外部下载脚本)
+rn-app/assets/dictionary/
+
+# 桌面端 vendor 二进制 (ffmpeg / ffprobe / yt-dlp, 让用户自己装或文档说明)
+videoinfo-gengui/vendor/
+
+# 桌面端调试音频产物
+videoinfo-gengui/scripts/debug_*.wav
+
 # 通用的 .env (Expo / Next.js / 自定义后端都用)
 .env
 .env.*
