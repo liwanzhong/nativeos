@@ -1,0 +1,183 @@
+# =============================================================================
+# NativeOS root .gitignore
+# rn-app/ has its own .gitignore (Expo / RN), do not duplicate here.
+# videoinfo-gengui/ has no .gitignore, rules below cover it.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 根目录临时文件
+# -----------------------------------------------------------------------------
+.build-pid
+*.pid
+*.tmp
+*.bak
+*.swp
+
+# -----------------------------------------------------------------------------
+# 凭据 / 配置 (重要: 阿里云 OSS / 通义千问 api_key 都在 videoinfo-gengui/config.json)
+# -----------------------------------------------------------------------------
+videoinfo-gengui/config.json
+videoinfo-gengui/config.local.json
+videoinfo-gengui/config.*.json
+!videoinfo-gengui/config.example.json
+
+# 通用的 .env (Expo / Next.js / 自定义后端都用)
+.env
+.env.*
+!.env.example
+.envrc
+
+# -----------------------------------------------------------------------------
+# Python (videoinfo-gengui)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# venv / poetry / pdm
+venv/
+.venv/
+env/
+ENV/
+.venv.bak/
+.python-version
+
+# PyInstaller / cx_Freeze 打包产物
+videoinfo-gengui/build/
+videoinfo-gengui/dist/
+videoinfo-gengui/*.spec.bak
+videoinfo-gengui/*.onefile-build/
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Notebook
+.ipynb_checkpoints/
+
+# -----------------------------------------------------------------------------
+# Node / JS / TypeScript 兜底
+# (rn-app 自己有 .gitignore,这里只兜根目录和未来可能新增的 Node 子项目)
+# -----------------------------------------------------------------------------
+node_modules/
+.npm
+.eslintcache
+.stylelintcache
+.parcel-cache/
+*.tsbuildinfo
+*.js.map
+*.d.ts.map
+
+# Expo
+.expo/
+.expo-shared/
+web-build/
+
+# React Native / Native
+android/build/
+android/app/build/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/captures/
+android/.cxx/
+android/app/release/
+android/app/debug/
+ios/build/
+ios/Pods/
+ios/*.xcworkspace/xcuserdata/
+ios/*.xcodeproj/xcuserdata/
+*.orig.*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.apk
+*.aab
+*.ipa
+
+# Metro
+.metro-health-check*
+
+# -----------------------------------------------------------------------------
+# 操作系统
+# -----------------------------------------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_view.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS / Linux
+.DS_Store
+.AppleDouble
+.LSOverride
+.fseventsd
+.Spotlight-V100
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# -----------------------------------------------------------------------------
+# IDE / 编辑器
+# -----------------------------------------------------------------------------
+.idea/
+.vscode/
+.vs/
+*.iml
+*.ipr
+*.iws
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.project
+.classpath
+.settings/
+nbproject/
+nbbuild/
+nbdist/
+.nb-gradle/
+
+# -----------------------------------------------------------------------------
+# 日志
+# -----------------------------------------------------------------------------
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# -----------------------------------------------------------------------------
+# Supabase / 部署产物
+# (supabase/migrations/ 是 schema, 必须 commit, 不要 ignore)
+# -----------------------------------------------------------------------------
+supabase/.branches/
+supabase/.temp/
+supabase/.env
+supabase/.env.local
+
+# -----------------------------------------------------------------------------
+# 文档站 / 静态站点本地构建
+# -----------------------------------------------------------------------------
+docs/.vitepress/cache/
+docs/.vuepress/.cache/
+.docusaurus/
+
+# -----------------------------------------------------------------------------
+# 大文件 / 二进制 (按需开启; docs/react-native-live2d-0.1.0.tgz 是本地 tgz, 暂保留追踪)
+# -----------------------------------------------------------------------------
+# *.tgz
+# *.tar.gz
+# *.zip

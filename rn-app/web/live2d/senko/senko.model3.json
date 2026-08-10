@@ -1,0 +1,41 @@
+{
+  "Version": 3,
+  "Name": "Senko",
+  "FileReferences": {
+    "Moc": "senko_normal.moc3",
+    "Textures": [
+      "texture_00.png"
+    ],
+    "Physics": "senko.physics3.json",
+    "Motions": {
+      "Idle": [
+        {
+          "Name": "Idle",
+          "File": "Idle.motion3.json",
+          "Weight": 1
+        }
+      ]
+    }
+  },
+  "Groups": [
+    {
+      "Target": "Parameter",
+      "Name": "EyeBlink",
+      "Text": ""
+    },
+    {
+      "Target": "Parameter",
+      "Name": "LipSync",
+      "Text": ""
+    }
+  ],
+  "HitAreas": [
+    {
+      "Name": "head",
+      "Id": "head"
+    }
+  ],
+  "LipSync": true,
+  "AutoBreath": true,
+  "AnisoLevel": 2
+}

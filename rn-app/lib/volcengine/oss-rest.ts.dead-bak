@@ -1,0 +1,547 @@
+/**
+ * 阿里云 OSS REST 客户端（纯 JS，零依赖）
+ *
+ * 为什么不用 ali-oss SDK：
+ *   - ali-oss 依赖 `address` 库做 promise chain，在 RN 0.83 + Hermes 下
+ *     会进无限递归（safeThen 互相 await），触发 "Maximum call stack size exceeded"
+ *   - ali-oss 还带 urllib / utility 等大依赖，对一个文件 ASR 中转用途来说太重
+ *
+ * PUT 走 multipart upload 而不是 simple PUT（2026-08-07 实测）：
+ *   - RN 0.83 + Hermes 的 fetch PUT 大 binary body：静默挂起无响应
+ *   - RN 0.83 + Hermes 的 XMLHttpRequest PUT 大 binary body：body 传 1 字节后
+ *     XHR 内部直接 done status=0 触发 onerror
+ *   - expo-file-system.uploadAsync simple PUT 大 body：emulator 上 100-continue
+ *     协商卡死，永远不发 body
+ *   - **multipart upload**：把 2.8MB 切成 4 片 720KB，每片独立 PUT（小 body
+ *     不会卡 100-continue），最后合并。是阿里云 OSS 处理大文件的标准做法，
+ *     对网络层友好，emulator 真机都稳定
+ *
+ * 这里只实现 ASR 字幕生成需要的 3 个操作：
+ *   1) PUT  object（上传 wav）— multipart upload
+ *   2) sign GetURL（生成 1h 签名 URL 给火山 ASR 拉 wav）— 纯 JS 算
+ *   3) DELETE object（30s 用完即删）— 用 fetch（无 body，应该不卡）
+ *
+ * 签名算法：v1（HMAC-SHA1，跟桌面端 oss2 保持完全一致）
+ */
+
+import { Buffer } from 'buffer';
+import * as FileSystem from 'expo-file-system/legacy';
+
+// ---------------------------------------------------------------------------
+// SHA-1 + HMAC-SHA1 纯 JS 实现
+// ---------------------------------------------------------------------------
+
+function rotl(n: number, b: number): number {
+  return ((n << b) | (n >>> (32 - b))) >>> 0;
+}
+
+function sha1(message: Uint8Array): Uint8Array {
+  // 初始化 5 个 32-bit hash 值
+  let h0 = 0x67452301;
+  let h1 = 0xefcdab89;
+  let h2 = 0x98badcfe;
+  let h3 = 0x10325476;
+  let h4 = 0xc3d2e1f0;
+
+  // 预处理：补位 + 长度
+  const ml = message.length * 8; // 原消息 bit 长度
+  // 补 1 + 0，补到 ≡ 448 (mod 512)，单位 byte
+  const padLen = (((message.length + 9 + 63) >> 6) << 6) - message.length;
+  const buf = new Uint8Array(message.length + padLen);
+  buf.set(message);
+  buf[message.length] = 0x80;
+  // 末尾 8 bytes 写 bit 长度（大端）
+  // 注意：JS 位运算 shift count 只取低 5 位（`>>> 32` 等于 `>>> 0`），
+  // 所以不能用 `ml >>> (i * 8)` 写第 5-8 字节，改用逐字节除 256 写。
+  let mlHi = Math.floor(ml / 0x100000000);
+  let mlLo = ml >>> 0;
+  for (let i = 0; i < 4; i++) {
+    buf[buf.length - 1 - i] = mlLo & 0xff;
+    mlLo = Math.floor(mlLo / 256);
+  }
+  for (let i = 4; i < 8; i++) {
+    buf[buf.length - 1 - i] = mlHi & 0xff;
+    mlHi = Math.floor(mlHi / 256);
+  }
+
+  // 处理每个 512-bit (64-byte) 块
+  const w = new Uint32Array(80);
+  for (let chunk = 0; chunk < buf.length; chunk += 64) {
+    for (let i = 0; i < 16; i++) {
+      const off = chunk + i * 4;
+      w[i] = ((buf[off] << 24) | (buf[off + 1] << 16) | (buf[off + 2] << 8) | buf[off + 3]) >>> 0;
+    }
+    for (let i = 16; i < 80; i++) {
+      w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+
+    let a = h0;
+    let b = h1;
+    let c = h2;
+    let d = h3;
+    let e = h4;
+
+    for (let i = 0; i < 80; i++) {
+      let f: number;
+      let k: number;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+      const temp = (rotl(a, 5) + f + e + k + w[i]) >>> 0;
+      e = d;
+      d = c;
+      c = rotl(b, 30);
+      b = a;
+      a = temp;
+    }
+
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+
+  const out = new Uint8Array(20);
+  const hs = [h0, h1, h2, h3, h4];
+  for (let i = 0; i < 5; i++) {
+    out[i * 4] = (hs[i] >>> 24) & 0xff;
+    out[i * 4 + 1] = (hs[i] >>> 16) & 0xff;
+    out[i * 4 + 2] = (hs[i] >>> 8) & 0xff;
+    out[i * 4 + 3] = hs[i] & 0xff;
+  }
+  return out;
+}
+
+function hmacSha1(key: Uint8Array, message: Uint8Array): Uint8Array {
+  const blockSize = 64;
+  let k = key;
+  if (k.length > blockSize) {
+    k = sha1(k);
+  }
+  const padded = new Uint8Array(blockSize);
+  padded.set(k);
+
+  const ipad = new Uint8Array(blockSize);
+  const opad = new Uint8Array(blockSize);
+  for (let i = 0; i < blockSize; i++) {
+    ipad[i] = padded[i] ^ 0x36;
+    opad[i] = padded[i] ^ 0x5c;
+  }
+
+  const inner = new Uint8Array(blockSize + message.length);
+  inner.set(ipad);
+  inner.set(message, blockSize);
+  const innerHash = sha1(inner);
+
+  const outer = new Uint8Array(blockSize + innerHash.length);
+  outer.set(opad);
+  outer.set(innerHash, blockSize);
+  return sha1(outer);
+}
+
+// ---------------------------------------------------------------------------
+// Base64（RN 自带 btoa/atob 不支持非 latin1；手动实现更稳）
+// ---------------------------------------------------------------------------
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function base64Encode(bytes: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += B64[b0 >> 2];
+    out += B64[((b0 & 0x03) << 4) | (b1 >> 4)];
+    out += i + 1 < bytes.length ? B64[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+    out += i + 2 < bytes.length ? B64[b2 & 0x3f] : '=';
+  }
+  return out;
+}
+
+function utf8Encode(s: string): Uint8Array {
+  // TextEncoder 在 RN/Hermes 里是支持的
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(s);
+  }
+  // fallback: 手动 UTF-8 编码
+  const out: number[] = [];
+  for (let i = 0; i < s.length; i++) {
+    let c = s.charCodeAt(i);
+    if (c < 0x80) {
+      out.push(c);
+    } else if (c < 0x800) {
+      out.push(0xc0 | (c >> 6));
+      out.push(0x80 | (c & 0x3f));
+    } else if (c < 0xd800 || c >= 0xe000) {
+      out.push(0xe0 | (c >> 12));
+      out.push(0x80 | ((c >> 6) & 0x3f));
+      out.push(0x80 | (c & 0x3f));
+    } else {
+      // surrogate pair
+      i++;
+      const c2 = s.charCodeAt(i);
+      c = 0x10000 + (((c & 0x3ff) << 10) | (c2 & 0x3ff));
+      out.push(0xf0 | (c >> 18));
+      out.push(0x80 | ((c >> 12) & 0x3f));
+      out.push(0x80 | ((c >> 6) & 0x3f));
+      out.push(0x80 | (c & 0x3f));
+    }
+  }
+  return new Uint8Array(out);
+}
+
+// ---------------------------------------------------------------------------
+// OSS REST API
+// ---------------------------------------------------------------------------
+
+export interface OssConfig {
+  endpoint: string;     // e.g. "https://oss-cn-beijing.aliyuncs.com"
+  bucket: string;       // e.g. "nativeos"
+  accessKeyId: string;
+  accessKeySecret: string;
+}
+
+function buildAuthHeader(
+  cfg: OssConfig,
+  verb: string,
+  objectKey: string,
+  contentType: string,
+  contentMd5Base64: string,
+  date: string,
+  canonicalizedHeaders: string,
+): { authorization: string; canonicalizedResource: string } {
+  // virtual-hosted style: canonicalizedResource 不带 bucket 段
+  const canonicalizedResource = `/${objectKey}`;
+  const stringToSign = [
+    verb,
+    contentMd5Base64,
+    contentType,
+    date,
+    canonicalizedHeaders,
+    canonicalizedResource,
+  ].join('\n');
+  const secretKeyBytes = utf8Encode(cfg.accessKeySecret);
+  const stringToSignBytes = utf8Encode(stringToSign);
+  const sigBytes = hmacSha1(secretKeyBytes, stringToSignBytes);
+  const sig = base64Encode(sigBytes);
+  return {
+    authorization: `OSS ${cfg.accessKeyId}:${sig}`,
+    canonicalizedResource,
+  };
+}
+
+function httpDate(): string {
+  // RFC 1123 GMT 格式，跟 oss2.put_object_from_file 用的一致
+  const d = new Date();
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const pad = (n: number) => (n < 10 ? '0' + n : '' + n);
+  return (
+    days[d.getUTCDay()] + ', ' +
+    pad(d.getUTCDate()) + ' ' +
+    months[d.getUTCMonth()] + ' ' +
+    d.getUTCFullYear() + ' ' +
+    pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + ' GMT'
+  );
+}
+
+/**
+ * 拼出 OSS 对象的完整 URL。
+ *
+ * 跟 desktop `oss2.Bucket.put_object / sign_url` 默认行为一致：
+ *   - desktop 端用 path-style: `https://<endpoint>/<bucket>/<key>`
+ *   - 比如 `https://oss-cn-beijing.aliyuncs.com/nativeos/app/asr-tmp/xxx.wav`
+ *
+ * NativeOS 端（2026-08-07 实测）：path-style 域名 `oss-cn-beijing.aliyuncs.com`
+ * 在 Android emulator 上传 PUT 永远不返回 response（fetch / XHR 都卡死），
+ * 但 video 列表走 virtual-hosted `nativeos.oss-cn-beijing.aliyuncs.com`
+ * 的 GET 一切正常。所以 NativeOS 单独切到 virtual-hosted style：
+ *   - URL: `https://<bucket>.<endpoint>/<key>`
+ *   - 比如 `https://nativeos.oss-cn-beijing.aliyuncs.com/app/asr-tmp/xxx.wav`
+ *
+ * virtual-hosted style 下签名规则（v1）：
+ *   - canonicalizedResource = `/<key>` （不带 bucket 段，跟 path-style 不一样）
+ *
+ * 跟 desktop 端不对齐是已知权衡 — desktop 走 path-style 是网络通的，
+ * NativeOS 走 virtual-hosted 才能通。
+ */
+const BUCKET = 'nativeos';
+
+function buildObjectUrl(cfg: OssConfig, objectKey: string): string {
+  // virtual-hosted: <bucket>.<host>/<key>
+  // endpoint 形如 "https://oss-cn-beijing.aliyuncs.com"
+  // 去掉协议头，把 host 段拼成 "<bucket>.<host>"
+  const endpointNoScheme = cfg.endpoint.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  return `https://${BUCKET}.${endpointNoScheme}/${encodeURI(objectKey).replace(/%2F/g, '/')}`;
+}
+
+/**
+ * PUT 上传（覆盖语义）。等效 oss2.Bucket.put_object(key, data)。
+ *
+ * 用 multipart upload 而不是 simple PUT（2026-08-07 实测）：
+ *   - simple PUT 在 emulator 上 100-continue 协商卡死，永远不发 body
+ *   - multipart 把 wav 切成小片（每片 1MB）独立 PUT，小 body 不触发
+ *     100-continue，emulator 真机都稳定
+ *
+ * 流程（3 个 HTTP 调用）：
+ *   1) InitiateMultipartUpload（POST ?uploads）→ 拿 uploadId
+ *   2) UploadPart × N（PUT ?partNumber=N&uploadId=X）→ 每片拿 ETag
+ *   3) CompleteMultipartUpload（POST ?uploadId=X + XML 列出所有 part ETag）→ 完成
+ *
+ * 每片通过 expo-file-system.uploadAsync 上传（走 native OkHttp，独立
+ * code path），最后用 fetch 调 initiate / complete（XML body 小不卡）。
+ */
+export async function ossPutObject(
+  cfg: OssConfig,
+  objectKey: string,
+  data: Uint8Array | Buffer,
+  contentType: string,
+): Promise<{ status: number; etag?: string }> {
+  console.log('[OSS] PUT start (multipart)', {
+    objectKey,
+    size: data.byteLength,
+    cfg: { endpoint: cfg.endpoint, bucket: cfg.bucket, accessKeyIdPreview: cfg.accessKeyId.slice(0, 6) + '…' },
+  });
+
+  // Part size：1MB。OSS 限制 min 100KB（除最后一片）/ max 5GB / 最多 10000 片
+  // 2.8MB → 3 片（1MB + 1MB + 0.8MB）。小到不会触发 OkHttp 100-continue
+  const PART_SIZE = 1024 * 1024;
+  const totalSize = data.byteLength;
+  const partCount = Math.max(1, Math.ceil(totalSize / PART_SIZE));
+
+  // 临时目录
+  const cacheDir = `${FileSystem.cacheDirectory ?? ''}oss-multipart-${Date.now()}/`;
+  try {
+    const info = await FileSystem.getInfoAsync(cacheDir);
+    if (!info.exists) {
+      await FileSystem.makeDirectoryAsync(cacheDir, { intermediates: true });
+    }
+  } catch (mkdirErr) {
+    console.warn('[OSS] multipart cache dir setup warning', { err: String(mkdirErr) });
+  }
+
+  // 写过的 part 临时文件，最后统一删
+  const partFileUris: string[] = [];
+
+  try {
+    // ─── Step 1: InitiateMultipartUpload ─────────────────────────────────
+    // POST /<key>?uploads, body 是空 XML（OSS 仍要求 Content-Type: application/xml）
+    // OSS v1 签名：6 段 — VERB / Content-MD5 / Content-Type / Date / CanonicalizedOSSHeaders / CanonicalizedResource
+    // 不要漏第 5 段（CanonicalizedOSSHeaders = ""）！
+    const initDate = httpDate();
+    const initCanonical = `/${objectKey}?uploads`;
+    const initStringToSign = ['POST', '', 'application/xml', initDate, '', initCanonical].join('\n');
+    const initSig = base64Encode(
+      hmacSha1(utf8Encode(cfg.accessKeySecret), utf8Encode(initStringToSign)),
+    );
+    const initAuth = `OSS ${cfg.accessKeyId}:${initSig}`;
+    const initUrl = `${buildObjectUrl(cfg, objectKey)}?uploads`;
+
+    console.log('[OSS] multipart initiate', { initUrl });
+    const initResp = await fetch(initUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': initAuth,
+        'Date': initDate,
+        'Content-Type': 'application/xml',
+        'Content-Length': '0',
+      },
+      body: '',
+    });
+    if (!initResp.ok) {
+      const errBody = (await initResp.text()).slice(0, 500);
+      throw new Error(`OSS InitiateMultipartUpload 失败: ${initResp.status} ${errBody}`);
+    }
+    const initXml = await initResp.text();
+    // 简单正则：<UploadId>xxx</UploadId>
+    const uploadIdMatch = initXml.match(/<UploadId>([^<]+)<\/UploadId>/);
+    if (!uploadIdMatch) {
+      throw new Error(`OSS InitiateMultipartUpload 响应无 UploadId: ${initXml.slice(0, 300)}`);
+    }
+    const uploadId = uploadIdMatch[1];
+    console.log('[OSS] multipart initiate OK', { uploadId });
+
+    // ─── Step 2: UploadPart × N ─────────────────────────────────────────
+    // 每片独立 PUT，小 body 不卡 100-continue
+    const partEtags: Array<{ partNumber: number; etag: string }> = [];
+    for (let i = 0; i < partCount; i++) {
+      const partNumber = i + 1;
+      const start = i * PART_SIZE;
+      const end = Math.min(start + PART_SIZE, totalSize);
+      const partData = data.subarray(start, end);
+      const partByteLength = partData.byteLength;
+      // base64 写临时文件
+      const partBase64 = Buffer.from(partData).toString('base64');
+      const partFileUri = `${cacheDir}part-${partNumber}.bin`;
+      await FileSystem.writeAsStringAsync(partFileUri, partBase64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+      partFileUris.push(partFileUri);
+      const partInfo = await FileSystem.getInfoAsync(partFileUri, { size: true });
+      const partFileSize = (partInfo as any).size ?? partByteLength;
+      console.log('[OSS] multipart upload part start', {
+        partNumber,
+        bytes: partByteLength,
+        fileSize: partFileSize,
+        partFileUri,
+      });
+
+      const partDate = httpDate();
+      const partCanonical = `/${objectKey}?partNumber=${partNumber}&uploadId=${uploadId}`;
+      const partStringToSign = ['PUT', '', contentType, partDate, '', partCanonical].join('\n');
+      const partSig = base64Encode(
+        hmacSha1(utf8Encode(cfg.accessKeySecret), utf8Encode(partStringToSign)),
+      );
+      const partAuth = `OSS ${cfg.accessKeyId}:${partSig}`;
+      const partUrl = `${buildObjectUrl(cfg, objectKey)}?partNumber=${partNumber}&uploadId=${uploadId}`;
+
+      const partResult = await FileSystem.uploadAsync(partUrl, partFileUri, {
+        httpMethod: 'PUT',
+        headers: {
+          'Authorization': partAuth,
+          'Date': partDate,
+          'Content-Type': contentType,
+          'Content-Length': String(partFileSize),
+        },
+        uploadType: (FileSystem as any).FileSystemUploadType?.BINARY_CONTENT ?? 0,
+      });
+
+      if (partResult.status < 200 || partResult.status >= 300) {
+        const errBody = (partResult.body ?? '').slice(0, 500);
+        throw new Error(`OSS UploadPart ${partNumber} 失败: ${partResult.status} ${errBody}`);
+      }
+      // ETag 在响应头里（OSS 会返回带引号的 ETag，去掉引号）
+      const partHeaders = partResult.headers ?? {};
+      const rawEtag = (partHeaders as any).ETag ?? (partHeaders as any).etag ?? '';
+      const etag = rawEtag.replace(/^"|"$/g, '');
+      if (!etag) {
+        throw new Error(`OSS UploadPart ${partNumber} 响应无 ETag`);
+      }
+      partEtags.push({ partNumber, etag });
+      console.log('[OSS] multipart upload part OK', { partNumber, etag });
+    }
+
+    // ─── Step 3: CompleteMultipartUpload ───────────────────────────────
+    // POST ?uploadId=X, body 是 XML 列出所有 part
+    const completeDate = httpDate();
+    const completeCanonical = `/${objectKey}?uploadId=${uploadId}`;
+    const completeBody =
+      '<CompleteMultipartUpload>' +
+      partEtags
+        .sort((a, b) => a.partNumber - b.partNumber)
+        .map((p) => `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${p.etag}</ETag></Part>`)
+        .join('') +
+      '</CompleteMultipartUpload>';
+    const completeStringToSign = ['POST', '', 'application/xml', completeDate, '', completeCanonical].join('\n');
+    const completeSig = base64Encode(
+      hmacSha1(utf8Encode(cfg.accessKeySecret), utf8Encode(completeStringToSign)),
+    );
+    const completeAuth = `OSS ${cfg.accessKeyId}:${completeSig}`;
+    const completeUrl = `${buildObjectUrl(cfg, objectKey)}?uploadId=${uploadId}`;
+
+    console.log('[OSS] multipart complete', { completeUrl, bodyLen: completeBody.length });
+    const completeBodyByteLen = Buffer.byteLength(completeBody, 'utf8');
+    const completeResp = await fetch(completeUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': completeAuth,
+        'Date': completeDate,
+        'Content-Type': 'application/xml; charset=utf-8',
+        'Content-Length': String(completeBodyByteLen),
+      },
+      body: completeBody,
+    });
+    if (!completeResp.ok) {
+      const errBody = (await completeResp.text()).slice(0, 500);
+      throw new Error(`OSS CompleteMultipartUpload 失败: ${completeResp.status} ${errBody}`);
+    }
+
+    console.log('[OSS] PUT multipart done', {
+      objectKey,
+      totalSize,
+      partCount,
+      uploadId,
+    });
+    return { status: completeResp.status, etag: partEtags[partEtags.length - 1]?.etag };
+  } finally {
+    // 清掉所有 part 临时文件（best-effort）
+    for (const partUri of partFileUris) {
+      try {
+        await FileSystem.deleteAsync(partUri, { idempotent: true });
+      } catch (delErr) {
+        console.warn('[OSS] multipart temp file cleanup failed (best-effort)', { partUri, err: String(delErr) });
+      }
+    }
+    // 清目录
+    try {
+      await FileSystem.deleteAsync(cacheDir, { idempotent: true });
+    } catch (delErr) {
+      // ignore
+    }
+  }
+}
+
+/**
+ * 生成 1h 签名 URL（GET）。等效 oss2.Bucket.sign_url('GET', key, 3600)。
+ * 不需要发 HTTP 请求，纯本地算。
+ */
+export function ossSignGetUrl(
+  cfg: OssConfig,
+  objectKey: string,
+  expiresInSeconds: number,
+): string {
+  // OSS GET 签名 URL 规则（v1）：
+  //   StringToSign = "GET\n\n\n<Expires>\n/<bucket>/<key>"
+  //   URL = endpoint + /bucket + / + key + "?Expires=...&..."
+  // path-style 跟 desktop 端 sign_url 行为一致
+  const expires = Math.floor(Date.now() / 1000) + expiresInSeconds;
+  // virtual-hosted style: canonicalizedResource 不带 bucket 段
+  const canonicalizedResource = `/${objectKey}`;
+  const stringToSign = `GET\n\n\n${expires}\n${canonicalizedResource}`;
+  const sigBytes = hmacSha1(utf8Encode(cfg.accessKeySecret), utf8Encode(stringToSign));
+  const sig = base64Encode(sigBytes);
+  const baseUrl = buildObjectUrl(cfg, objectKey);
+  // Signature / OSSAccessKeyId / Expires 在 query 里需要 URL-encode
+  const params = `Expires=${expires}&OSSAccessKeyId=${encodeURIComponent(cfg.accessKeyId)}&Signature=${encodeURIComponent(sig)}`;
+  return `${baseUrl}?${params}`;
+}
+
+/**
+ * DELETE 临时文件。404 视为成功（already-gone）。
+ */
+export async function ossDeleteObject(
+  cfg: OssConfig,
+  objectKey: string,
+): Promise<{ status: number }> {
+  const url = buildObjectUrl(cfg, objectKey);
+  const date = httpDate();
+  const { authorization } = buildAuthHeader(cfg, 'DELETE', objectKey, '', '', date, '');
+
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': authorization,
+      'Date': date,
+    },
+  });
+  if (response.status === 404) {
+    return { status: 404 };
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error(`OSS DELETE 失败: ${response.status} ${response.statusText} ${body.slice(0, 300)}`);
+  }
+  return { status: response.status };
+}

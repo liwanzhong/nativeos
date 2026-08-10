@@ -1,0 +1,4 @@
+PySide6>=6.6,<7
+oss2>=2.18,<3
+psutil>=5.9
+PyInstaller>=6.0,<7

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "title": "官方推荐视频转存入口",
+  "intro": "请先复制下面的网盘分享信息，自行转存到你的个人网盘。转存完成后，再回到 App 中从视频详情页或绑定入口选择对应文件即可播放。",
+  "updatedAt": "2026-04-22T00:00:00.000Z",
+  "providers": [
+    {
+      "provider": "baidu_pan",
+      "label": "百度网盘",
+      "shareUrl": "https://pan.baidu.com/s/1ZVNBBWcQfgMuxKkwD6PuhA?pwd=1rn7",
+      "accessCode": "1rn7",
+      "description": "这里放的是 NativeOS 官方推荐视频分享目录，也可以复制百度网盘口令到百度网盘 App 中打开。",
+      "saveHint": "建议整目录转存到你常用的同步目录，后续在 App 中绑定会更方便。",
+      "steps": [
+        "复制链接后在百度网盘中打开，或使用百度网盘口令在 App 内打开。",
+        "完成转存后，回到 App 里绑定对应视频文件。"
+      ],
+      "copyText": "百度网盘推荐视频转存信息\n链接：https://pan.baidu.com/s/1ZVNBBWcQfgMuxKkwD6PuhA?pwd=1rn7\n提取码：1rn7\n口令：&&协冮皎级舵乃偏泉旅戏#"
+    }
+  ],
+  "notes": [
+    "请先确认你已经登录对应网盘账号。",
+    "建议将官方视频保存在你常用的同步目录下，后续绑定更方便。"
+  ]
+}

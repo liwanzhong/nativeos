@@ -1,0 +1,20 @@
+/* Web-specific styles for NativeOS */
+
+/* Fix bottom tab bar height and padding */
+[role="tablist"] {
+  height: 100px !important;
+  padding-bottom: 40px !important;
+  padding-top: 8px !important;
+}
+
+/* Ensure tab buttons have proper spacing */
+[role="tab"] {
+  padding-bottom: 8px !important;
+}
+
+/* Fix tab label visibility */
+[role="tab"] span:last-child {
+  margin-top: 4px !important;
+  margin-bottom: 0 !important;
+  display: block !important;
+}
