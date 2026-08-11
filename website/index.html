@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#2563EB" />
+  <meta name="format-detection" content="telephone=no" />
+  <meta name="robots" content="index, follow" />
+  <title>NativeOS — 把英语视频变成你说得出来的英语 | 英语口语学习 App</title>
+  <meta name="description" content="NativeOS 是一款英语口语学习 Android 应用。从真实英语视频中理解表达，在 AI 情景任务中开口练习，把值得记住的内容交给个人知识库。" />
+  <meta name="keywords" content="英语口语,英语学习,口语练习,AI陪练,英语视频,影子跟读,精听,NativeOS,tofitit" />
+  <meta name="author" content="NativeOS" />
+  <link rel="canonical" href="https://tofitit.com/" />
+  <link rel="icon" href="icon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="icon.png" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="NativeOS — 把英语视频变成你说得出来的英语" />
+  <meta property="og:description" content="从真实英语视频中理解表达，在 AI 情景任务中开口练习，把值得记住的内容交给个人知识库。" />
+  <meta property="og:image" content="https://tofitit.com/og-image.jpg" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:url" content="https://tofitit.com/" />
+  <meta property="og:site_name" content="NativeOS" />
+  <meta property="og:locale" content="zh_CN" />
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="NativeOS — 把英语视频变成你说得出来的英语" />
+  <meta name="twitter:description" content="从真实英语视频中理解表达，在 AI 情景任务中开口练习，把值得记住的内容交给个人知识库。" />
+  <meta name="twitter:image" content="https://tofitit.com/og-image.jpg" />
+
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- Schema.org: SoftwareApplication -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "NativeOS",
+    "operatingSystem": "ANDROID",
+    "applicationCategory": "EducationalApplication",
+    "description": "NativeOS 是一款英语口语学习 Android 应用。从真实英语视频中理解表达，在 AI 情景任务中开口练习，把值得记住的内容交给个人知识库。",
+    "url": "https://tofitit.com/",
+    "image": "https://tofitit.com/og-image.jpg",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "CNY"
+    }
+  }
+  </script>
+
+  <!-- Schema.org: Organization -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "Organization",
+    "name": "NativeOS",
+    "url": "https://tofitit.com/",
+    "logo": "https://tofitit.com/icon.png",
+    "description": "NativeOS 是一款英语口语学习应用。"
+  }
+  </script>
+
+  <!-- Schema.org: HowTo (五步练习法) -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "HowTo",
+    "name": "NativeOS 五步英语口语练习法",
+    "description": "基于克拉申自然习得理论，每段视频按顺序走完五步，形成完整的习得单元。70% 的时间用于精听和磨耳朵，30% 用于跟读和复述。坚持不中断，是这套方法生效的唯一前提。",
+    "totalTime": "PT30M",
+    "step": [
+      {
+        "@type": "HowToStep",
+        "position": 1,
+        "name": "场景化视频输入",
+        "text": "反复观看适合自己水平的英文视频。重点是必须有具体的场景和画面，是能看见人物、动作、环境的视频，让声音和情境产生直接联系。"
+      },
+      {
+        "@type": "HowToStep",
+        "position": 2,
+        "name": "盲听 · 反复磨耳朵",
+        "text": "反复盲听同一段，不要暂停、不要查词、不要字幕，直到能听出大致内容、情绪和说话人的节奏。"
+      },
+      {
+        "@type": "HowToStep",
+        "position": 3,
+        "name": "精听 · 反复啃透",
+        "text": "反复精听同一段，逐句循环。点击不认识的词查词典，把真正卡住的地方反复听清，收藏值得记住的句子。"
+      },
+      {
+        "@type": "HowToStep",
+        "position": 4,
+        "name": "影子跟读 · 反复跟读",
+        "text": "反复跟着字幕按住麦克风同步跟读同一段。目的不是发音准，而是逼大脑同时理解和产出，跟到能跟上原声节奏为止。"
+      },
+      {
+        "@type": "HowToStep",
+        "position": 5,
+        "name": "复述 + AI 对练 · 反复输出",
+        "text": "关掉字幕，反复用自己的话把内容说出来，再反复进入 AI 情景任务，在真实对话里把刚内化的表达用出来。"
+      }
+    ]
+  }
+  </script>
+
+  <!-- Schema.org: FAQPage -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "NativeOS 适合什么水平？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "NativeOS 支持 A1-C2 全等级。初次使用时可选择自己的真实水平，系统会按等级和兴趣推荐内容与 AI 话题。基础较弱的用户可全程使用中文翻译、回复提示和跟读辅助。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "AI 陪练和普通 AI 聊天有什么区别？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "NativeOS 的对话有具体角色、环境和任务目标，结合语音识别、表达反馈、跟读辅助及知识库沉淀。用户需要真正完成任务，而不是自由聊天。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "可以使用自己的视频吗？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "支持导入手机本地视频，也支持从已连接的百度网盘导入内容。导入后 AI 可自动生成双语字幕，并延展出对应的 AI 陪练话题。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "说错了会怎样？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "AI 会优先保证对话继续，在真正影响表达时给出纠正建议，并区分语言错误和语音识别异常。纠正后的表达可一键收藏进入复习队列。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "收藏的内容会去哪里？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "单词、句子和纠正后的表达会进入个人知识库，并附带来源（视频或陪练）。系统基于 FSRS 算法按记忆状态安排复习，不让收藏变成被遗忘的清单。"
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "是否必须付费？",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "可免费体验核心功能。Pro 会员提供更大的 AI 对话、语音识别、语音朗读与视频字幕额度；也支持 BYOK，使用自己的 API Key 绕过额度限制。"
+        }
+      }
+    ]
+  }
+  </script>
+
+  <!-- Schema.org: BreadcrumbList -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      {
+        "@type": "ListItem",
+        "position": 1,
+        "name": "首页",
+        "item": "https://tofitit.com/"
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+
+<!-- ===== NAV ===== -->
+<nav class="nav" id="nav">
+  <div class="nav-inner">
+    <a class="nav-logo" href="#">
+      <img class="logo-img" src="icon.png" alt="NativeOS" />
+      <span class="logo-text">NativeOS</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#how">推荐习得实践</a></li>
+      <li><a href="#video">视频跟练</a></li>
+      <li><a href="#practice">AI 陪练</a></li>
+      <li><a href="#library">个人知识库</a></li>
+      <li><a href="#faq">常见问题</a></li>
+    </ul>
+    <a class="btn btn-sm" href="#download">下载应用</a>
+    <button class="nav-hamburger" id="hamburger" aria-label="菜单">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+  <div class="nav-mobile" id="nav-mobile">
+    <a href="#how">推荐习得实践</a>
+    <a href="#video">视频跟练</a>
+    <a href="#practice">AI 陪练</a>
+    <a href="#library">个人知识库</a>
+    <a href="#faq">常见问题</a>
+    <a href="#download" class="btn btn-sm">下载应用</a>
+  </div>
+</nav>
+
+<!-- ===== HERO ===== -->
+<section class="hero" id="hero">
+  <div class="container">
+    <div class="hero-text">
+      <p class="eyebrow">英语口语学习应用</p>
+      <h1>把你看过的英语，<br>变成你说得出来的英语。</h1>
+      <p class="hero-sub">从真实视频中理解表达，在 AI 情景中开口使用，<br class="br-lg">再把值得记住的内容交给个人知识库。</p>
+      <ul class="hero-pills">
+        <li>看真实视频，不背脱离语境的词表</li>
+        <li>和 AI 角色完成真实情景任务</li>
+        <li>生词、好句和错误自动进入复习</li>
+      </ul>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#download">下载 Android 版</a>
+        <a class="btn btn-ghost" href="#how">推荐习得实践</a>
+      </div>
+    </div>
+    <div class="hero-screens">
+      <div class="screen screen-back screen-left">
+        <div class="mock-video">
+          <div class="mock-video-bar"></div>
+          <div class="mock-subtitle-line long"></div>
+          <div class="mock-subtitle-line short"></div>
+          <div class="mock-subtitle-zh"></div>
+        </div>
+      </div>
+      <div class="screen screen-main">
+        <div class="mock-chat">
+          <div class="mock-chat-header">
+            <div class="mock-avatar"></div>
+            <div class="mock-npc-info">
+              <div class="mock-npc-name"></div>
+              <div class="mock-npc-role"></div>
+            </div>
+          </div>
+          <div class="mock-bubble mock-bubble-npc">Hey! Are we doing the camping trip this weekend?</div>
+          <div class="mock-bubble mock-bubble-user">Yeah, I was thinking Saturday morning…</div>
+          <div class="mock-bubble mock-bubble-npc">Perfect. Should we bring extra sleeping bags?</div>
+          <div class="mock-mic-row">
+            <div class="mock-mic-btn"></div>
+            <span>按住说话</span>
+          </div>
+        </div>
+      </div>
+      <div class="screen screen-back screen-right">
+        <div class="mock-library">
+          <div class="mock-lib-title">知识库</div>
+          <div class="mock-card-row"><span class="mock-tag word">单词</span><div class="mock-card-content"></div></div>
+          <div class="mock-card-row"><span class="mock-tag sent">句子</span><div class="mock-card-content long"></div></div>
+          <div class="mock-card-row"><span class="mock-tag word">单词</span><div class="mock-card-content med"></div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== HOW ===== -->
+<section class="how" id="how">
+  <div class="container">
+    <p class="section-eyebrow">推荐习得实践</p>
+    <h2>学英语，不该在"看懂"这里结束。</h2>
+    <p class="section-sub">NativeOS 把真实输入、开口练习和长期记忆连接起来。<strong>坚持不中断，是这套方法生效的唯一前提。</strong></p>
+
+    <div class="method-tip">
+      <div class="method-tip-icon"><i data-lucide="lightbulb"></i></div>
+      <div class="method-tip-body">
+        <div class="method-tip-title">选材比方法重要</div>
+        <p>挑自己<span class="hl">真正感兴趣</span>的话题，难度选在<span class="hl">「能听懂大意」</span>的范围就行。别一上来就硬啃 TED 演讲或原生美剧——<strong>越舒服越能坚持，越勉强越练越丧。</strong></p>
+      </div>
+    </div>
+
+    <div class="method-tip method-tip-allocation">
+      <div class="method-tip-icon"><i data-lucide="timer"></i></div>
+      <div class="method-tip-body">
+        <div class="method-tip-title">时间分配 70 / 30</div>
+        <div class="alloc-bar">
+          <div class="alloc-input" style="flex: 70"><span>70% 输入</span></div>
+          <div class="alloc-output" style="flex: 30"><span>30% 输出</span></div>
+        </div>
+        <div class="alloc-legend">
+          <div class="alloc-legend-item">
+            <span class="alloc-dot alloc-dot-input"></span>
+            <strong>输入</strong>：盲听（02） + 精听（03）
+          </div>
+          <div class="alloc-legend-item">
+            <span class="alloc-dot alloc-dot-output"></span>
+            <strong>输出</strong>：跟读（04） + 复述（05）
+          </div>
+        </div>
+        <p>每段视频的练习时间里，<strong>70% 的时间和精力砸在精听和磨耳朵上</strong>——这是<strong>语感的地基</strong>。剩下 30% 留给跟读和复述，把已经吸收的表达变成自己的话。<strong>不要倒过来</strong>。</p>
+      </div>
+    </div>
+
+    <div class="method-steps">
+
+      <div class="method-step">
+        <div class="method-step-top">
+          <div class="method-num">01</div>
+          <div class="method-icon"><i data-lucide="eye"></i></div>
+        </div>
+        <h3>场景化视频输入</h3>
+        <p>反复观看<strong>适合自己水平的英文视频</strong>。重点是必须有<strong>具体的场景和画面</strong>——不是播客、不是纯音频，是能看见人物、动作、环境的视频。让声音和情境产生直接联系，大脑在画面里记住语言，而不是在单词本里。</p>
+        <p class="method-theory">声音脱离画面就是抽象符号——画面是语义的锚点。先建立这个锚点，盲听和精听才有意义。</p>
+      </div>
+
+      <div class="method-arrow">→</div>
+
+      <div class="method-step">
+        <div class="method-step-top">
+          <div class="method-num">02</div>
+          <div class="method-icon"><i data-lucide="ear"></i></div>
+        </div>
+        <h3>盲听 · 反复磨耳朵</h3>
+        <p>反复盲听同一段。不要暂停、不要查词、不要字幕，直到能听出大致内容、情绪和说话人的节奏。</p>
+        <p class="method-theory">培养语感的起点——注意力在内容上，语感在反复磨耳朵中积累。</p>
+      </div>
+
+      <div class="method-arrow">→</div>
+
+      <div class="method-step">
+        <div class="method-step-top">
+          <div class="method-num">03</div>
+          <div class="method-icon"><i data-lucide="search"></i></div>
+        </div>
+        <h3>精听 · 反复啃透</h3>
+        <p>反复精听同一段，逐句循环。点击不认识的词查词典，把真正卡住的地方反复听清。收藏值得记住的句子。</p>
+        <p class="method-theory">深度可理解输入——遵循 Krashen i+1 原则，反复理解略高于当前水平的表达。</p>
+      </div>
+
+      <div class="method-arrow">→</div>
+
+      <div class="method-step">
+        <div class="method-step-top">
+          <div class="method-num">04</div>
+          <div class="method-icon"><i data-lucide="audio-lines"></i></div>
+        </div>
+        <h3>影子跟读 · 反复跟读</h3>
+        <p>反复跟着字幕按住麦克风同步跟读同一段。目的不是发音准，而是逼大脑同时理解和产出——跟到能跟上原声节奏为止。</p>
+        <p class="method-theory">同步激活语言理解与产出回路，是从听懂到说出的神经桥梁。</p>
+      </div>
+
+      <div class="method-arrow">→</div>
+
+      <div class="method-step">
+        <div class="method-step-top">
+          <div class="method-num">05</div>
+          <div class="method-icon"><i data-lucide="message-circle"></i></div>
+        </div>
+        <h3>复述 + AI 对练 · 反复输出</h3>
+        <p>关掉字幕，反复用自己的话把内容说出来；再反复进入 AI 情景任务，在真实对话里把刚内化的表达用出来。</p>
+        <p class="method-theory">反复输出和真实任务才能让习得最终完成——Swain 输出假说 + TBLT 任务型教学。</p>
+      </div>
+
+    </div>
+
+  </div>
+</section>
+
+<!-- ===== VIDEO ===== -->
+<section class="video-section" id="video">
+  <div class="container">
+    <p class="section-eyebrow">视频跟练</p>
+    <h2>从你真正想看的内容开始练。</h2>
+    <p class="section-sub">使用精选视频，或者导入手机与网盘中的内容。字幕、查词、逐句跟读和 AI 延展话题，都围绕同一段真实内容展开。</p>
+    <div class="video-features">
+      <div class="video-feature">
+        <div class="vf-icon"><i data-lucide="download"></i></div>
+        <div class="vf-body">
+          <h3>想看什么，就用什么练</h3>
+          <p>官方内容、本地视频、百度网盘视频都能进入训练流程，AI 自动生成双语字幕。</p>
+        </div>
+      </div>
+      <div class="video-feature">
+        <div class="vf-icon"><i data-lucide="file-text"></i></div>
+        <div class="vf-body">
+          <h3>每一句都能停下来练</h3>
+          <p>双语字幕、单句循环、点击查词和跟读练习，让"没听清"变成"真正掌握"。</p>
+        </div>
+      </div>
+      <div class="video-feature">
+        <div class="vf-icon"><i data-lucide="rocket"></i></div>
+        <div class="vf-body">
+          <h3>看完马上开口</h3>
+          <p>AI 从视频语境中延展出新的情景任务，把输入立即变成输出，不留在"我看懂了"。</p>
+        </div>
+      </div>
+    </div>
+    <div class="video-mock">
+      <div class="vmock-player">
+        <div class="vmock-video-area">
+          <div class="vmock-play-overlay"><i data-lucide="play"></i></div>
+        </div>
+        <div class="vmock-controls">
+          <div class="vmock-progress"><div class="vmock-progress-fill"></div></div>
+          <div class="vmock-btns">
+            <span><i data-lucide="skip-back"></i></span><span><i data-lucide="play"></i></span><span><i data-lucide="skip-forward"></i></span>
+            <span class="vmock-flex"></span>
+            <span><i data-lucide="repeat"></i> 单句循环</span>
+            <span><i data-lucide="languages"></i> 双语</span>
+          </div>
+        </div>
+      </div>
+      <div class="vmock-subtitles">
+        <div class="vmock-seg vmock-seg-active">
+          <span class="vmock-time">0:12</span>
+          <div>
+            <div class="vmock-en">Should we bring extra <span class="vmock-word">sleeping bags</span> just in case?</div>
+            <div class="vmock-zh">以防万一，我们应该多带几个睡袋吗？</div>
+          </div>
+          <span class="vmock-mic"><i data-lucide="mic"></i></span>
+        </div>
+        <div class="vmock-seg">
+          <span class="vmock-time">0:19</span>
+          <div>
+            <div class="vmock-en">Good idea. The weather can be unpredictable.</div>
+            <div class="vmock-zh">好主意。天气可能很难预测。</div>
+          </div>
+        </div>
+        <div class="vmock-seg">
+          <span class="vmock-time">0:25</span>
+          <div>
+            <div class="vmock-en">Let's also pack some extra food and water.</div>
+            <div class="vmock-zh">我们也多带些食物和水吧。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== AI PRACTICE ===== -->
+<section class="practice dark-section" id="practice">
+  <div class="container">
+    <p class="section-eyebrow light">AI 情景陪练</p>
+    <h2 class="light">不是陪你闲聊，<br>而是陪你完成一次真实表达。</h2>
+    <p class="section-sub light">每次陪练都有角色、环境和目标。你需要真正开口处理问题，AI 会继续对话、提供提示，并在需要时纠正表达。</p>
+    <div class="features-grid">
+      <div class="feature-card dark">
+        <div class="feature-icon"><i data-lucide="target"></i></div>
+        <h3>有目标的真实场景</h3>
+        <p>点餐、旅行、面试、汇报、社交，不是漫无目的聊天。每次对话都有明确的任务目标。</p>
+      </div>
+      <div class="feature-card dark">
+        <div class="feature-icon"><i data-lucide="mic"></i></div>
+        <h3>随时开口，不怕说错</h3>
+        <p>按住麦克风说话，AI 理解你的表达并自然回应，低压力的真实沟通练习。</p>
+      </div>
+      <div class="feature-card dark">
+        <div class="feature-icon"><i data-lucide="lightbulb"></i></div>
+        <h3>卡住时给提示</h3>
+        <p>不知道怎么说时，获得符合当前场景和等级的回复建议，并直接进入跟读练习。</p>
+      </div>
+      <div class="feature-card dark">
+        <div class="feature-icon"><i data-lucide="check-circle"></i></div>
+        <h3>纠正真正影响表达的问题</h3>
+        <p>区分语言问题、表达建议和语音识别噪声，不因微小差异频繁打断对话节奏。</p>
+      </div>
+    </div>
+    <div class="practice-demo">
+      <div class="demo-phone">
+        <div class="demo-screen">
+          <div class="demo-header">
+            <div class="demo-back"><i data-lucide="chevron-left"></i></div>
+            <div class="demo-title-area">
+              <span class="demo-active-dot"></span>
+              <span class="demo-scene-title">周末露营计划</span>
+            </div>
+          </div>
+          <div class="demo-avatar-zone">
+            <div class="demo-avatar-circle">
+              <span><i data-lucide="smile"></i></span>
+            </div>
+            <div class="demo-npc-label">Alex · Camping Buddy</div>
+          </div>
+          <div class="demo-messages">
+            <div class="demo-msg npc">Hey! Are we doing the camping trip this weekend?</div>
+            <div class="demo-msg user">Yeah, I was thinking Saturday morning works best.</div>
+            <div class="demo-msg npc">Perfect! Should we bring extra sleeping bags just in case?</div>
+          </div>
+          <div class="demo-input-row">
+            <div class="demo-hint-btn"><i data-lucide="lightbulb"></i></div>
+            <div class="demo-mic"><i data-lucide="mic"></i></div>
+          </div>
+        </div>
+      </div>
+      <div class="demo-callouts">
+        <div class="callout">
+          <div class="callout-icon"><i data-lucide="user-round"></i></div>
+          <div>
+            <strong>角色伙伴</strong>
+            <p>Live2D 角色形象，NPC 说话时口型同步</p>
+          </div>
+        </div>
+        <div class="callout">
+          <div class="callout-icon"><i data-lucide="languages"></i></div>
+          <div>
+            <strong>按需翻译</strong>
+            <p>点击任意句子显示中文，不依赖翻译也能练习</p>
+          </div>
+        </div>
+        <div class="callout">
+          <div class="callout-icon"><i data-lucide="star"></i></div>
+          <div>
+            <strong>一键收藏</strong>
+            <p>对话中的表达直接加入知识库，不会遗忘</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== LIBRARY ===== -->
+<section class="library-section" id="library">
+  <div class="container">
+    <p class="section-eyebrow">个人知识库</p>
+    <h2>只复习你真正遇到过的英语。</h2>
+    <p class="section-sub">视频里没听懂的词、对话里想记住的句子、AI 纠正后的表达，统一进入个人知识库，并在合适的时间再次出现。</p>
+    <div class="lib-points">
+      <div class="lib-point">
+        <div class="lib-icon"><i data-lucide="link"></i></div>
+        <div>
+          <h3>每张卡片都带着语境</h3>
+          <p>不是孤立词表，可以追溯到原视频或原对话，帮你回想起当时的场景。</p>
+        </div>
+      </div>
+      <div class="lib-point">
+        <div class="lib-icon"><i data-lucide="book-open"></i></div>
+        <div>
+          <h3>单词和句子统一管理</h3>
+          <p>从视频、AI 陪练中随手收藏，来源清晰，不需要手动复制整理。</p>
+        </div>
+      </div>
+      <div class="lib-point">
+        <div class="lib-icon"><i data-lucide="clock"></i></div>
+        <div>
+          <h3>到时间再复习</h3>
+          <p>基于 FSRS 的个性化复习调度，你只需在合适的时间处理今天到期的内容。</p>
+        </div>
+      </div>
+    </div>
+    <div class="lib-mock">
+      <div class="lib-stats">
+        <div class="lib-stat"><span class="lib-num">12</span><span class="lib-label">今日到期</span></div>
+        <div class="lib-stat"><span class="lib-num">148</span><span class="lib-label">总卡数</span></div>
+      </div>
+      <div class="lib-start-btn">开始复习 (12)</div>
+      <div class="lib-cards">
+        <div class="lib-card">
+          <span class="lib-tag word">单词</span>
+          <span class="lib-tag-src">视频</span>
+          <div class="lib-card-content">sleeping bag</div>
+          <div class="lib-card-trans">睡袋</div>
+          <span class="lib-due">明天到期</span>
+        </div>
+        <div class="lib-card">
+          <span class="lib-tag sent">句子</span>
+          <span class="lib-tag-src">陪练</span>
+          <div class="lib-card-content">The weather can be unpredictable.</div>
+          <div class="lib-card-trans">天气可能很难预测。</div>
+          <span class="lib-due today">今天到期</span>
+        </div>
+        <div class="lib-card">
+          <span class="lib-tag word">单词</span>
+          <span class="lib-tag-src">视频</span>
+          <div class="lib-card-content">unpredictable</div>
+          <div class="lib-card-trans">不可预测的</div>
+          <span class="lib-due">3 天后</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ===== FAQ ===== -->
+<section class="faq" id="faq">
+  <div class="container">
+    <p class="section-eyebrow">常见问题</p>
+    <h2>关于 NativeOS，你可能想知道</h2>
+    <div class="faq-list">
+      <details class="faq-item">
+        <summary>NativeOS 适合什么水平？</summary>
+        <p>支持 A1-C2 全等级，初次使用时选择自己的真实水平，系统会根据等级和兴趣推荐内容与 AI 话题。基础较弱的用户可以全程使用中文翻译、回复提示和跟读辅助。</p>
+      </details>
+      <details class="faq-item">
+        <summary>AI 陪练和普通 AI 聊天有什么区别？</summary>
+        <p>NativeOS 的对话有具体角色、环境和任务目标，并结合语音识别、表达反馈、跟读辅助及知识库沉淀。你需要真正完成任务，而不只是自由聊天。</p>
+      </details>
+      <details class="faq-item">
+        <summary>可以使用自己的视频吗？</summary>
+        <p>可以。支持导入手机本地视频，也支持从已连接的百度网盘导入内容。导入后 AI 可自动生成双语字幕，并延展出对应的 AI 陪练话题。</p>
+      </details>
+      <details class="faq-item">
+        <summary>说错了会怎样？</summary>
+        <p>AI 会优先保证对话继续，在真正影响表达时给出纠正建议，并区分语言错误和语音识别异常。纠正后的表达可以一键收藏进入复习队列。</p>
+      </details>
+      <details class="faq-item">
+        <summary>收藏的内容会去哪里？</summary>
+        <p>单词、句子和纠正后的表达会进入个人知识库，并附带来源（视频或陪练）。系统基于 FSRS 算法按记忆状态安排复习，不让收藏变成被遗忘的清单。</p>
+      </details>
+      <details class="faq-item">
+        <summary>是否必须付费？</summary>
+        <p>可以免费体验核心功能。Pro 会员提供更大的 AI 对话、语音识别、语音朗读与视频字幕额度；也支持 BYOK，使用自己的 API Key 绕过额度限制。</p>
+      </details>
+    </div>
+    <p class="faq-more">还有问题？<a href="mailto:hi@tofitit.com">联系作者</a> 获取支持，或加入 NativeOS 体验群。</p>
+  </div>
+</section>
+
+<!-- ===== CTA ===== -->
+<section class="cta dark-section" id="download">
+  <div class="container cta-inner">
+    <h2 class="light">别只看懂。<br>下一次，真正说出来。</h2>
+    <p class="section-sub light">从一段你感兴趣的视频开始，把英语变成可以真实使用的能力。</p>
+    <a class="btn btn-primary btn-lg" href="#download">下载 NativeOS · Android</a>
+    <p class="cta-hint">联系作者获取下载链接或加入体验</p>
+  </div>
+</section>
+
+<!-- ===== FOOTER ===== -->
+<footer class="footer">
+  <div class="container footer-inner">
+    <div class="footer-brand">
+      <a class="nav-logo" href="#">
+        <img class="logo-img" src="icon.png" alt="NativeOS" />
+        <span class="logo-text">NativeOS</span>
+      </a>
+      <p>把你看过的英语，<br>变成你说得出来的英语。</p>
+    </div>
+    <div class="footer-links">
+      <div class="footer-col">
+        <h5>产品</h5>
+        <a href="#how">推荐习得实践</a>
+        <a href="#practice">AI 陪练</a>
+        <a href="#video">视频跟练</a>
+        <a href="#library">个人知识库</a>
+        <a href="#faq">常见问题</a>
+      </div>
+      <div class="footer-col">
+        <h5>关于</h5>
+        <a href="#download">下载应用</a>
+        <a href="#">联系作者</a>
+        <a href="#">隐私政策</a>
+        <a href="#">服务条款</a>
+      </div>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    <p>© 2026 NativeOS. All rights reserved.</p>
+  </div>
+</footer>
+
+<script src="lucide.min.js" defer></script>
+<script src="script.js" defer></script>
+</body>
+</html>
