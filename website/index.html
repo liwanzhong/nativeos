@@ -631,8 +631,23 @@
   <div class="container cta-inner">
     <h2 class="light">别只看懂。<br>下一次，真正说出来。</h2>
     <p class="section-sub light">从一段你感兴趣的视频开始，把英语变成可以真实使用的能力。</p>
-    <a class="btn btn-primary btn-lg" href="#download">下载 NativeOS · Android</a>
-    <p class="cta-hint">联系作者获取下载链接或加入体验</p>
+    <a class="btn btn-primary btn-lg js-download" href="#" data-fallback-url="https://oss.tofitit.com/app/android/NativeOS-release-latest.apk">下载 NativeOS · Android</a>
+    <p class="cta-version js-version-info" hidden>
+      <span class="cta-version-name js-version-name">v—</span>
+      <span class="cta-version-sep">·</span>
+      <span class="cta-version-size js-version-size">— MB</span>
+      <span class="cta-version-sep">·</span>
+      <span class="cta-version-date js-version-date">—</span>
+    </p>
+    <details class="cta-notes js-release-notes" hidden>
+      <summary>更新内容</summary>
+      <ul class="cta-notes-list js-release-list"></ul>
+    </details>
+    <p class="cta-hint js-version-error" hidden>无法获取最新版本信息，请稍后再试。</p>
+    <div class="cta-qr js-qr-section" hidden>
+      <p class="cta-qr-hint">手机扫码下载</p>
+      <canvas class="cta-qr-canvas js-qr-canvas" width="140" height="140"></canvas>
+    </div>
   </div>
 </section>
 
@@ -670,6 +685,7 @@
 </footer>
 
 <script src="lucide.min.js" defer></script>
+<script src="qrcode.min.js" defer></script>
 <script src="script.js" defer></script>
 </body>
 </html>

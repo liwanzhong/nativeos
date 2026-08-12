@@ -398,6 +398,89 @@ h4 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
 .cta-inner .section-sub { margin: 0 auto 36px; }
 .cta-hint { margin-top: 16px; font-size: 13px; color: rgba(255,255,255,.4); }
 
+/* ===== CTA / DOWNLOAD ===== */
+.cta-version {
+  margin-top: 18px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, .55);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cta-version-name { color: #fff; font-weight: 700; font-size: 15px; }
+.cta-version-sep { opacity: .4; }
+
+.cta-notes {
+  margin: 16px auto 0;
+  max-width: 480px;
+  text-align: left;
+  background: rgba(255, 255, 255, .04);
+  border: 1px solid rgba(255, 255, 255, .08);
+  border-radius: 12px;
+  padding: 0;
+  overflow: hidden;
+}
+.cta-notes summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 12px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, .75);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  user-select: none;
+}
+.cta-notes summary::-webkit-details-marker { display: none; }
+.cta-notes summary::after {
+  content: '+';
+  font-size: 18px;
+  color: rgba(255, 255, 255, .5);
+  font-weight: 400;
+  transition: transform .2s;
+}
+.cta-notes[open] summary::after { content: '−'; }
+.cta-notes-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 18px 14px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, .65);
+  line-height: 1.7;
+}
+.cta-notes-list li {
+  position: relative;
+  padding-left: 14px;
+}
+.cta-notes-list li::before {
+  content: '•';
+  position: absolute;
+  left: 0;
+  color: var(--blue);
+  font-weight: 800;
+}
+
+.cta-qr {
+  margin-top: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.cta-qr-hint {
+  font-size: 12px;
+  color: rgba(255, 255, 255, .45);
+  letter-spacing: .5px;
+}
+.cta-qr-canvas {
+  background: #fff;
+  border-radius: 12px;
+  padding: 8px;
+}
+
 /* ===== FOOTER ===== */
 .footer { background: var(--dark); border-top: 1px solid var(--dark-2); padding: 56px 0 0; }
 .footer-inner { display: grid; grid-template-columns: 1fr auto; gap: 64px; padding-bottom: 40px; }
