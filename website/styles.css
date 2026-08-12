@@ -401,7 +401,7 @@ h4 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
 /* ===== FOOTER ===== */
 .footer { background: var(--dark); border-top: 1px solid var(--dark-2); padding: 56px 0 0; }
 .footer-inner { display: grid; grid-template-columns: 1fr auto; gap: 64px; padding-bottom: 40px; }
-.footer-brand .nav-logo { margin-bottom: 12px; }
+.footer-brand .nav-logo { margin-bottom: 12px; color: #fff; }
 .footer-brand p { font-size: 14px; color: rgba(255,255,255,.4); line-height: 1.7; }
 .footer-links { display: flex; gap: 48px; }
 .footer-col { display: flex; flex-direction: column; gap: 10px; }
