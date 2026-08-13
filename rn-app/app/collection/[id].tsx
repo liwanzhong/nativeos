@@ -91,6 +91,7 @@ import {
 } from '../../lib/content/user-videos';
 import {
   generateUserVideoAiPracticeCards,
+  loadGeneratedUserVideoAiPracticeCards,
   subscribeUserVideoAiPracticeState,
 } from '../../lib/content/user-video-ai-practice';
 import {
@@ -103,6 +104,10 @@ import {
   invalidateOfficialSceneBindingStatusCache,
 } from '../../lib/content/cloud-binding-summary';
 import { getConfiguredCloudProviders } from '../../lib/database/cloud-bindings';
+import {
+  addAiTopicToHome,
+  buildAiPracticeTopicSnapshot,
+} from '../../lib/ai/ai-practice-user-meta';
 
 const DETAIL_LOG_PREFIX = '[CollectionDetail]';
 
@@ -618,15 +623,23 @@ export default function CollectionDetailPage() {
         void load(true);
       });
       await generateUserVideoAiPracticeCards(video.id);
-      // On success, deep-link into the AI 陪练 tab with this
-      // video as the context so the user can browse the freshly
-      // generated topics immediately. (If the AI 陪练 tab
-      // doesn't yet read the `videoId` param, this is a
-      // forward-compatible no-op.)
-      router.push({
-        pathname: '/(tabs)/feed',
-        params: { videoId: video.id, videoTitle: video.title },
-      });
+      // On success, push every freshly generated card into the
+      // user's AI 陪练 home grid (origin = from_video_chip) and
+      // switch to the AI 陪练 tab. The home page reads back via
+      // listHomeAiTopics and the new topics show up at the top.
+      const cards = await loadGeneratedUserVideoAiPracticeCards(video.id);
+      for (const card of cards) {
+        const snapshot = buildAiPracticeTopicSnapshot({
+          card,
+          origin: 'from_video_chip',
+          sourceType: 'video_chip',
+          sourceLabel: '视频话题',
+          sourceId: video.id,
+          sceneTitle: video.title,
+        });
+        await addAiTopicToHome({ ...snapshot, homeOrigin: 'from_video_chip' });
+      }
+      router.push('/(tabs)/feed');
     } catch (err) {
       Alert.alert('AI 话题生成失败', err instanceof Error ? err.message : String(err));
     } finally {

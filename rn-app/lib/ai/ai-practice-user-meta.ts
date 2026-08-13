@@ -16,8 +16,14 @@
 
 import type { ScenarioCard } from './scenario-generator';
 
-export type AiPracticeTopicOrigin = 'recommended' | 'video';
-export type AiPracticeTopicSourceType = 'recommended' | 'official_video' | 'imported_video';
+export type AiPracticeTopicOrigin = 'recommended' | 'video' | 'from_video_chip' | 'from_recommended' | 'from_custom';
+export type AiPracticeTopicSourceType = 'recommended' | 'official_video' | 'imported_video' | 'video_chip' | 'recommended_topic' | 'custom_topic';
+
+/**
+ * Re-exported for callers that only want the home origin subset.
+ * @see lib/database/ai-practice-user-meta.ts
+ */
+export type { AiPracticeHomeOrigin } from '../database/ai-practice-user-meta';
 
 export interface AiPracticeTopicSnapshot {
   topicId: string;
@@ -34,6 +40,12 @@ export interface AiPracticeTopicSnapshot {
   icon: string;
   desc?: string;
   descZh?: string;
+  /**
+   * Timestamp the user added this topic to their AI 陪练 home.
+   * Drives home grid sort order (newest on top). Optional on legacy
+   * rows (no home concept before 2026-08-13 redesign).
+   */
+  homeAddedAt?: number;
 }
 
 export interface AiPracticeUserMetaRecord extends AiPracticeTopicSnapshot {
@@ -97,13 +109,24 @@ function sanitizeAiPracticeTopicSnapshot(raw: unknown): AiPracticeTopicSnapshot 
   if (!card || typeof candidate.topicId !== 'string' || candidate.topicId.trim().length === 0) {
     return null;
   }
+  const origin: AiPracticeTopicOrigin =
+    candidate.origin === 'video' ? 'video'
+    : candidate.origin === 'from_video_chip' ? 'from_video_chip'
+    : candidate.origin === 'from_recommended' ? 'from_recommended'
+    : candidate.origin === 'from_custom' ? 'from_custom'
+    : 'recommended';
+  const sourceType: AiPracticeTopicSourceType =
+    candidate.sourceType === 'official_video' ? 'official_video'
+    : candidate.sourceType === 'imported_video' ? 'imported_video'
+    : candidate.sourceType === 'video_chip' ? 'video_chip'
+    : candidate.sourceType === 'recommended_topic' ? 'recommended_topic'
+    : candidate.sourceType === 'custom_topic' ? 'custom_topic'
+    : 'recommended';
   return {
     topicId: candidate.topicId,
     card,
-    origin: candidate.origin === 'video' ? 'video' : 'recommended',
-    sourceType: candidate.sourceType === 'official_video' || candidate.sourceType === 'imported_video'
-      ? candidate.sourceType
-      : 'recommended',
+    origin,
+    sourceType,
     sourceLabel: typeof candidate.sourceLabel === 'string' && candidate.sourceLabel.trim().length > 0
       ? candidate.sourceLabel
       : '推荐话题',
@@ -130,6 +153,7 @@ function sanitizeAiPracticeTopicSnapshot(raw: unknown): AiPracticeTopicSnapshot 
       : card.icon,
     desc: typeof candidate.desc === 'string' ? candidate.desc : card.desc,
     descZh: typeof candidate.descZh === 'string' ? candidate.descZh : card.descZh,
+    homeAddedAt: typeof candidate.homeAddedAt === 'number' ? candidate.homeAddedAt : undefined,
   };
 }
 
@@ -198,4 +222,7 @@ export {
   markAiPracticeTopicUsed,
   setAiPracticeTopicFavorite,
   toggleAiPracticeTopicFavorite,
+  addAiTopicToHome,
+  removeAiTopicFromHome,
+  listHomeAiTopics,
 } from '../database/ai-practice-user-meta';

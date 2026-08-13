@@ -5,7 +5,7 @@
  * one product.
  *
  * Two-level header pattern:
- *   pageTitle    (xl, bold)  — top-of-page name like "知识库" / "AI陪练"
+ *   pageTitle    (xxl, bold)  — top-of-page name like "知识库" / "AI陪练"
  *   sectionTitle (base, bold) — sub-section labels like "全部卡片" / "推荐话题"
  *
  * No back arrow. These are top-level tabs, not sub-pages.
@@ -24,7 +24,7 @@ export const sectionStyles = StyleSheet.create({
     gap: 4,
   },
   pageTitle: {
-    fontSize: fontSize.xl,
+    fontSize: fontSize.xxl,
     fontWeight: fontWeight.bold,
     color: colors.text.primary,
   },

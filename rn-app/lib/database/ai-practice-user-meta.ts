@@ -21,11 +21,30 @@ import { getDatabase } from './schema';
 // The shape mirrors AiPracticeUserMetaRecord in
 // lib/ai/ai-practice-user-meta.ts.
 
+/**
+ * Home origin — where a topic was added into the user's AI 陪练 home grid.
+ *
+ * Three sources, unified into one list on the home page:
+ *   - from_video_chip: pushed from a video row's "AI 话题" chip in
+ *                      collection/[id] (official or user-video AI topics)
+ *   - from_recommended: added from the "推荐话题" section of /ai-practice/add
+ *                       (officially-picked series' pre-generated topics)
+ *   - from_custom:     added from the "自定义话题" generator of /ai-practice/add
+ *
+ * Legacy 'recommended' / 'video' values are still readable (old data is
+ * preserved), but the home page filters them out and only displays the
+ * new three sources.
+ */
+export type AiPracticeHomeOrigin =
+  | 'from_video_chip'
+  | 'from_recommended'
+  | 'from_custom';
+
 export interface AiPracticeTopicSnapshot {
   topicId: string;
   card: any; // ScenarioCard
-  origin: 'recommended' | 'video';
-  sourceType: 'recommended' | 'official_video' | 'imported_video';
+  origin: 'recommended' | 'video' | AiPracticeHomeOrigin;
+  sourceType: 'recommended' | 'official_video' | 'imported_video' | 'video_chip' | 'recommended_topic' | 'custom_topic';
   sourceLabel: string;
   sourceId?: string;
   sceneTitle?: string;
@@ -36,6 +55,12 @@ export interface AiPracticeTopicSnapshot {
   icon: string;
   desc?: string;
   descZh?: string;
+  /**
+   * Timestamp the user added this topic to their AI 陪练 home.
+   * Drives home grid sort order (newest on top). Optional on legacy rows
+   * (they fall back to `updated_at` on the SQL side).
+   */
+  homeAddedAt?: number;
 }
 
 export interface AiPracticeUserMetaRecord extends AiPracticeTopicSnapshot {
@@ -166,4 +191,65 @@ export async function toggleAiPracticeTopicFavorite(
 ): Promise<AiPracticeUserMetaRecord> {
   const current = await getAiPracticeUserMeta(snapshot.topicId);
   return setAiPracticeTopicFavorite(snapshot, !current?.isFavorite);
+}
+
+// ── Home grid (AI 陪练主页) ─────────────────────────────────────────
+// The home page shows topics the user has explicitly added — from
+// video chips, the 推荐话题 section of /ai-practice/add, or the 自定义
+// generator. These writers do NOT bump `use_count` or `last_used_at`
+// (those are reserved for "actually opened the immersive chat").
+// `homeAddedAt` is the only field they touch; it lives inside `meta_json`
+// so we don't need a schema bump.
+
+export async function addAiTopicToHome(
+  snapshot: AiPracticeTopicSnapshot & { homeOrigin: AiPracticeHomeOrigin },
+): Promise<void> {
+  const db = await getDatabase();
+  const enriched: AiPracticeTopicSnapshot = {
+    ...snapshot,
+    origin: snapshot.homeOrigin,
+    sourceType: snapshot.homeOrigin === 'from_video_chip'
+      ? 'video_chip'
+      : snapshot.homeOrigin === 'from_recommended'
+        ? 'recommended_topic'
+        : 'custom_topic',
+    homeAddedAt: Date.now(),
+  };
+  // INSERT OR REPLACE: if a row with this topic_id already exists (e.g.
+  // user added then removed earlier), we just overwrite the snapshot.
+  // We deliberately do NOT change last_used_at / use_count — those are
+  // owned by markAiPracticeTopicUsed.
+  await db.runAsync(
+    `INSERT OR REPLACE INTO ai_practice_user_meta (
+      topic_id, is_favorite, favorited_at, last_used_at, use_count,
+      meta_json, updated_at
+    ) VALUES (?, 0, NULL, NULL, 0, ?, ?)`,
+    [snapshot.topicId, JSON.stringify(enriched), Date.now()],
+  );
+}
+
+export async function removeAiTopicFromHome(topicId: string): Promise<void> {
+  const db = await getDatabase();
+  await db.runAsync(
+    'DELETE FROM ai_practice_user_meta WHERE topic_id = ?',
+    [topicId],
+  );
+}
+
+/**
+ * Read home grid topics only — filter out legacy 'recommended' / 'video'
+ * rows that pre-date the home-page redesign. The result is sorted by
+ * `homeAddedAt` desc, falling back to `updated_at` for legacy rows
+ * (defensive — should be empty after the first migration).
+ */
+export async function listHomeAiTopics(): Promise<AiPracticeUserMetaRecord[]> {
+  const all = await listAiPracticeUserMeta();
+  const HOME_ORIGINS: ReadonlySet<string> = new Set([
+    'from_video_chip',
+    'from_recommended',
+    'from_custom',
+  ]);
+  return all
+    .filter((row) => HOME_ORIGINS.has(String(row.origin)))
+    .sort((a, b) => (b.homeAddedAt ?? b.updatedAt ?? 0) - (a.homeAddedAt ?? a.updatedAt ?? 0));
 }
