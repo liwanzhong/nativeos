@@ -56,9 +56,18 @@ interface GenerateVideoAiPracticeOptions {
     targetCount: number;
     titles: string[];
   }) => void;
+  /**
+   * Titles the user has already seen for this scene. When set,
+   * they're injected into the user prompt so the model steers
+   * toward fresh angles instead of regenerating near-duplicates.
+   * The picker UI uses this when the user taps "换一组" — the
+   * previously-displayed titles get fed back to the LLM as
+   * "avoid these" context.
+   */
+  excludeTitles?: string[];
 }
 
-function buildPracticePrompt(level: string, count: number, npcFirstCount: number, userFirstCount: number) {
+export function buildPracticePrompt(level: string, count: number, npcFirstCount: number, userFirstCount: number) {
   return `You are NativeOS, an immersive English learning scenario designer.
 Given a video's title, description, and transcript excerpts, generate exactly ${count} real-life English practice scenario cards.
 
@@ -161,13 +170,13 @@ Return ONLY valid JSON, no markdown:
 }`;
 }
 
-function getUserFirstRatio(level: string) {
+export function getUserFirstRatio(level: string) {
   if (level === 'A1' || level === 'A2') return 0.35;
   if (level === 'B1' || level === 'B2') return 0.65;
   return 0.8;
 }
 
-function computeCardCount(transcriptLines: string[]) {
+export function computeCardCount(transcriptLines: string[]) {
   const lineCount = transcriptLines.length;
   if (lineCount <= 15) return 3;
   if (lineCount <= 50) return 5;
@@ -181,14 +190,27 @@ function extractTranscriptLines(scene: VideoSceneDetail) {
     .slice(0, 40);
 }
 
-function buildUserPrompt(scene: VideoSceneDetail, transcriptLines: string[]) {
+function buildUserPrompt(
+  scene: VideoSceneDetail,
+  transcriptLines: string[],
+  excludeTitles: readonly string[] = [],
+) {
   const description = [
     scene.card.desc,
     scene.card.descZh,
     scene.sourceLabel ? `Source: ${scene.sourceLabel}` : '',
     Array.isArray(scene.goals) && scene.goals.length > 0 ? `Goals: ${scene.goals.join(' / ')}` : '',
   ].filter(Boolean).join('\n');
-  return `Video title: ${scene.card.title}\nDescription: ${description.slice(0, 900)}\nTranscript (first 40 lines):\n${transcriptLines.join('\n')}`;
+  // When the user explicitly asks to regenerate topics, we feed
+  // the previously-generated titles back into the prompt so the
+  // model can steer away from them. The list is bounded — the
+  // transcript excerpt is already capped at 900 chars; we cap
+  // the avoid list at ~400 chars (≈10 short titles) so it doesn't
+  // crowd the prompt.
+  const avoidSection = excludeTitles.length > 0
+    ? `\nAvoid generating topics similar to these (the user already saw them): ${excludeTitles.slice(0, 10).join(' | ')}`
+    : '';
+  return `Video title: ${scene.card.title}\nDescription: ${description.slice(0, 900)}\nTranscript (first 40 lines):\n${transcriptLines.join('\n')}${avoidSection}`;
 }
 
 
@@ -463,9 +485,10 @@ async function generateVideoAiPracticeCardsNonStreaming(
   options?: GenerateVideoAiPracticeOptions,
 ) {
   options?.onProgress?.('正在兼容模式下生成 AI陪练场景...');
+  const excludeTitles = options?.excludeTitles ?? [];
   const result = await callAIProxy({
     type: 'generate-card',
-    prompt: buildUserPrompt(scene, transcriptLines),
+    prompt: buildUserPrompt(scene, transcriptLines, excludeTitles),
     systemMessage: buildPracticePrompt(level, count, npcFirstCount, userFirstCount),
     userLevel: level,
     maxTokens: 5200,
@@ -505,7 +528,8 @@ export async function generateVideoAiPracticeCards(
   const count = computeCardCount(transcriptLines);
   const userFirstCount = Math.round(count * getUserFirstRatio(level));
   const npcFirstCount = count - userFirstCount;
-  const prompt = buildUserPrompt(scene, transcriptLines);
+  const excludeTitles = options?.excludeTitles ?? [];
+  const prompt = buildUserPrompt(scene, transcriptLines, excludeTitles);
   const systemMessage = buildPracticePrompt(level, count, npcFirstCount, userFirstCount);
   const cards: ScenarioCard[] = [];
   const seenKeys = new Set<string>();

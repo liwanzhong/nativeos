@@ -8,7 +8,7 @@ import {
   ActivityIndicator,
   Modal,
 } from 'react-native';
-import { useRouter, useFocusEffect } from 'expo-router';
+import { useRouter, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Shuffle, Star, X } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -18,6 +18,7 @@ import { generateDailyScenariosStream, selectScenario, type ScenarioCard } from 
 import {
   buildRecommendedAiTopicItems,
   getAiPracticeFitBand,
+  getAiPracticeFitScore,
   isTimestampInHistoryFilter,
   listVideoAiTopicGroups,
   type AiPracticeFitBand,
@@ -34,6 +35,7 @@ import {
   type AiPracticeTopicSnapshot,
   type AiPracticeUserMetaRecord,
 } from '../../lib/ai/ai-practice-user-meta';
+import { loadGeneratedUserVideoAiPracticeCards } from '../../lib/content/user-video-ai-practice';
 
 const RECOMMENDED_TOPIC_COUNT = 6;
 const RECOMMENDED_TOPIC_CACHE_VERSION = 'v2';
@@ -257,6 +259,26 @@ export function AiPracticeHome() {
     }
   }, [recommendedCards.length]);
 
+  // Mirror of the user's "我的合集" → official series id set. We
+  // re-load on every focus (cheap — single Supabase SELECT) so
+  // the topics section stays in sync with pick/unpick from the
+  // videos tab. Self-built user_collections don't contribute —
+  // they have no manifest, so no AI practice topics — and the
+  // union with pickedSeriesIds is the "我的合集" filter for this
+  // section.
+  const [pickedSeriesIds, setPickedSeriesIds] = useState<Set<string>>(new Set());
+
+  const loadPickedSeriesIds = useCallback(async () => {
+    try {
+      const { listMyPickedSeriesIds } = await import('../../lib/content/user-picked-series');
+      const ids = await listMyPickedSeriesIds();
+      setPickedSeriesIds(ids);
+    } catch {
+      // Treat as "no picks" — the section will just be empty.
+      setPickedSeriesIds(new Set());
+    }
+  }, []);
+
   const loadVideoTopics = useCallback(async (forceRefresh: boolean = false, levelOverride?: string) => {
     // Don't show the spinner if we already have data. Tab switches
     // would otherwise flicker the loading state even though SQLite
@@ -269,7 +291,16 @@ export function AiPracticeHome() {
       setIsVideoLoading(true);
     }
     try {
-      const groups = await listVideoAiTopicGroups(levelOverride || userLevel, forceRefresh);
+      // Filter to only the user's subscribed official collections.
+      // After the videos-tab redesign ("我的合集" grid), the AI
+      // practice tab is no longer a "show me everything" directory
+      // — it surfaces topics derived from the same series the user
+      // has curated in their home grid.
+      const groups = await listVideoAiTopicGroups(
+        levelOverride || userLevel,
+        forceRefresh,
+        pickedSeriesIds,
+      );
       setVideoGroups(groups);
     } catch {
       if (!hadData) setVideoGroups([]);
@@ -278,7 +309,7 @@ export function AiPracticeHome() {
         setIsVideoLoading(false);
       }
     }
-  }, [userLevel]);
+  }, [pickedSeriesIds, userLevel]);
 
   const refreshAll = useCallback(async (forceRefresh: boolean = false) => {
     const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
@@ -286,10 +317,11 @@ export function AiPracticeHome() {
     setUserLevel(level);
     await Promise.all([
       loadRecommended(forceRefresh),
+      loadPickedSeriesIds(),
       loadVideoTopics(forceRefresh, level),
       loadMeta(),
     ]);
-  }, [loadMeta, loadRecommended, loadVideoTopics]);
+  }, [loadMeta, loadPickedSeriesIds, loadRecommended, loadVideoTopics]);
 
   useFocusEffect(useCallback(() => {
     // Tab focus: read from SQLite cache (fast path, <50 ms warm).
@@ -299,6 +331,81 @@ export function AiPracticeHome() {
     // tab switch. Pull-to-refresh is the explicit escape hatch.
     void refreshAll(false);
   }, [refreshAll]));
+
+  // ── User-video "deep link" highlight ─────────────────────────
+  // When the AI 话题 chip on a user-video row deep-links here
+  // (router.push with `videoId` / `videoTitle` params), the home
+  // tab should surface the freshly generated cards right at the
+  // top so the user can pick a topic without scrolling. The
+  // highlight is a self-contained section above the regular
+  // 推荐 / 视频 topics; it lives only as long as the user keeps
+  // it open (tapping the close button clears it AND strips the
+  // params so a back-and-forth doesn't re-open it).
+  const searchParams = useLocalSearchParams<{ videoId?: string; videoTitle?: string }>();
+  const highlightVideoId = typeof searchParams.videoId === 'string' ? searchParams.videoId : null;
+  const highlightVideoTitleParam = typeof searchParams.videoTitle === 'string' ? searchParams.videoTitle : null;
+  const [userVideoHighlight, setUserVideoHighlight] = useState<{
+    entryId: string;
+    title: string;
+    items: VideoAiTopicItem[];
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (!highlightVideoId) {
+      setUserVideoHighlight(null);
+      return;
+    }
+    (async () => {
+      try {
+        const cards = await loadGeneratedUserVideoAiPracticeCards(highlightVideoId);
+        if (cancelled) return;
+        // Build a title fallback chain: param → entry lookup → id.
+        let title = highlightVideoTitleParam || '';
+        if (!title) {
+          try {
+            const { getUserVideoEntryById } = await import('../../lib/content/user-videos');
+            const entry = await getUserVideoEntryById(highlightVideoId);
+            if (entry?.title) title = entry.title;
+          } catch {
+            // fall through
+          }
+        }
+        if (!title) title = highlightVideoId;
+        if (cards.length === 0) {
+          // No cards saved yet (e.g. the user just kicked off
+          // generation; chip shows pending → navigating here
+          // before the run completes is possible). Surface an
+          // empty highlight with a friendly message rather than
+          // hiding it.
+          setUserVideoHighlight({ entryId: highlightVideoId, title, items: [] });
+          return;
+        }
+        const items: VideoAiTopicItem[] = cards.map((card) => {
+          const snapshot = buildAiPracticeTopicSnapshot({
+            card,
+            origin: 'video',
+            sourceType: 'imported_video',
+            sourceLabel: '导入视频',
+            sourceId: highlightVideoId,
+            sceneTitle: title,
+          });
+          return {
+            topicId: snapshot.topicId,
+            card: snapshot.card,
+            snapshot,
+            fitBand: getAiPracticeFitBand(card.level, userLevel),
+            fitScore: getAiPracticeFitScore(card.level, userLevel),
+          };
+        });
+        setUserVideoHighlight({ entryId: highlightVideoId, title, items });
+      } catch {
+        if (!cancelled) {
+          setUserVideoHighlight(null);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [highlightVideoId, highlightVideoTitleParam, userLevel]);
 
   const handlePullRefresh = useCallback(async () => {
     setIsPullRefreshing(true);
@@ -444,6 +551,86 @@ export function AiPracticeHome() {
             <Text style={sectionStyles.pageTitle}>AI陪练</Text>
           </View>
         </View>
+
+        {/* User-video deep-link highlight.
+            Renders ONLY when a row's AI 话题 chip deep-linked
+            into this tab with `videoId`. Tapping the close
+            button clears the local state AND strips the params
+            so a back-and-forth doesn't re-open it. Auto-switches
+            to the "话题" tab (deep link usually follows a fresh
+            generation; the user is here to pick a topic, not to
+            browse history). */}
+        {userVideoHighlight ? (
+          <View style={styles.userVideoHighlight}>
+            <View style={styles.userVideoHighlightHeader}>
+              <View style={styles.userVideoHighlightHeaderInfo}>
+                <Text style={styles.userVideoHighlightEyebrow}>来自视频</Text>
+                <Text style={styles.userVideoHighlightTitle} numberOfLines={1}>
+                  《{userVideoHighlight.title}》
+                </Text>
+              </View>
+              <Pressable
+                hitSlop={8}
+                onPress={() => {
+                  setUserVideoHighlight(null);
+                  // Strip the params so re-focusing the tab
+                  // (e.g. via tab-bar tap) doesn't re-mount the
+                  // highlight. router.setParams is the official
+                  // expo-router escape hatch for this.
+                  try {
+                    router.setParams({ videoId: undefined, videoTitle: undefined });
+                  } catch {
+                    // Older expo-router versions don't expose
+                    // setParams on the router instance; fall
+                    // through silently — the highlight won't
+                    // re-open because the next focus will
+                    // re-read params and they were never set
+                    // back. The user can re-trigger it from
+                    // the source row if they want.
+                  }
+                }}
+                style={styles.userVideoHighlightClose}
+              >
+                <X size={16} color={colors.text.secondary} />
+              </Pressable>
+            </View>
+            {userVideoHighlight.items.length === 0 ? (
+              <View style={styles.userVideoHighlightEmpty}>
+                <Text style={styles.userVideoHighlightEmptyText}>
+                  这个视频的 AI 话题还没生成,可以在视频跟练页点 AI 话题 chip 触发生成。
+                </Text>
+              </View>
+            ) : (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                contentContainerStyle={styles.userVideoHighlightScroll}
+              >
+                {userVideoHighlight.items.map((item) => (
+                  <Pressable
+                    key={`uv-highlight-${item.topicId}`}
+                    style={styles.userVideoHighlightCard}
+                    onPress={() => void openAiTopic(item.snapshot)}
+                  >
+                    <View style={styles.recommendedCardTopRow}>
+                      <Text style={styles.recommendedEmoji}>{item.card.icon}</Text>
+                      <View style={[styles.cardMetaCompact, styles.recommendedCardMetaRow]}>
+                        <View style={[styles.levelBadge, { backgroundColor: (LEVEL_COLORS[item.card.level] || LEVEL_COLORS.B1).bg }]}>
+                          <Text style={[styles.levelText, { color: (LEVEL_COLORS[item.card.level] || LEVEL_COLORS.B1).text }]}>{item.card.level}</Text>
+                        </View>
+                        <Text style={styles.categoryText} numberOfLines={1}>{item.card.category}</Text>
+                      </View>
+                    </View>
+                    <Text style={styles.recommendedCardTitle} numberOfLines={2}>{item.card.title}</Text>
+                    <Text style={styles.recommendedCardDesc} numberOfLines={1}>
+                      {item.card.descZh || item.card.desc}
+                    </Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            )}
+          </View>
+        ) : null}
 
         <View style={styles.primaryStickyWrap}>
           <View style={styles.primaryTabRow}>
@@ -1156,6 +1343,75 @@ const styles = StyleSheet.create({
   sceneSheetChipTextActive: {
     color: colors.primary,
     fontWeight: fontWeight.bold,
+  },
+
+  // ── User-video deep-link highlight ──────────────────────────
+  // A tinted block above the regular 推荐 / 跟练 sections that
+  // appears ONLY when a row's AI 话题 chip deep-linked here with
+  // `videoId`. Visually distinct (light violet wash + a small
+  // "来自视频" eyebrow) so the user knows these topics are
+  // specific to a video they just generated from.
+  userVideoHighlight: {
+    backgroundColor: 'rgba(124,58,237,0.06)',
+    borderRadius: borderRadius.lg,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderColor: 'rgba(124,58,237,0.15)',
+  },
+  userVideoHighlightHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  userVideoHighlightHeaderInfo: { flex: 1, minWidth: 0 },
+  userVideoHighlightEyebrow: {
+    fontSize: 11,
+    color: '#7C3AED',
+    fontWeight: fontWeight.semibold,
+    letterSpacing: 0.3,
+    textTransform: 'uppercase',
+    marginBottom: 2,
+  },
+  userVideoHighlightTitle: {
+    fontSize: fontSize.base,
+    color: colors.text.primary,
+    fontWeight: fontWeight.semibold,
+  },
+  userVideoHighlightClose: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.04)',
+  },
+  userVideoHighlightScroll: {
+    gap: spacing.sm,
+    paddingRight: spacing.md,
+  },
+  // Highlight cards re-use the same `recommendedCardTopRow` /
+  // `recommendedEmoji` / `recommendedCardTitle` / etc. styles as
+  // the 推荐话题 section. Only the outer Pressable + width is
+  // different (fixed-width for a horizontal scroller).
+  userVideoHighlightCard: {
+    width: 200,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.sm,
+    gap: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.05)',
+  },
+  userVideoHighlightEmpty: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.sm,
+  },
+  userVideoHighlightEmptyText: {
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+    lineHeight: 18,
   },
 });
 

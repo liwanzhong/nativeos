@@ -21,6 +21,7 @@ import {
   resolveCloudReferencedVideoCoverSource,
   resolveCloudReferencedVideoSource,
 } from './cloud-video-playback';
+import { getOrCreateDefaultCollection, encodeUserCollectionId, listUserCollections } from './user-collections';
 import {
   checkSubtitleQuota,
   consumeQuota,
@@ -64,6 +65,7 @@ const USER_VIDEOS_ROOT_DIR = `${documentDirectory ?? ''}user-videos`;
 const USER_VIDEOS_FILES_DIR = `${USER_VIDEOS_ROOT_DIR}/files`;
 const USER_VIDEOS_COVERS_DIR = `${USER_VIDEOS_ROOT_DIR}/covers`;
 const USER_VIDEOS_SUBTITLES_DIR = `${USER_VIDEOS_ROOT_DIR}/subtitles`;
+const USER_VIDEOS_AI_PRACTICE_DIR = `${USER_VIDEOS_ROOT_DIR}/ai-practice`;
 const USER_VIDEOS_INDEX_PATH = `${USER_VIDEOS_ROOT_DIR}/index.json`;
 const LOCAL_ASR_CHUNK_SIZE_MS = 90_000;
 const CLOUD_REMOTE_ASR_CHUNK_SIZE_MS = 10_000;
@@ -113,6 +115,13 @@ const userVideoEntrySchema = z.object({
   subtitleZhUri: z.string().optional(),
   subtitleUpdatedAt: z.string().optional(),
   subtitleCursorMs: z.number().nonnegative().optional(),
+  /**
+   * Owning collection id. Same format as imported_video_packs: 
+   * `"user:<bigserial>"` for user-built collections; absent means
+   * "uncategorised — surface under the default collection at read
+   * time". Set on import, editable from the video detail page.
+   */
+  collectionId: z.string().optional(),
   localVideoUri: z.string().optional(),
   /** When set: this cloud video has been downloaded into the local
    *  cache and the local copy is the source of truth for any
@@ -122,6 +131,31 @@ const userVideoEntrySchema = z.object({
   cachedLocalSize: z.number().nonnegative().optional(),
   /** ISO timestamp of when the cloud video finished downloading locally. */
   cachedAt: z.string().optional(),
+
+  // ── AI practice topic state ──
+  // Mirrors the subtitle pipeline: a status enum, an optional
+  // phase (so the UI can show "提取字幕 / 调用 LLM / 保存" style
+  // progress), and a 0..1 progress + human-readable message. The
+  // generated scenario cards are stored in a separate JSON file
+  // pointed to by `aiPracticeUri` (same separation pattern we use
+  // for `subtitleUri`) so the index doesn't bloat on every
+  // generation run. The generation trigger is in
+  // `user-video-ai-practice.ts`; the schema only carries the
+  // persisted state.
+  aiPracticeStatus: z.enum(['none', 'pre-shipped', 'pending', 'processing', 'ready', 'error']).optional(),
+  aiPracticePhase: z.enum(['preparing', 'extracting-subtitle', 'calling-llm', 'saving']).optional(),
+  aiPracticeProgress: z.number().min(0).max(1).optional(),
+  aiPracticeProgressMessage: z.string().optional(),
+  /** Number of practice scenario cards saved. */
+  aiPracticeCount: z.number().int().nonnegative().optional(),
+  /** Local URI of the saved cards JSON (one file per entry, the
+   *  same `aiPracticeFileName` is just for human reference). */
+  aiPracticeUri: z.string().optional(),
+  /** ISO timestamp of the most recent successful generation. */
+  aiPracticeUpdatedAt: z.string().optional(),
+  /** Last error message from a failed run; cleared on next run. */
+  aiPracticeErrorMessage: z.string().optional(),
+
   localFileName: z.string().optional(),
   mimeType: z.string().optional(),
   provider: z
@@ -196,6 +230,20 @@ type AsrUploadResponse = {
 interface ImportLocalVideoOptions {
   sourceName?: string | null;
   mimeType?: string | null;
+  /**
+   * Owning collection wire id (`"user:<bigserial>"`). When absent,
+   * the import flow lazy-creates the default collection and tags the
+   * entry with its wire id. Set by the import-sheet picker when the
+   * user has chosen a non-default target.
+   */
+  collectionId?: string;
+  /**
+   * Skip the duplicate-by-name detection. Set by the import sheet
+   * when the user confirms "Import anyway" from the duplicate
+   * dialog. We still log the dedup result so a future investigation
+   * can see what was bypassed.
+   */
+  force?: boolean;
 }
 
 interface CreateCloudVideoReferenceParams {
@@ -205,6 +253,11 @@ interface CreateCloudVideoReferenceParams {
   remoteFileId?: string | number;
   remoteFileName?: string;
   fileSize?: number;
+  /**
+   * Owning collection wire id. See `ImportLocalVideoOptions` for
+   * the same semantics.
+   */
+  collectionId?: string;
 }
 
 export class DuplicateLocalVideoImportError extends Error {
@@ -1411,14 +1464,64 @@ function normalizeLocalVideoDuplicateName(name?: string | null) {
   return (name || '').trim().toLowerCase();
 }
 
-function findDuplicateLocalVideoEntry(items: UserVideoEntry[], sourceName?: string | null, fileSize?: number) {
+function findDuplicateLocalVideoEntry(
+  items: UserVideoEntry[],
+  sourceName?: string | null,
+  fileSize?: number,
+  /**
+   * Wire ids of user collections that USED to exist but no longer
+   * do on the current user's Supabase. Entries whose `collectionId`
+   * is in this set are "orphan" (deleted collection, e.g. from a
+   * previous build where the `collectionId` plumbing was incomplete
+   * or the user recreated their account). They will show up in the
+   * default collection at read time, but for dedup purposes they
+   * should NOT count as "already imported" — the user can clearly
+   * see nothing in their real collections, so a same-name file
+   * picked from disk should be allowed to import.
+   */
+  orphanCollectionIds: ReadonlySet<string> = new Set(),
+) {
   const normalizedName = normalizeLocalVideoDuplicateName(sourceName);
   if (!normalizedName) {
     return null;
   }
 
-  return items.find((item) => {
+  // ── DIAG (2026-08-12): user reports dedup misfires. Log every
+  // local_file entry we're comparing against so we can see which
+  // one matched, what its name/size/collectionId was, and whether
+  // the size-check branch was hit.
+  const localFileItems = items.filter((it) => it.sourceType === 'local_file');
+  console.log('[UserVideoDedup] scan start', {
+    queryName: sourceName ?? null,
+    normalizedQuery: normalizedName,
+    querySize: typeof fileSize === 'number' ? fileSize : null,
+    orphanCount: orphanCollectionIds.size,
+    orphans: Array.from(orphanCollectionIds),
+    candidateCount: localFileItems.length,
+    candidates: localFileItems.map((it) => ({
+      id: it.id,
+      title: it.title,
+      localFileName: it.localFileName ?? null,
+      normalizedItemName: normalizeLocalVideoDuplicateName(it.localFileName || it.title),
+      fileSize: typeof it.fileSize === 'number' ? it.fileSize : null,
+      collectionId: it.collectionId ?? null,
+      isOrphan: it.collectionId ? orphanCollectionIds.has(it.collectionId) : false,
+    })),
+  });
+
+  const matched = items.find((item) => {
     if (item.sourceType !== 'local_file') {
+      return false;
+    }
+
+    // Skip orphan entries — they have no real owner collection,
+    // and the user has no way to manage them via the UI. Don't
+    // block fresh imports on them.
+    if (item.collectionId && orphanCollectionIds.has(item.collectionId)) {
+      console.log('[UserVideoDedup] skip orphan entry', {
+        entryId: item.id,
+        entryCollectionId: item.collectionId,
+      });
       return false;
     }
 
@@ -1428,11 +1531,37 @@ function findDuplicateLocalVideoEntry(items: UserVideoEntry[], sourceName?: stri
     }
 
     if (typeof fileSize === 'number' && Number.isFinite(fileSize) && fileSize > 0) {
-      return item.fileSize === fileSize;
+      const sizeMatch = item.fileSize === fileSize;
+      console.log('[UserVideoDedup] size branch', {
+        entryId: item.id,
+        querySize: fileSize,
+        entrySize: item.fileSize ?? null,
+        result: sizeMatch ? 'MATCH' : 'skip (name match but size differs)',
+      });
+      return sizeMatch;
     }
 
+    // ── DIAG: when query size is unknown we currently fall back to
+    // name-only. That's been the false-positive source. Log the
+    // hit so we can see the size-less path is being taken.
+    console.log('[UserVideoDedup] SIZE-UNKNOWN FALLBACK (name only)', {
+      entryId: item.id,
+      entryName: item.localFileName || item.title,
+      entryCollectionId: item.collectionId ?? null,
+    });
     return true;
   }) || null;
+
+  if (matched) {
+    console.log('[UserVideoDedup] MATCH', {
+      matchedId: matched.id,
+      matchedTitle: matched.title,
+      matchedLocalFileName: matched.localFileName ?? null,
+      matchedFileSize: matched.fileSize ?? null,
+      matchedCollectionId: matched.collectionId ?? null,
+    });
+  }
+  return matched;
 }
 
 export function isDuplicateLocalVideoImportError(error: unknown): error is DuplicateLocalVideoImportError {
@@ -1604,6 +1733,48 @@ export async function deleteUserVideoEntry(id: string) {
   return entry;
 }
 
+/**
+ * Move a user video to a different collection, or remove it from
+ * its current collection (passing `undefined`) so it falls back to
+ * the default collection via the "no collectionId → default" rule
+ * in `matchesCollection`. Local files / cloud references are
+ * untouched — only the index row's `collectionId` is rewritten.
+ *
+ * Use this for non-destructive "remove from this collection"
+ * (when the user is currently inside a custom collection).
+ * For real delete (e.g. "从默认合集移除"), call `deleteUserVideoEntry`.
+ */
+export async function setUserVideoCollection(
+  id: string,
+  collectionId: string | undefined,
+): Promise<UserVideoEntry | null> {
+  const updated = await updateUserVideoEntry(id, (current) => {
+    // Only the collectionId field changes; everything else
+    // (sourceType, provider, cache state, cover, etc.) is
+    // preserved so the entry doesn't get re-imported / re-cached.
+    return { ...current, collectionId };
+  });
+  if (!updated) {
+    console.warn('[UserVideoCollection] entry not found', { id });
+  }
+  return updated;
+}
+
+/**
+ * Patch one or more fields on a user video entry. The mutation
+ * is a shallow merge: every key in `patch` is written through;
+ * keys not present are left alone. Returns the updated entry
+ * (or null if no entry with that id exists). Used by the
+ * subtitle / cache / AI practice pipelines to bump their state
+ * fields without rewriting the whole entry by hand.
+ */
+export async function updateUserVideoEntryFields(
+  id: string,
+  patch: Partial<UserVideoEntry>,
+): Promise<UserVideoEntry | null> {
+  return await updateUserVideoEntry(id, (current) => ({ ...current, ...patch }));
+}
+
 export async function importLocalVideoFromUri(sourceUri: string, options: ImportLocalVideoOptions = {}) {
   ensureUserVideosAvailable();
   assertVideoCandidate(sourceUri, options);
@@ -1612,6 +1783,14 @@ export async function importLocalVideoFromUri(sourceUri: string, options: Import
   await ensureDirectory(USER_VIDEOS_COVERS_DIR);
   await ensureDirectory(USER_VIDEOS_SUBTITLES_DIR);
 
+  // Resolve the owning collection. Picker can pass a non-default
+  // wire id; if absent, lazy-create the default collection and tag
+  // the entry with its wire id. The home page reads back via
+  // `matchesCollection()`; without a default row every imported
+  // video would be orphaned and the home card would show 0.
+  const targetCollectionId = options.collectionId
+    ?? encodeUserCollectionId((await getOrCreateDefaultCollection()).id);
+
   const now = new Date().toISOString();
   const sourceName = (options.sourceName || getFileNameFromUri(sourceUri) || `video_${Date.now()}.mp4`).trim();
   const sourceInfo = await getInfoAsync(sourceUri);
@@ -1619,7 +1798,46 @@ export async function importLocalVideoFromUri(sourceUri: string, options: Import
     ? sourceInfo.size
     : undefined;
   const index = await readUserVideosIndex();
-  const duplicateEntry = findDuplicateLocalVideoEntry(index.items, sourceName, sourceFileSize);
+  // Build the set of currently-valid user collection wire ids so
+  // dedup can skip "orphan" entries (whose `collectionId` points
+  // to a deleted collection on Supabase). Those entries have no
+  // visible owner, so they shouldn't block a fresh import.
+  let orphanCollectionIds: Set<string> = new Set();
+  try {
+    const userCols = await listUserCollections();
+    const validWireIds = new Set<string>(userCols.map((row) => encodeUserCollectionId(row.id)));
+    orphanCollectionIds = new Set<string>();
+    for (const it of index.items) {
+      if (typeof it.collectionId === 'string' && it.collectionId.startsWith('user:') && !validWireIds.has(it.collectionId)) {
+        orphanCollectionIds.add(it.collectionId);
+      }
+    }
+  } catch (err) {
+    // If the network call fails, fall through with an empty set —
+    // dedup will still work, just slightly stricter than ideal.
+    console.warn('[UserVideoDedup] listUserCollections failed; orphan filter disabled', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // ── DIAG (2026-08-12): user reports dedup misfires. Log the
+  // resolved source name + size + index size before we run the
+  // dedup check.
+  console.log('[UserVideoDedup] importLocalVideoFromUri preflight', {
+    sourceUri,
+    sourceName,
+    sourceFileSize: typeof sourceFileSize === 'number' ? sourceFileSize : null,
+    sourceInfoExists: sourceInfo.exists,
+    indexItemCount: index.items.length,
+    localFileCount: index.items.filter((it) => it.sourceType === 'local_file').length,
+    cloudRefCount: index.items.filter((it) => it.sourceType === 'cloud_reference').length,
+    force: options.force === true,
+    orphanCount: orphanCollectionIds.size,
+    orphans: Array.from(orphanCollectionIds),
+  });
+  const duplicateEntry = options.force
+    ? null
+    : findDuplicateLocalVideoEntry(index.items, sourceName, sourceFileSize, orphanCollectionIds);
   if (duplicateEntry) {
     throw new DuplicateLocalVideoImportError(duplicateEntry);
   }
@@ -1658,13 +1876,14 @@ export async function importLocalVideoFromUri(sourceUri: string, options: Import
     mimeType: options.mimeType || undefined,
     fileSize: fileSize ?? sourceFileSize,
     coverImageUri,
+    collectionId: targetCollectionId,
   };
 
   await writeUserVideosIndex([entry, ...index.items.filter((item) => item.id !== entry.id)]);
   return entry;
 }
 
-export async function pickAndImportLocalVideo() {
+export async function pickAndImportLocalVideo(options: { collectionId?: string; force?: boolean } = {}) {
   const result = await DocumentPicker.getDocumentAsync({
     type: 'video/*',
     copyToCacheDirectory: true,
@@ -1676,6 +1895,8 @@ export async function pickAndImportLocalVideo() {
   return importLocalVideoFromUri(result.assets[0].uri, {
     sourceName: result.assets[0].name,
     mimeType: result.assets[0].mimeType,
+    collectionId: options.collectionId,
+    force: options.force,
   });
 }
 
@@ -1690,6 +1911,13 @@ export async function createCloudVideoReference(params: CreateCloudVideoReferenc
   await ensureDirectory(USER_VIDEOS_ROOT_DIR);
   await ensureDirectory(USER_VIDEOS_COVERS_DIR);
 
+  // Resolve the target collection. Picker can pass a non-default
+  // wire id; otherwise lazy-create default. Same rationale as
+  // importLocalVideoFromUri.
+  const defaultWireId = encodeUserCollectionId(
+    (await getOrCreateDefaultCollection()).id,
+  );
+
   const title = (params.title || params.remoteFileName || remotePath || '网盘视频').trim();
   const now = new Date().toISOString();
   const index = await readUserVideosIndex();
@@ -1697,6 +1925,15 @@ export async function createCloudVideoReference(params: CreateCloudVideoReferenc
   const existing = index.items.find((item) => item.sourceType === 'cloud_reference' && buildCloudReferenceIdentity(item.provider!, item.remotePath, item.remoteFileId) === identity);
   const entryId = existing?.id || `user_cloud_video_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   let coverImageUri = existing?.coverImageUri;
+
+  // Resolution order:
+  //   1. explicit picker choice (params.collectionId)
+  //   2. existing entry's collectionId (re-import: keep the user's
+  //      prior assignment)
+  //   3. default wire id
+  const collectionId = params.collectionId
+    ?? existing?.collectionId
+    ?? defaultWireId;
 
   const entry: UserVideoEntry = existing ? {
     ...existing,
@@ -1709,6 +1946,7 @@ export async function createCloudVideoReference(params: CreateCloudVideoReferenc
     remoteFileName: params.remoteFileName || title,
     fileSize: params.fileSize,
     coverImageUri,
+    collectionId,
   } : {
     id: entryId,
     title,
@@ -1725,6 +1963,7 @@ export async function createCloudVideoReference(params: CreateCloudVideoReferenc
     remoteFileName: params.remoteFileName || title,
     fileSize: params.fileSize,
     coverImageUri,
+    collectionId,
   };
 
   const nextItems = index.items.filter((item) => item.id !== entry.id);
@@ -2010,6 +2249,97 @@ export function triggerUserVideoSubtitleGeneration(id: string, options?: { expec
 
 export function triggerCloudVideoSubtitleGeneration(id: string, options?: { startMs?: number; endMs?: number; expectedDurationSeconds?: number }) {
   return requestCloudVideoSubtitleGeneration(id, options);
+}
+
+/**
+ * Fire-and-forget subtitle auto-generation for an imported entry.
+ *
+ * Mirrors the pre-redesign `videos.tsx` flow:
+ *   - **local_file** : silently skip when the user is Free or
+ *     today's hard subtitle quota is exhausted. The entry stays at
+ *     `subtitleStatus: 'pending'`, and the detail page surfaces the
+ *     precise gate (Pro paywall / "今日额度已用完") when the user
+ *     taps to retry. The free path is silent because the user just
+ *     imported the video — slapping a Pro toast in their face
+ *     mid-import feels like spam.
+ *   - **cloud_reference** : no gate here. The user already walked
+ *     through a more involved flow (mount a drive, browse, pick a
+ *     file), and the existing toast on `triggerCloud*` failure
+ *     gives them a precise next step.
+ *
+ * Errors thrown by the underlying generation are caught and logged;
+ * they never propagate back to the import success path, so a
+ * subtitle failure doesn't retroactively make the import look
+ * broken. Re-discovery happens when the user opens the detail page
+ * and `subtitleStatus` shows 'error' / 'pending'.
+ *
+ * Safe to call from anywhere — no React state, no router. The
+ * caller (ImportVideoSheet, the shared-share path on the home
+ * page, the collection detail page) wires any UI refresh after
+ * the underlying entry's `subtitleStatus` updates.
+ */
+export async function triggerImportedVideoSubtitleGeneration(
+  entry: { id?: string | null; sourceType?: string | null } | null | undefined,
+): Promise<void> {
+  if (!entry?.id) return;
+  const entryId: string = entry.id;
+  const sourceType = entry.sourceType;
+
+  if (sourceType === 'local_file') {
+    // Lazy-import to avoid a circular import: user-videos.ts is
+    // pulled into quota.ts via ... not yet, but better safe than
+    // sorry. Keep this dynamic.
+    let pro = false;
+    let hardQuotaExhausted = false;
+    try {
+      const quotaMod = await import('../quota');
+      const [tierResult, usageConfig] = await Promise.allSettled([
+        quotaMod.isProNow(),
+        Promise.all([quotaMod.getTodayUsage(), quotaMod.getQuotaConfig()]),
+      ]);
+      pro = tierResult.status === 'fulfilled' && tierResult.value === true;
+      if (pro && usageConfig.status === 'fulfilled') {
+        const [usage, config] = usageConfig.value;
+        const hard = config.pro.asr_subtitle.hard;
+        if (typeof hard === 'number' && hard > 0 && usage.asr_subtitle >= hard) {
+          hardQuotaExhausted = true;
+        }
+      }
+    } catch (err) {
+      // If quota check fails, fall through and run the trigger —
+      // the underlying call has its own quota enforcement and
+      // will surface a precise error if applicable.
+      console.warn('[UserVideoSubtitle] pro/quota check failed; falling through', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    if (!pro) {
+      console.log('[UserVideoSubtitle] skip auto-trigger: free user', { entryId });
+      return;
+    }
+    if (hardQuotaExhausted) {
+      console.log('[UserVideoSubtitle] skip auto-trigger: hard quota exhausted', { entryId });
+      return;
+    }
+  }
+
+  const task = sourceType === 'cloud_reference'
+    ? triggerCloudVideoSubtitleGeneration(entryId)
+    : sourceType === 'local_file'
+      ? triggerUserVideoSubtitleGeneration(entryId)
+      : null;
+  if (!task) {
+    console.log('[UserVideoSubtitle] no trigger for sourceType', { entryId, sourceType: sourceType ?? null });
+    return;
+  }
+  void task.catch((err) => {
+    console.warn('[UserVideoSubtitle] auto-trigger failed', {
+      entryId,
+      sourceType: sourceType ?? null,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
 }
 
 export async function deleteLocalUserVideoFile(uri?: string) {

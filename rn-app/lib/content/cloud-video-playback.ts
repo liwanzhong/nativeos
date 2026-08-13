@@ -81,6 +81,83 @@ function getDownloadTaskKey(sceneId: string, provider: CloudVideoProvider) {
   return `${sceneId}__${provider}`;
 }
 
+// ── Public subscription surface ────────────────────────────────
+// In-memory only. Lets UI components (e.g. the cache chip on a
+// collection detail row) observe a download's progress without
+// having to focus a settings page. Pairs with `getCachedDownloadEntry`
+// (also exported) which gives the most recent state on subscribe
+// (e.g. when the page re-mounts mid-download). The source of
+// truth across app restarts is the SQLite `cloud_video_downloads`
+// table, queried separately by `getDownloadedSceneSource`.
+export type DownloadStateListener = (state: {
+  status: 'idle' | 'resolving' | 'downloading' | 'paused' | 'completed' | 'error';
+  progress: number;
+  totalBytesWritten: number;
+  totalBytesExpectedToWrite: number;
+  speedBytesPerSecond: number;
+  errorMessage?: string;
+} | null) => void;
+
+const downloadListeners = new Map<string, Set<DownloadStateListener>>();
+
+function notifyDownloadListeners(taskKey: string) {
+  const listeners = downloadListeners.get(taskKey);
+  if (!listeners) return;
+  const entry = downloadEntryCache.get(taskKey);
+  const payload = entry ? {
+    status: entry.status,
+    progress: entry.progress,
+    totalBytesWritten: entry.totalBytesWritten ?? 0,
+    totalBytesExpectedToWrite: entry.totalBytesExpectedToWrite ?? 0,
+    speedBytesPerSecond: entry.speedBytesPerSecond ?? 0,
+    errorMessage: entry.errorMessage,
+  } : null;
+  listeners.forEach((listener) => {
+    try { listener(payload); } catch { /* listener errors are non-fatal */ }
+  });
+}
+
+export function subscribeDownloadState(
+  sceneId: string,
+  provider: CloudVideoProvider,
+  listener: DownloadStateListener,
+): () => void {
+  const taskKey = getDownloadTaskKey(sceneId, provider);
+  const set = downloadListeners.get(taskKey) ?? new Set<DownloadStateListener>();
+  set.add(listener);
+  downloadListeners.set(taskKey, set);
+  return () => {
+    const current = downloadListeners.get(taskKey);
+    if (!current) return;
+    current.delete(listener);
+    if (current.size === 0) downloadListeners.delete(taskKey);
+  };
+}
+
+export function getCachedDownloadEntrySnapshot(
+  sceneId: string,
+  provider: CloudVideoProvider,
+): {
+  status: 'idle' | 'resolving' | 'downloading' | 'paused' | 'completed' | 'error';
+  progress: number;
+  totalBytesWritten: number;
+  totalBytesExpectedToWrite: number;
+  speedBytesPerSecond: number;
+  errorMessage?: string;
+} | null {
+  const taskKey = getDownloadTaskKey(sceneId, provider);
+  const entry = downloadEntryCache.get(taskKey);
+  if (!entry) return null;
+  return {
+    status: entry.status,
+    progress: entry.progress,
+    totalBytesWritten: entry.totalBytesWritten ?? 0,
+    totalBytesExpectedToWrite: entry.totalBytesExpectedToWrite ?? 0,
+    speedBytesPerSecond: entry.speedBytesPerSecond ?? 0,
+    errorMessage: entry.errorMessage,
+  };
+}
+
 function getCloudCacheDir() {
   return new Directory(Paths.cache, 'cloud-video-cache');
 }
@@ -268,6 +345,11 @@ async function patchDownloadEntry(
   };
   const taskKey = getDownloadTaskKey(sceneId, provider);
   downloadEntryCache.set(taskKey, next);
+  // Fan out to in-memory subscribers (collection detail rows
+  // use this to animate the cache chip without re-rendering the
+  // whole page). Listener errors are swallowed; the entry is
+  // the source of truth.
+  notifyDownloadListeners(taskKey);
   const lastPersistAt = progressPersistTimestamps[taskKey] || 0;
   const shouldPersist = forcePersist || Date.now() - lastPersistAt >= DOWNLOAD_PROGRESS_PERSIST_INTERVAL_MS;
   if (shouldPersist) {

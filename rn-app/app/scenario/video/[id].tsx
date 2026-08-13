@@ -1,9 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Alert, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem } from 'react-native';
+import { Alert, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ScrollView, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem } from 'react-native';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import * as Haptics from 'expo-haptics';
-import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical } from 'lucide-react-native';
+import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RefreshCw, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../../constants/theme';
 import { getVideoSceneById, getVideoSceneSummaryById, invalidateVideoSceneCaches, type VideoSceneDetail, type VideoSceneSegment, type WordTiming } from '../../../lib/content/video-scenes';
@@ -21,7 +21,13 @@ import { bindOfficialSceneToProvider, getBaiduPanBinding, getDownloadedSceneSour
 import { CLOUD_DOWNLOAD_SLOW_HELP_MESSAGE, CLOUD_DOWNLOAD_SLOW_HELP_TITLE } from '../../../lib/content/cloud-download-help';
 import { downloadImportedCloudVideo, downloadOfficialSceneVideo, pauseOfficialSceneVideoDownload, removeOfficialSceneVideoDownload, resolveCloudReferencedVideoSource, resolveOfficialSceneVideoSource, resumeOfficialSceneVideoDownload } from '../../../lib/content/cloud-video-playback';
 import { generateVideoAiPracticeCards, getVideoAiPracticeGenerationState, loadGeneratedVideoAiPracticeCards, subscribeVideoAiPracticeGenerationState, type VideoAiPracticeGenerationState, type VideoAiPracticeGenerationStatus } from '../../../lib/content/video-ai-practice';
-import { getVideoUserMeta, markVideoScenePracticed, setVideoSceneFavorite } from '../../../lib/content/video-user-meta';
+import {
+  generateUserVideoAiPracticeCards,
+  getUserVideoAiPracticeState,
+  loadGeneratedUserVideoAiPracticeCards,
+  subscribeUserVideoAiPracticeState,
+} from '../../../lib/content/user-video-ai-practice';
+import { getVideoUserMeta, markVideoScenePracticed } from '../../../lib/content/video-user-meta';
 import {
   createCard,
   deleteCard,
@@ -30,7 +36,9 @@ import {
 } from '../../../lib/database';
 import { prewarmDictionaryDb } from '../../../lib/dictionary/db';
 import { lookupWord as queryDictionaryWord } from '../../../lib/dictionary/query';
-import { deleteUserVideoEntry, triggerCloudVideoSubtitleGeneration, triggerUserVideoSubtitleGeneration } from '../../../lib/content/user-videos';
+import { deleteUserVideoEntry, setUserVideoCollection, triggerCloudVideoSubtitleGeneration, triggerUserVideoSubtitleGeneration } from '../../../lib/content/user-videos';
+import { encodeUserCollectionId, listUserCollections } from '../../../lib/content/user-collections';
+import { invalidateCollectionsCache } from '../../../lib/content/collections';
 
 function WordHighlightText({
   words,
@@ -1361,7 +1369,59 @@ function VideoLearningPlayer({
     setVideoAiStreamTargetCount(generationState?.targetCount ?? 0);
   }, [filterValidAiCards]);
 
+  // Map a user-video AI practice state onto the playback page's
+  // existing VideoAiPracticeGenerationStatus shape so the picker
+  // UI doesn't have to branch on the underlying data source. The
+  // mapping collapses both `processing` phases into 'generating',
+  // and treats `ready` / `idle` / null all as 'idle' until the
+  // caller refreshes from disk (the user-video load path handles
+  // that).
+  const applyUserVideoAiSnapshot = useCallback((
+    state: { status: 'idle' | 'processing' | 'ready' | 'error'; progressText?: string; errorMessage?: string; parsedCount?: number; targetCount?: number } | null,
+    fallbackCards: ScenarioCard[] = [],
+  ) => {
+    const nextCards = filterValidAiCards(fallbackCards);
+    const mapped: VideoAiPracticeGenerationStatus =
+      state?.status === 'processing' ? 'generating'
+      : state?.status === 'ready' ? 'completed'
+      : state?.status === 'error' ? 'failed'
+      : 'idle';
+    setVideoAiPickerCards(nextCards);
+    setVideoAiGenerationStatus(mapped);
+    setVideoAiGenerationError(state?.errorMessage ?? null);
+    setIsGeneratingVideoAiPractice(mapped === 'generating');
+    setVideoAiProgressText(state?.progressText ?? '当前还没有 AI陪练主题');
+    setVideoAiStreamParsedCount(state?.parsedCount ?? nextCards.length);
+    setVideoAiStreamTargetCount(state?.targetCount ?? 0);
+  }, [filterValidAiCards]);
+
   const syncVideoAiPracticeState = useCallback(async (targetScene: VideoSceneDetail) => {
+    // User-managed imported scenes (百度网盘 / 本地导入) share
+    // the entry-based user-video-ai-practice storage. The scene
+    // id IS the user-video entry id (`user_video_<timestamp>_<hash>`),
+    // so we route through the entry pipeline. This keeps the
+    // collection-detail page's "AI 话题" chip in sync with
+    // whatever the player just generated.
+    if (isUserManagedImportedScene(targetScene)) {
+      const cards = filterValidAiCards(await loadGeneratedUserVideoAiPracticeCards(targetScene.id));
+      const state = await getUserVideoAiPracticeState(targetScene.id);
+      applyUserVideoAiSnapshot(state, cards);
+      return {
+        cards,
+        generationState: state
+          ? {
+              sceneId: targetScene.id,
+              status: state.status === 'processing' ? 'generating' : state.status === 'ready' ? 'completed' : state.status === 'error' ? 'failed' : 'idle',
+              progressText: state.progressText ?? '',
+              parsedCount: state.parsedCount,
+              targetCount: state.targetCount,
+              cards: state.cards.length > 0 ? state.cards : cards,
+              errorMessage: state.errorMessage,
+              updatedAt: state.updatedAt,
+            }
+          : null,
+      };
+    }
     const builtInCards = filterValidAiCards(targetScene.aiPracticeCards);
     const generatedCards = builtInCards.length > 0 ? builtInCards : filterValidAiCards(await loadGeneratedVideoAiPracticeCards(targetScene.id));
     const generationState = await getVideoAiPracticeGenerationState(targetScene.id);
@@ -1370,9 +1430,9 @@ function VideoLearningPlayer({
       cards: generationState?.cards?.length ? filterValidAiCards(generationState.cards) : generatedCards,
       generationState,
     };
-  }, [applyVideoAiGenerationSnapshot, filterValidAiCards]);
+  }, [applyUserVideoAiSnapshot, applyVideoAiGenerationSnapshot, filterValidAiCards]);
 
-  const handleStartGenerateVideoAiPractice = useCallback(async () => {
+  const handleStartGenerateVideoAiPractice = useCallback(async (excludeTitles?: string[]) => {
     setIsVideoAiPickerVisible(true);
     if (videoAiGenerationStatus === 'generating') {
       return;
@@ -1381,10 +1441,33 @@ function VideoLearningPlayer({
     setVideoAiGenerationStatus('generating');
     setIsGeneratingVideoAiPractice(true);
     setVideoAiProgressText('正在准备生成 AI陪练...');
-    setVideoAiStreamParsedCount(videoAiPickerCards.length);
+    // For regeneration, the previous run's titles get carried
+    // over to the LLM as "avoid these" context. For a fresh
+    // first run, pass the currently-displayed titles too — they're
+    // the same titles the user will see when they hit "换一组",
+    // so feeding them in keeps the regen logic consistent.
+    const previousTitles = excludeTitles ?? videoAiPickerCards.map((c) => c.title);
+    setVideoAiStreamParsedCount(0);
     setVideoAiStreamTargetCount(0);
     try {
+      // User-managed imported scenes route through the
+      // entry-based user-video pipeline. The user-video-ai-practice
+      // module is the single source of truth for these entries,
+      // so the collection-detail page's "AI 话题" chip and the
+      // picker here stay in sync.
+      if (isUserManagedImportedScene(scene)) {
+        const cards = filterValidAiCards(
+          await generateUserVideoAiPracticeCards(scene.id, { excludeTitles: previousTitles }),
+        );
+        setVideoAiPickerCards(cards);
+        setVideoAiGenerationStatus('completed');
+        setVideoAiGenerationError(null);
+        setVideoAiStreamParsedCount(cards.length);
+        setVideoAiStreamTargetCount(cards.length);
+        return;
+      }
       const availableCards = filterValidAiCards(await generateVideoAiPracticeCards(scene, {
+        excludeTitles: previousTitles,
         onProgress: (message) => {
           setVideoAiProgressText(message);
         },
@@ -1404,7 +1487,14 @@ function VideoLearningPlayer({
     } finally {
       setIsGeneratingVideoAiPractice(false);
     }
-  }, [filterValidAiCards, scene, videoAiGenerationStatus, videoAiPickerCards.length]);
+  }, [filterValidAiCards, scene, videoAiGenerationStatus, videoAiPickerCards]);
+
+  // Regenerate with a fresh batch — feed the currently-displayed
+  // titles back to the LLM as "avoid these" so the new set leans
+  // into fresh angles instead of re-running near-duplicates.
+  const handleRegenerateVideoAiPractice = useCallback(() => {
+    void handleStartGenerateVideoAiPractice(videoAiPickerCards.map((c) => c.title));
+  }, [handleStartGenerateVideoAiPractice, videoAiPickerCards]);
 
   const handleOpenVideoAiPractice = useCallback(async () => {
     setIsVideoAiPickerVisible(true);
@@ -1414,12 +1504,21 @@ function VideoLearningPlayer({
   useEffect(() => {
     let active = true;
     void syncVideoAiPracticeState(scene);
-    const unsubscribe = subscribeVideoAiPracticeGenerationState(scene.id, (generationState) => {
-      if (!active) {
-        return;
-      }
-      applyVideoAiGenerationSnapshot(generationState, generationState?.cards ?? []);
-    });
+    // Subscribe on the same axis the data lives on. User-managed
+    // imported scenes drive off the entry-based pipeline; the
+    // collection-detail page's "AI 话题" chip is the same listener
+    // so progress / completion shows up in both UIs.
+    const unsubscribe = isUserManagedImportedScene(scene)
+      ? subscribeUserVideoAiPracticeState(scene.id, (state) => {
+          if (!active) return;
+          applyUserVideoAiSnapshot(state, state?.cards ?? []);
+        })
+      : subscribeVideoAiPracticeGenerationState(scene.id, (generationState) => {
+          if (!active) {
+            return;
+          }
+          applyVideoAiGenerationSnapshot(generationState, generationState?.cards ?? []);
+        });
     return () => {
       active = false;
       unsubscribe();
@@ -2659,6 +2758,21 @@ function VideoLearningPlayer({
               ListHeaderComponent={videoAiPickerCards.length > 0 ? (
                 <View style={styles.videoAiPickerListHeader}>
                   <Text style={styles.videoAiPickerSectionTitle}>{isGeneratingVideoAiPractice ? '已生成的话题' : '可选话题'}</Text>
+                  {/* "换一组" — regenerate with the displayed
+                      titles fed back as "avoid these" so the new
+                      batch leans into fresh angles. Hidden while
+                      a generation is in flight to avoid double
+                      triggers. */}
+                  {!isGeneratingVideoAiPractice ? (
+                    <Pressable
+                      style={styles.videoAiPickerRegenerateBtn}
+                      onPress={handleRegenerateVideoAiPractice}
+                      hitSlop={6}
+                    >
+                      <RefreshCw size={14} color={colors.primary} />
+                      <Text style={styles.videoAiPickerRegenerateBtnText}>换一组</Text>
+                    </Pressable>
+                  ) : null}
                 </View>
               ) : null}
               ListEmptyComponent={(
@@ -2724,13 +2838,18 @@ export default function VideoSceneDetailScreen() {
   const insets = useSafeAreaInsets();
   const [scene, setScene] = useState<VideoSceneDetail | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [isVideoFavorited, setIsVideoFavorited] = useState(false);
   const [headerProviderState, setHeaderProviderState] = useState<VideoSourceProviderState | null>(null);
   const [headerDownloadEntry, setHeaderDownloadEntry] = useState<DownloadedSceneSource | null>(null);
   const [isHeaderMenuVisible, setIsHeaderMenuVisible] = useState(false);
   const [isHeaderBindPickerVisible, setIsHeaderBindPickerVisible] = useState(false);
   const [isCacheSheetVisible, setIsCacheSheetVisible] = useState(false);
   const [isCacheActionBusy, setIsCacheActionBusy] = useState(false);
+  // Move-to-collection picker (for user-imported videos). Distinct
+  // from the cache / delete modals above — opens when the user
+  // picks "移动到合集" in the three-dot menu.
+  const [isMovePickerVisible, setIsMovePickerVisible] = useState(false);
+  const [movePickerCollections, setMovePickerCollections] = useState<{ id: number; title: string; is_default: boolean }[]>([]);
+  const [isMovePickerLoading, setIsMovePickerLoading] = useState(false);
   const hasCompletedInitialSceneLoadRef = useRef(false);
   const lastHeaderDownloadStatusRef = useRef<DownloadedSceneSource['status'] | null>(null);
 
@@ -2864,30 +2983,6 @@ export default function VideoSceneDetailScreen() {
       clipStartMs: scene.clipStartMs,
       clipEndMs: scene.clipEndMs,
     });
-  }, [scene]);
-
-  useEffect(() => {
-    if (!scene) {
-      setIsVideoFavorited(false);
-      return;
-    }
-    let active = true;
-    void getVideoUserMeta(scene.id)
-      .then((meta) => {
-        if (!active) {
-          return;
-        }
-        setIsVideoFavorited(Boolean(meta?.isFavorite));
-      })
-      .catch(() => {
-        if (!active) {
-          return;
-        }
-        setIsVideoFavorited(false);
-      });
-    return () => {
-      active = false;
-    };
   }, [scene]);
 
   useEffect(() => {
@@ -3171,22 +3266,6 @@ export default function VideoSceneDetailScreen() {
 
   const handleBack = () => router.back();
 
-  const handleToggleVideoFavorite = useCallback(async () => {
-    if (!scene) {
-      return;
-    }
-    const nextFavorite = !isVideoFavorited;
-    setIsHeaderMenuVisible(false);
-    setIsVideoFavorited(nextFavorite);
-    try {
-      const nextMeta = await setVideoSceneFavorite(scene.id, nextFavorite);
-      setIsVideoFavorited(Boolean(nextMeta.isFavorite));
-    } catch (error) {
-      setIsVideoFavorited(!nextFavorite);
-      Alert.alert('操作失败', error instanceof Error ? error.message : '请稍后重试');
-    }
-  }, [isVideoFavorited, scene]);
-
   const handleDeleteImportedVideo = useCallback(() => {
     if (!scene || !isImportedDeleteMenuEnabled || isCacheActionBusy) {
       return;
@@ -3216,6 +3295,65 @@ export default function VideoSceneDetailScreen() {
       },
     ]);
   }, [isCacheActionBusy, isImportedDeleteMenuEnabled, router, scene]);
+
+  // ── Move-to-collection (user-imported videos only) ────────
+  // Tapping "移动到合集" in the three-dot menu opens a sub-sheet
+  // listing every user collection. Pick a target → rewrite the
+  // entry's `collectionId`, refresh caches, close the menu and
+  // stay on the player (so the user can keep practicing without
+  // losing their place).
+  const handleOpenMovePicker = useCallback(async () => {
+    if (!scene) return;
+    setIsHeaderMenuVisible(false);
+    setIsMovePickerVisible(true);
+    setIsMovePickerLoading(true);
+    try {
+      const list = await listUserCollections();
+      setMovePickerCollections(list.map((c) => ({
+        id: c.id,
+        title: c.title,
+        is_default: c.is_default,
+      })));
+    } catch (error) {
+      console.warn('[VideoScene] load move picker collections failed', {
+        sceneId: scene.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      setMovePickerCollections([]);
+    } finally {
+      setIsMovePickerLoading(false);
+    }
+  }, [scene]);
+
+  const handleCloseMovePicker = useCallback(() => {
+    setIsMovePickerVisible(false);
+  }, []);
+
+  const handlePickMoveTarget = useCallback(
+    async (targetWireId: string) => {
+      const currentScene = scene;
+      if (!currentScene) return;
+      try {
+        const updated = await setUserVideoCollection(currentScene.id, targetWireId);
+        if (!updated) {
+          Alert.alert('移动失败', '找不到这个视频');
+          return;
+        }
+        // Bust caches so the home grid and the back-navigated
+        // collection detail both re-read the new collectionId.
+        invalidateVideoSceneCaches([currentScene.id]);
+        invalidateCollectionsCache();
+        setIsMovePickerVisible(false);
+        const targetTitle = movePickerCollections.find(
+          (c) => encodeUserCollectionId(c.id) === targetWireId,
+        )?.title ?? '合集';
+        Alert.alert('已移动', `已移到 ${targetTitle}`);
+      } catch (error) {
+        Alert.alert('移动失败', error instanceof Error ? error.message : String(error));
+      }
+    },
+    [movePickerCollections, scene],
+  );
 
   const handleUnbindCloudVideo = useCallback(() => {
     if (!scene || !headerProviderState?.provider || !isManualHeaderBinding) {
@@ -3301,15 +3439,7 @@ export default function VideoSceneDetailScreen() {
       >
         <View style={styles.headerMenuOverlay}>
           <Pressable style={StyleSheet.absoluteFillObject} onPress={() => setIsHeaderMenuVisible(false)} />
-          <View style={[styles.headerMenuCard, { top: Math.max(insets.top + 34, 34) }]}> 
-            <Pressable
-              style={styles.headerMenuItem}
-              onPress={() => {
-                void handleToggleVideoFavorite();
-              }}
-            >
-              <Text style={styles.headerMenuItemText}>{isVideoFavorited ? '取消收藏视频' : '收藏视频'}</Text>
-            </Pressable>
+          <View style={[styles.headerMenuCard, { top: Math.max(insets.top + 34, 34) }]}>
             {scene?.contentOrigin === 'official' && scene.officialAssetKeys ? (
               <>
                 {headerCacheStatusText ? (
@@ -3389,6 +3519,12 @@ export default function VideoSceneDetailScreen() {
                     <Text style={styles.headerMenuItemText}>{cachePrimaryActionLabel}</Text>
                   </Pressable>
                 ) : null}
+                <Pressable
+                  style={styles.headerMenuItem}
+                  onPress={handleOpenMovePicker}
+                >
+                  <Text style={styles.headerMenuItemText}>移动到合集</Text>
+                </Pressable>
                 <Pressable
                   style={styles.headerMenuItem}
                   onPress={handleDeleteImportedVideo}
@@ -3513,6 +3649,56 @@ export default function VideoSceneDetailScreen() {
           </View>
         </View>
       </Modal>
+
+      {/* ── Move-to-collection picker (user-imported videos only) ──
+            Same visual family as the collection-detail move picker:
+            list of user collections with a "默认" badge on the
+            default one. We don't pre-filter "current" because the
+            video player doesn't know which collection the user
+            opened it from — any non-default target is valid. */}
+      <Modal
+        visible={isMovePickerVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={handleCloseMovePicker}
+      >
+        <View style={styles.sheetOverlay}>
+          <Pressable
+            style={{ flex: 1 }}
+            onPress={handleCloseMovePicker}
+          />
+          <View style={styles.movePickerSheet}>
+            <View style={styles.movePickerSheetHandle} />
+            <Text style={styles.movePickerSheetTitle}>移动到哪个合集</Text>
+            {isMovePickerLoading ? (
+              <ActivityIndicator size="small" color={colors.primary} />
+            ) : (
+              <ScrollView style={styles.movePickerSheetList} showsVerticalScrollIndicator={false}>
+                {movePickerCollections.map((c) => {
+                  const wireId = encodeUserCollectionId(c.id);
+                  return (
+                    <Pressable
+                      key={c.id}
+                      style={styles.movePickerSheetRow}
+                      onPress={() => void handlePickMoveTarget(wireId)}
+                    >
+                      <Text style={styles.movePickerSheetRowText} numberOfLines={1}>
+                        {c.title}
+                      </Text>
+                      {c.is_default ? (
+                        <Text style={styles.movePickerSheetRowBadge}>默认</Text>
+                      ) : null}
+                    </Pressable>
+                  );
+                })}
+                {movePickerCollections.length === 0 ? (
+                  <Text style={styles.movePickerSheetEmpty}>还没有合集可移动</Text>
+                ) : null}
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -3535,6 +3721,68 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.sm,
     paddingBottom: spacing.lg,
+  },
+
+  // ── Move-to-collection picker (user-imported videos) ─────
+  // Visually matches the home page's addMenu / pickerSheet:
+  // surface card, 28px top radius, hugged content. The handle
+  // sits at the top so it reads as "another bottom sheet" in
+  // this same UX family.
+  movePickerSheet: {
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xl,
+    gap: spacing.md,
+    maxHeight: '70%',
+  },
+  movePickerSheetHandle: {
+    width: 40,
+    height: 5,
+    backgroundColor: colors.border.default,
+    borderRadius: borderRadius.full,
+    alignSelf: 'center',
+    marginBottom: spacing.sm,
+  },
+  movePickerSheetTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: fontWeight.bold,
+    color: colors.text.primary,
+  },
+  movePickerSheetList: {
+    maxHeight: 360,
+  },
+  movePickerSheetRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border.default,
+  },
+  movePickerSheetRowText: {
+    flex: 1,
+    fontSize: fontSize.base,
+    color: colors.text.primary,
+    fontWeight: fontWeight.medium,
+  },
+  movePickerSheetRowBadge: {
+    fontSize: fontSize.xs,
+    color: colors.text.tertiary,
+    backgroundColor: 'rgba(0,0,0,0.04)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: borderRadius.sm,
+    overflow: 'hidden',
+    marginLeft: spacing.sm,
+  },
+  movePickerSheetEmpty: {
+    fontSize: fontSize.sm,
+    color: colors.text.tertiary,
+    textAlign: 'center',
+    paddingVertical: spacing.lg,
   },
   bindPickerSheetBody: {
     minHeight: 360,
@@ -3987,8 +4235,25 @@ const styles = StyleSheet.create({
     marginLeft: 24,
   },
   videoAiPickerListHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     paddingTop: spacing.xs,
     paddingBottom: spacing.xs,
+  },
+  videoAiPickerRegenerateBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: borderRadius.full,
+    backgroundColor: 'rgba(37,99,235,0.08)',
+  },
+  videoAiPickerRegenerateBtnText: {
+    fontSize: fontSize.xs,
+    color: colors.primary,
+    fontWeight: fontWeight.semibold,
   },
   videoAiPickerSectionTitle: {
     color: '#64748B',

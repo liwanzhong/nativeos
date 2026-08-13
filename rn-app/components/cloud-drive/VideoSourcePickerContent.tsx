@@ -47,6 +47,13 @@ type VideoSourcePickerContentProps = {
   onRequestGoToMountDrives?: () => void;
   fixedProvider?: CloudVideoProvider | null;
   visible?: boolean;
+  /**
+   * Wire id of the collection the next import should land in. Used
+   * by the cloud-browser import path (which calls
+   * `createCloudVideoReference` directly, not via `onCloudFileSelected`,
+   * so the parent has to pass the target down explicitly).
+   */
+  collectionId?: string;
 };
 
 type PickerView = 'overview' | 'cloud_browser' | 'cloud_video_list';
@@ -82,6 +89,7 @@ export function VideoSourcePickerContent({
   onRequestGoToMountDrives,
   fixedProvider = null,
   visible,
+  collectionId,
 }: VideoSourcePickerContentProps) {
   const [activeView, setActiveView] = useState<PickerView>('overview');
   const [configuredProviders, setConfiguredProviders] = useState<CloudVideoProvider[]>([]);
@@ -270,6 +278,12 @@ export function VideoSourcePickerContent({
         remoteFileId: item.baiduFsId,
         remoteFileName: item.name,
         fileSize: item.size,
+        // Without this, the cloud-browser import path (which calls
+        // createCloudVideoReference directly, bypassing the parent)
+        // would always land in the default collection — even when
+        // the user explicitly picked a custom one in the inline
+        // selector.
+        collectionId,
       });
       if (entry && onCloudImportSuccess) {
         onCloudImportSuccess(entry);
@@ -291,7 +305,7 @@ export function VideoSourcePickerContent({
     } finally {
       setImportingKey(null);
     }
-  }, [activeBrowserProvider, importingKey, mode, onCloudFileSelected, onCloudImportSuccess]);
+  }, [activeBrowserProvider, collectionId, importingKey, mode, onCloudFileSelected, onCloudImportSuccess]);
 
   const handleDownloadCloudFile = useCallback(async (item: UnifiedFileItem) => {
     if (!activeBrowserProvider || !onDownloadCloudVideo || downloadingKey || mode !== 'import') {

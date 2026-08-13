@@ -11,6 +11,7 @@ import {
 } from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { z } from 'zod';
+import { getOrCreateDefaultCollection, encodeUserCollectionId } from './user-collections';
 
 const IMPORT_ROOT_DIR = `${documentDirectory ?? ''}imported-video-packs`;
 const IMPORT_INDEX_PATH = `${IMPORT_ROOT_DIR}/index.json`;
@@ -64,6 +65,16 @@ const importedVideoPackIndexEntrySchema = z.object({
   infoFileName: z.string().optional(),
   coverFileName: z.string().optional(),
   aiPracticeFileName: z.string().optional(),
+  /**
+   * Owning collection id. Encoded as `"user:<bigserial>"` for
+   * user-built collections; absent / null means "uncategorised —
+   * surface it under the default collection at read time".
+   *
+   * Set on import (assigned by the import flow) and editable from
+   * the video detail page. Empty string is treated the same as
+   * absent.
+   */
+  collectionId: z.string().optional(),
 });
 
 const importedVideoPackIndexSchema = z.object({
@@ -77,6 +88,11 @@ export type ImportedVideoPackIndexEntry = z.infer<typeof importedVideoPackIndexE
 interface ImportVideoPackSourceOptions {
   sourceName?: string | null;
   mimeType?: string | null;
+  /**
+   * Owning collection wire id. See `ImportLocalVideoOptions` in
+   * user-videos.ts for the same semantics.
+   */
+  collectionId?: string;
 }
 
 let pendingImportedVideoPackUri: string | null = null;
@@ -187,7 +203,7 @@ async function writeImportIndex(items: ImportedVideoPackIndexEntry[]) {
   });
 }
 
-function buildImportedIndexEntry(manifest: ImportedVideoPackManifest, packageDir: string): ImportedVideoPackIndexEntry {
+function buildImportedIndexEntry(manifest: ImportedVideoPackManifest, packageDir: string, collectionId?: string): ImportedVideoPackIndexEntry {
   const manifestUri = joinPath(packageDir, 'manifest.json');
   return {
     id: manifest.id,
@@ -216,6 +232,7 @@ function buildImportedIndexEntry(manifest: ImportedVideoPackManifest, packageDir
     infoFileName: manifest.infoFile,
     coverFileName: manifest.coverFile,
     aiPracticeFileName: manifest.aiPracticeFile,
+    collectionId,
   };
 }
 
@@ -332,7 +349,13 @@ export async function importVideoPackFromUri(sourceUri: string, options: ImportV
     await cleanupPath(packageDir);
     await moveAsync({ from: extractDir, to: packageDir });
 
-    const entry = buildImportedIndexEntry(manifest, packageDir);
+    // Resolve owning collection. Picker can pass a non-default
+    // wire id; otherwise lazy-create default. Same rationale as
+    // user-videos imports.
+    const targetCollectionId = options.collectionId
+      ?? encodeUserCollectionId((await getOrCreateDefaultCollection()).id);
+
+    const entry = buildImportedIndexEntry(manifest, packageDir, targetCollectionId);
     const index = await readImportIndex();
     const nextItems = index.items.filter((item) => item.id !== entry.id);
     nextItems.unshift(entry);
@@ -358,4 +381,56 @@ export async function pickAndImportVideoPack() {
     sourceName: result.assets[0].name,
     mimeType: result.assets[0].mimeType,
   });
+}
+
+/**
+ * Move a pack entry to a different collection, or clear its
+ * `collectionId` (passing `undefined`) so the pack falls back to
+ * the default collection. The pack's actual files on disk are
+ * NOT touched — only the index row is updated. Use this for
+ * non-destructive "remove from this custom collection". For real
+ * delete, call `deleteImportedVideoPack`.
+ */
+export async function setImportedVideoPackCollection(
+  id: string,
+  collectionId: string | undefined,
+): Promise<ImportedVideoPackIndexEntry | null> {
+  const index = await readImportIndex();
+  const target = index.items.find((item) => item.id === id);
+  if (!target) {
+    console.warn('[ImportedVideoPackCollection] entry not found', { id });
+    return null;
+  }
+  const nextItems = index.items.map((item) =>
+    item.id === id ? { ...item, collectionId } : item,
+  );
+  await writeImportIndex(nextItems);
+  return nextItems.find((item) => item.id === id) ?? null;
+}
+
+/**
+ * Hard-delete an imported pack: remove the index row AND delete
+ * the pack's directory (video, subtitles, cover, etc.). Used
+ * when the user removes a pack from the default collection —
+ * the catch-all sink — so there's nowhere else for it to land.
+ */
+export async function deleteImportedVideoPack(id: string): Promise<ImportedVideoPackIndexEntry | null> {
+  const index = await readImportIndex();
+  const target = index.items.find((item) => item.id === id);
+  if (!target) {
+    return null;
+  }
+  // Best-effort cleanup of the pack directory. We don't fail the
+  // delete if cleanup throws (e.g. file already gone) — the index
+  // row removal is the source of truth.
+  try {
+    await cleanupPath(target.packageDir);
+  } catch (err) {
+    console.warn('[ImportedVideoPackDelete] cleanupPath failed (continuing)', {
+      id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  await writeImportIndex(index.items.filter((item) => item.id !== id));
+  return target;
 }

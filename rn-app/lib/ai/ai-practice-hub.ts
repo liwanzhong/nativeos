@@ -160,9 +160,32 @@ function buildVideoTopicItem(scene: VideoSceneDetail, card: ScenarioCard, userLe
   };
 }
 
-export async function listVideoAiTopicGroups(userLevel: string, forceRefresh: boolean = false): Promise<VideoAiTopicGroup[]> {
+export async function listVideoAiTopicGroups(
+  userLevel: string,
+  forceRefresh: boolean = false,
+  pickedSeriesIds: Set<string> | null = null,
+): Promise<VideoAiTopicGroup[]> {
   const scenes = await getFeaturedVideoScenes(forceRefresh);
-  const groups: Array<VideoAiTopicGroup | null> = await Promise.all(scenes.map(async (scene) => {
+
+  // After the videos-tab redesign ("我的跟练" entry), the AI practice
+  // tab only shows topics derived from series the user has explicitly
+  // picked. Pass `pickedSeriesIds = null` to keep the legacy behaviour
+  // (show every official scene's topics) — used by previews, debug
+  // screens, and the initial 0.5 release while we ship the picker.
+  //
+  // An empty Set is NOT the same as null: empty = "user is signed in
+  // but hasn't picked anything yet, so this section should be empty".
+  const isOfficial = (scene: VideoSceneDetail) =>
+    scene.contentOrigin !== 'imported' && typeof scene.groupId === 'string' && scene.groupId.length > 0;
+
+  const filteredScenes = pickedSeriesIds === null
+    ? scenes
+    : scenes.filter((scene) => {
+        if (!isOfficial(scene)) return false;
+        return pickedSeriesIds.has(scene.groupId as string);
+      });
+
+  const groups: Array<VideoAiTopicGroup | null> = await Promise.all(filteredScenes.map(async (scene) => {
     const cards = await loadSceneAiCards(scene);
     if (cards.length === 0) {
       return null;
