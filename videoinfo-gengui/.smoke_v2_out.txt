@@ -1,0 +1,44 @@
+﻿============================================================
+Test 1: build mock fixture
+============================================================
+  [info] video_dir: SUMMER FUN at the Water Park
+  [OK] fixture: 1 parent info.json + 1 parent subtitle + 7 chapter subdirs (each with mp4, no info.json)
+
+============================================================
+Test 2: _split_subtitles_by_chapter against mock data
+============================================================
+  [log] [字幕切分] 发现 7 个章节 + 1 个父字幕, 开始按章节切分...
+  [log] [字幕切分] 01 - Water Park: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 02 - Swimming Lesson: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 03 - Swimming: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 04 - Sunny Day Games: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 05 - Cruise Ship Holiday: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 06 - On the Sea: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 07 - Surfing: 1 个时间点 ← SUMMER FUN at the Water Park.en.json3
+  [log] [字幕切分] 完成, 共 7 个字幕文件, 7 个时间点
+  [OK] all 7 chapter subdirs have sliced subtitle
+
+============================================================
+Test 3: verify sliced content matches chapter time ranges
+============================================================
+  [OK] 01 - Water Park: 1 event at 135000ms (re-anchored, chapter duration 270000ms)
+  [OK] 02 - Swimming Lesson: 1 event at 135000ms (re-anchored, chapter duration 270000ms)
+  [OK] 03 - Swimming: 1 event at 134500ms (re-anchored, chapter duration 269000ms)
+  [OK] 04 - Sunny Day Games: 1 event at 135000ms (re-anchored, chapter duration 270000ms)
+  [OK] 05 - Cruise Ship Holiday: 1 event at 134500ms (re-anchored, chapter duration 269000ms)
+  [OK] 06 - On the Sea: 1 event at 135000ms (re-anchored, chapter duration 270000ms)
+  [OK] 07 - Surfing: 1 event at 134500ms (re-anchored, chapter duration 269000ms)
+
+============================================================
+Test 4: edge case - parent info.json without chapters array
+============================================================
+  [OK] correctly skipped when no chapters array
+
+============================================================
+Test 5: edge case - parent subtitle missing
+============================================================
+  [OK] correctly skipped when no parent subtitle
+
+============================================================
+All tests passed!
+============================================================

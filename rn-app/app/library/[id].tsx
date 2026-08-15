@@ -59,9 +59,10 @@ import {
 import { useCallback, useState } from 'react';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../constants/theme';
 import {
-  getOfficialVideoSeriesById,
+  getOfficialVideoSeriesById as getOfficialVideoSeriesByIdLegacy,
   type OfficialVideoSeriesDetail,
 } from '../../lib/content/video-series';
+import { getOfficialVideoSeriesDetailFromSupabase } from '../../lib/content/video-series-supabase-views';
 import { listMyPickedSeriesIds, pickSeries, unpickSeries } from '../../lib/content/user-picked-series';
 import { invalidateCollectionsCache } from '../../lib/content/collections';
 import { invalidateVideoSeriesViewsCache } from '../../lib/content/video-series-supabase-views';
@@ -103,10 +104,20 @@ export default function LibraryDetailPage() {
     if (!seriesId) return;
     setIsLoading(true);
     try {
-      const [detail, pickedIds] = await Promise.all([
-        getOfficialVideoSeriesById(seriesId, forceRefresh),
+      // Supabase is the source of truth (per-series row in
+      // `official_video_series` + per-episode rows in
+      // `official_video_episodes`). Fall back to the legacy
+      // OSS-catalog path if Supabase doesn't know the series —
+      // e.g. a series that was uploaded but never re-imported
+      // after the table was created.
+      const [pickedIds, supabaseResult] = await Promise.all([
         listMyPickedSeriesIds(),
+        getOfficialVideoSeriesDetailFromSupabase(seriesId, forceRefresh),
       ]);
+      let detail = supabaseResult;
+      if (!detail) {
+        detail = await getOfficialVideoSeriesByIdLegacy(seriesId, forceRefresh);
+      }
       setSeries(detail);
       setIsPicked(pickedIds.has(seriesId));
     } catch (err) {

@@ -453,19 +453,29 @@ _QUALITY_BORDERLINE = 'borderline'
 _QUALITY_BAD = 'bad'
 
 ENGLISH_SEGMENTATION_SYSTEM_PROMPT = """\
-You segment auto-generated English subtitle units into natural sentence-level subtitles.
+You are a subtitle text normalizer. For each input unit, output EXACTLY ONE
+segment that covers that single unit. Do NOT merge units. Do NOT split units.
 
-Return JSON only in this format:
-{"segments":[{"startUnit":1,"endUnit":2,"text":"Sentence text."}]}
-
-Rules:
-- Cover every input unit exactly once, in order, with no gaps and no overlaps.
-- `startUnit` and `endUnit` are 1-based and refer to the provided units.
-- Only merge adjacent units. Do not reorder units.
+HARD RULES — strict 1-to-1 mapping:
+- Every input unit must appear in the output as its OWN segment.
+- `startUnit` MUST equal `endUnit` for every segment.
+- The number of output segments must equal the number of input units.
+- Do not reorder units.
 - Do not drop content. Do not invent content.
-- Keep wording faithful to the source. You may add punctuation and normal capitalization.
-- Each `text` must be a complete readable English subtitle sentence.
-- Output JSON only."""
+
+What you MAY change in the text:
+- Add missing sentence-final punctuation (`.` `!` `?`).
+- Add commas, apostrophes, hyphens, or dashes where grammatically needed.
+- Capitalize the first letter of each sentence.
+- Capitalize proper nouns (e.g. "George" not "george", "Peppa" not "peppa").
+- Fix obvious ASR word errors only if you are very confident.
+
+What you MUST NOT change:
+- The words themselves.
+- The order of words.
+
+Return JSON only in this format (note: startUnit == endUnit for every segment):
+{"segments":[{"startUnit":1,"endUnit":1,"text":"Tropical day trip."}, {"startUnit":2,"endUnit":2,"text":"Peppa and George are on a cruise ship holiday."}]}"""
 
 
 def _normalize_space(text: str) -> str:
@@ -491,7 +501,12 @@ def _to_speech_events(events: list[dict]) -> list[dict]:
 
 
 def _to_timed_word_tokens(speech_events: list[dict]) -> list[dict]:
-    """Extract word-level tokens with timing from speech events."""
+    """Extract word-level tokens with timing from speech events.
+
+    每个 token 带 eventIndex 字段,方便调用方按 ASR event 边界切句
+    (mirror app 端的 groupTokensByEvent)。丢掉 eventIndex 会导致
+    跨 event 句子被合并,进而中英字幕 ID 错位。
+    """
     tokens: list[dict] = []
     for idx, entry in enumerate(speech_events):
         event = entry['event']
@@ -524,6 +539,7 @@ def _to_timed_word_tokens(speech_events: list[dict]) -> list[dict]:
                 'startMs': start_ms,
                 'endMs': max(start_ms, end_ms),
                 'tokenIndex': len(tokens),
+                'eventIndex': idx,  # 用于按 ASR event 边界切句
             })
     return tokens
 
@@ -592,29 +608,48 @@ def parse_json3_to_sentences(json3_path: Path) -> list[dict]:
     """Parse a json3 subtitle file into sentence-level segments.
 
     Returns list of {'id': 'cc-seg-N', 'startMs': int, 'endMs': int, 'text': str}.
-    The segmentation logic mirrors rn-app/lib/content/json3-parser.ts exactly.
+    The segmentation logic mirrors rn-app/lib/content/json3-parser.ts exactly,
+    including the critical "按 ASR event 边界切句" step: 每个 ASR event 结尾
+    一定 flush 一次,丢掉 VAD 分句会导致中英字幕 ID 错位 (translations key
+    cc-seg-N 跟 app 端 parseJson3Subtitles 算的 N 对不上)。
     """
     data = json.loads(json3_path.read_text('utf-8'))
     events = data.get('events', [])
     speech_events = _to_speech_events(events)
     timed_tokens = _to_timed_word_tokens(speech_events)
 
-    segments: list[dict] = []
-    sentence_tokens: list[dict] = []
-
+    # 按 ASR event 边界分组 token (mirror app 端的 groupTokensByEvent)
+    # 每个内层数组对应一个 ASR event 的所有 token
+    event_groups: list[list[dict]] = []
+    current_group: list[dict] = []
     for token in timed_tokens:
-        sentence_tokens.append(token)
-        trimmed = token['text'].strip()
-        if not trimmed or not _SENTENCE_END_RE.search(trimmed):
-            continue
-        seg = _finalize_sentence(sentence_tokens, len(segments))
-        if seg:
-            segments.append(seg)
-        sentence_tokens = []
+        # 没有 eventIndex 字段时退化为旧行为,但默认会从 _to_timed_word_tokens
+        # 拿到 eventIndex — 见下面给 token 补字段的逻辑
+        if current_group and token.get('eventIndex') != current_group[-1].get('eventIndex'):
+            event_groups.append(current_group)
+            current_group = []
+        current_group.append(token)
+    if current_group:
+        event_groups.append(current_group)
 
-    trailing = _finalize_sentence(sentence_tokens, len(segments))
-    if trailing:
-        segments.append(trailing)
+    segments: list[dict] = []
+
+    # 每个 event 内部按标点切句,event 结尾一定 flush (mirror app 端)
+    for group_tokens in event_groups:
+        sentence_tokens: list[dict] = []
+        for token in group_tokens:
+            sentence_tokens.append(token)
+            trimmed = token['text'].strip()
+            if not trimmed or not _SENTENCE_END_RE.search(trimmed):
+                continue
+            seg = _finalize_sentence(sentence_tokens, len(segments))
+            if seg:
+                segments.append(seg)
+            sentence_tokens = []
+        # event 结尾 flush,保证每个 ASR utterance 至少落成一段
+        trailing = _finalize_sentence(sentence_tokens, len(segments))
+        if trailing:
+            segments.append(trailing)
 
     return segments
 
@@ -717,39 +752,191 @@ def _normalize_segment_text(text: str) -> str:
 
 
 def _validate_ai_segment_batch(batch: list[dict], raw_segments: Any) -> list[dict]:
+    """宽松验证: LLM 抽风 (合并/丢 unit) 不 raise, 缺失/合并的 unit 用本地 text 兜底.
+
+    切段决策完全本地 (_logic_split_units), LLM 唯一作用是修标点/大写. 所以即使
+    LLM 偶尔合并/丢 1-2 个 unit, 也不影响"一句一段"核心诉求 — 兜底用本地原始
+    text (没修标点但不影响切段).
+
+    返回的是展开后的 1-to-1 segment 数组, 长度 == len(batch), 顺序对齐.
+    """
     if not isinstance(raw_segments, list) or not raw_segments:
         raise RuntimeError('AI 英文断句返回为空或格式不正确')
 
-    validated: list[dict] = []
-    expected_start = 1
+    # 按 startUnit 索引 LLM 输出 (一个 startUnit 最多对应一个 segment)
+    by_start: dict[int, dict] = {}
+    dropped_count = 0
     for item in raw_segments:
         if not isinstance(item, dict):
-            raise RuntimeError('AI 英文断句返回包含无效项目')
-        start_unit = int(item.get('startUnit') or 0)
-        end_unit = int(item.get('endUnit') or 0)
-        text = _normalize_segment_text(str(item.get('text') or ''))
-        if not text:
-            raise RuntimeError('AI 英文断句返回空文本')
-        if start_unit != expected_start or end_unit < start_unit or end_unit > len(batch):
-            raise RuntimeError('AI 英文断句返回的 unit 覆盖不连续')
-        start_sentence = batch[start_unit - 1]
-        end_sentence = batch[end_unit - 1]
-        validated.append({
-            'startToken': int(start_sentence.get('startToken') or 0),
-            'endToken': int(end_sentence.get('endToken') or 0),
-            'startMs': int(start_sentence.get('startMs') or 0),
-            'endMs': int(end_sentence.get('endMs') or 0),
+            continue
+        try:
+            start_u = int(item.get('startUnit') or 0)
+            end_u = int(item.get('endUnit') or start_u)
+        except (TypeError, ValueError):
+            continue
+        if start_u <= 0 or start_u > len(batch):
+            continue
+        if end_u < start_u or end_u > len(batch):
+            end_u = start_u
+        # 如果 start_u 已有, 保留第一个 (LLM 不应该重复)
+        by_start.setdefault(start_u, {'startUnit': start_u, 'endUnit': end_u, 'text': str(item.get('text') or '')})
+
+    expanded: list[dict] = []
+    fallback_count = 0
+    for unit_idx in range(1, len(batch) + 1):
+        sentence = batch[unit_idx - 1]
+        local_text = _normalize_segment_text(str(sentence.get('text') or ''))
+        if unit_idx in by_start:
+            seg = by_start[unit_idx]
+            llm_text = _normalize_segment_text(str(seg.get('text') or ''))
+            start_u = int(seg.get('startUnit') or unit_idx)
+            end_u = int(seg.get('endUnit') or unit_idx)
+            if start_u <= unit_idx <= end_u:
+                # 这个 unit 在 LLM 输出的某个 segment 范围内
+                if start_u == unit_idx:
+                    # 拿到 LLM 修过的 text (作为该 segment 的第一个 unit)
+                    text = llm_text or local_text
+                else:
+                    # LLM 合并到前一个 segment, 本 unit 拿不到 LLM 修的 text
+                    # 用本地原始 text 兜底
+                    text = local_text
+                    fallback_count += 1
+            else:
+                text = local_text
+                fallback_count += 1
+        else:
+            # LLM 没输出这个 unit, 用本地 text
+            text = local_text
+            fallback_count += 1
+        expanded.append({
+            'startToken': int(sentence.get('startToken') or 0),
+            'endToken': int(sentence.get('endToken') or 0),
+            'startMs': int(sentence.get('startMs') or 0),
+            'endMs': int(sentence.get('endMs') or 0),
             'text': text,
         })
-        expected_start = end_unit + 1
 
-    if expected_start != len(batch) + 1:
-        raise RuntimeError('AI 英文断句返回未覆盖全部 unit')
+    # trace: 报告 LLM 抽风程度
+    if dropped_count > 0 or fallback_count > 0 or len(by_start) != len(batch):
+        print(
+            f'  [AI 断句] batch len={len(batch)} llmSegments={len(by_start)} '
+            f'fallbackUnits={fallback_count} (用本地 text 兜底)'
+        )
 
-    return validated
+    return expanded
+
+
+# 2026-08-15: 纯逻辑拆分 — LLM 只修标点/大写, 本地规则按标点切/合并.
+# 切段决策完全本地、确定性, LLM 怎么抽风都不影响"一句一段"核心诉求.
+_UNIT_END_PUNC_RE = re.compile(r'[.!?。！？]["\')]*\s*$')
+
+
+def _looks_like_complete_sentence(text: str) -> bool:
+    """判断一段 text 是不是以 sentence-final punctuation 结尾 (即完整句)."""
+    return bool(_UNIT_END_PUNC_RE.search((text or '').rstrip()))
+
+
+def _build_segment_from_units(units: list[dict]) -> dict:
+    """把一组 unit 合并成一个 segment 字典 (startToken/endToken/startMs/endMs/text)."""
+    if not units:
+        return {
+            'startToken': 0,
+            'endToken': 0,
+            'startMs': 0,
+            'endMs': 0,
+            'text': '',
+        }
+    if len(units) == 1:
+        sentence = units[0]
+        return {
+            'startToken': int(sentence.get('startToken') or 0),
+            'endToken': int(sentence.get('endToken') or 0),
+            'startMs': int(sentence.get('startMs') or 0),
+            'endMs': int(sentence.get('endMs') or 0),
+            'text': str(sentence.get('text') or '').strip(),
+        }
+    # 多个 unit 合并: token/ms 取首尾, text 用空格拼接 (LLM 已修好空格)
+    first = units[0]
+    last = units[-1]
+    text = ' '.join(str(u.get('text') or '').strip() for u in units).strip()
+    # 合并空格的连字符 (e.g. "to-" + "day" → "to-day"), 简单处理就行
+    text = re.sub(r'\s*-\s+', '-', text)  # "to - day" → "to-day"
+    text = re.sub(r'\s+', ' ', text)
+    return {
+        'startToken': int(first.get('startToken') or 0),
+        'endToken': int(last.get('endToken') or 0),
+        'startMs': int(first.get('startMs') or 0),
+        'endMs': int(last.get('endMs') or 0),
+        'text': text,
+    }
+
+
+def _logic_split_units(units: list[dict]) -> list[dict]:
+    """纯逻辑拆分: 按标点切/合并 fragment.
+
+    规则:
+    - 标点结尾的 unit → 闭合当前段, 落成一段
+    - 没标点的 unit (fragment) → 跟后续 unit 合并, 直到遇到有标点的
+    - 末尾 fragment → 跟最后一段合并 (如果有), 否则独立成段
+
+    LLM 只修标点/大写, 不参与切段决策. 这样 100% 稳定可重现.
+    """
+    if not units:
+        return []
+    out: list[dict] = []
+    buf: list[dict] = []
+    for unit in units:
+        buf.append(unit)
+        if _looks_like_complete_sentence(str(unit.get('text') or '')):
+            out.append(_build_segment_from_units(buf))
+            buf = []
+    # 末尾 fragment: 跟最后一段合并 (如果有), 否则独立
+    if buf:
+        if out:
+            last = out[-1]
+            # 把最后一段还原成 unit dict, 再跟 buf 合并
+            last_as_unit = {
+                'startToken': last['startToken'],
+                'endToken': last['endToken'],
+                'startMs': last['startMs'],
+                'endMs': last['endMs'],
+                'text': last['text'],
+            }
+            out[-1] = _build_segment_from_units([last_as_unit] + buf)
+        else:
+            out.append(_build_segment_from_units(buf))
+    return out
+
+
+def _apply_ai_text_corrections_then_split(batch: list[dict], ai_segments: list[dict]) -> list[dict]:
+    """把 LLM 修过的 1-to-1 segments 按逻辑拆分规则切/合并.
+
+    流程: ai_segments[i] 是 unit i 修过的 text. 按标点切/合并:
+    - 修过的 text 以 . ! ? 结尾 → 闭合当前段
+    - 修过的 text 无句末标点 → fragment, 跟下一个合并
+    """
+    if len(ai_segments) != len(batch):
+        # _validate_ai_segment_batch 应该已经 raise 了, 这里兜底
+        raise RuntimeError(f'AI segments 数量不匹配: {len(ai_segments)} vs {len(batch)}')
+    # 把 ai_segments 的 text 覆盖到 batch 对应 unit 上, 保留 batch 的 token/ms
+    corrected_units: list[dict] = []
+    for unit, seg in zip(batch, ai_segments):
+        corrected_units.append({
+            'startToken': int(unit.get('startToken') or 0),
+            'endToken': int(unit.get('endToken') or 0),
+            'startMs': int(unit.get('startMs') or 0),
+            'endMs': int(unit.get('endMs') or 0),
+            'text': str(seg.get('text') or '').strip(),
+        })
+    return _logic_split_units(corrected_units)
 
 
 def _ai_correct_sentence_segments(sentences: list[dict], cfg: dict[str, str] | None = None, on_progress: Any = None) -> list[dict]:
+    """2026-08-15: LLM 只修标点/大写, 本地规则按标点切/合并.
+
+    流程: LLM 1-to-1 输出 (修标点/大写) → 本地 _logic_split_units 按标点切/合并.
+    切段决策完全本地, LLM 抽风最多影响标点美观, 不影响"一句一段".
+    """
     corrected: list[dict] = []
     batches = _build_ai_segmentation_batches(sentences)
     processed = 0
@@ -758,7 +945,7 @@ def _ai_correct_sentence_segments(sentences: list[dict], cfg: dict[str, str] | N
         for unit_index, sentence in enumerate(batch, start=1):
             numbered_lines.append(f'{unit_index}. {sentence.get("text") or ""}')
         user_prompt = '\n'.join([
-            'Segment the following subtitle units into natural English subtitle sentences.',
+            'Normalize the following subtitle units (one output segment per unit).',
             'Return JSON only.',
             '',
             *numbered_lines,
@@ -767,7 +954,9 @@ def _ai_correct_sentence_segments(sentences: list[dict], cfg: dict[str, str] | N
             on_progress(f'  英文断句 AI 矫正中: batch {batch_index}/{len(batches)}（{processed + 1}-{processed + len(batch)} / {len(sentences)} unit）')
         raw = _call_qwen(ENGLISH_SEGMENTATION_SYSTEM_PROMPT, user_prompt, cfg, max_tokens=1800, json_object=True)
         payload = _extract_json(raw)
-        batch_segments = _validate_ai_segment_batch(batch, payload.get('segments'))
+        ai_segments = _validate_ai_segment_batch(batch, payload.get('segments'))
+        # 1-to-1 验证通过后, 本地按标点切/合并
+        batch_segments = _apply_ai_text_corrections_then_split(batch, ai_segments)
         corrected.extend(batch_segments)
         processed += len(batch)
 

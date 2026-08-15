@@ -14,6 +14,12 @@ import { cleanupExtractedAudio, extractAudioToWav, extractRemoteAudioToWav } fro
 import { extractVideoFrame } from '../media/ffmpeg-thumbnail';
 import { transcribeWavFileDirect } from '../volcengine/file-asr';
 import { generateSubtitleTranslationPayload } from './subtitle-translation';
+import {
+  correctThenSplit,
+  json3EventsToSubtitleUnits,
+  type SubtitleUnit,
+  type CorrectedSubtitleSegment,
+} from './subtitle-segmenter';
 import type { CloudVideoProvider } from './cloud-drive-bindings';
 import {
   downloadCloudVideoAndWait,
@@ -282,7 +288,24 @@ async function generateAndSaveSubtitleTranslation(id: string, subtitleUri?: stri
     throw new Error('字幕文件不存在，无法生成中文字幕');
   }
   const subtitleJson = await readJsonFile<Json3File>(subtitleUri);
-  const payload = await generateSubtitleTranslationPayload(subtitleJson, subtitleUri.split('/').pop() || subtitleUri);
+  // 2026-08-15: 跟桌面端镜像 — 优先读 *.en.segmented.json, 里面是 LLM 修过
+  // 标点 + 本地按标点切/合并的 segments. 没有就回退到本地 groupTokensByEvent
+  // 切分 (旧行为, 切得碎).
+  let segmentedPayload: { sourceSubtitle?: string; segmentCount?: number; segments?: Array<{ id?: string; text?: string; startMs?: number; endMs?: number }> } | undefined;
+  try {
+    const segmentedUri = getSubtitleSegmentedTargetUri(id);
+    const raw = await readAsStringAsync(segmentedUri);
+    if (raw) {
+      segmentedPayload = JSON.parse(raw);
+    }
+  } catch {
+    // 没有 segmented.json 或解析失败, 忽略, fallback 到本地切分
+  }
+  const payload = await generateSubtitleTranslationPayload(
+    subtitleJson,
+    subtitleUri.split('/').pop() || subtitleUri,
+    segmentedPayload ? { segmentedPayload } : undefined,
+  );
   const subtitleZhUri = getSubtitleTranslationTargetUri(id);
   await writeJsonFile(subtitleZhUri, payload);
   await updateUserVideoEntry(id, (current) => ({
@@ -494,6 +517,14 @@ function buildJson3FromAsrResult(result: AsrUploadResponse, options?: { timeOffs
 
 function getSubtitleTargetUri(entryId: string) {
   return `${USER_VIDEOS_SUBTITLES_DIR}/${sanitizeSegment(entryId)}.json3`;
+}
+
+// 2026-08-15: 跟桌面端 segmented.json 镜像. 字幕 ASR 完写完 json3 后,
+// 立即调 LLM 修标点/大写 + 本地按标点切/合并, 把 sentence-level segments
+// 写到这里. 翻译 + 显示时优先用这个, 避免每次都调 LLM.
+// exported 出去给 video-scenes.ts 显示侧用 (parseJson3Subtitles 的 englishSegments 参数).
+export function getSubtitleSegmentedTargetUri(entryId: string) {
+  return `${USER_VIDEOS_SUBTITLES_DIR}/${sanitizeSegment(entryId)}.en.segmented.json`;
 }
 
 function getSubtitleTranslationTargetUri(entryId: string) {
@@ -1437,6 +1468,38 @@ async function commitGeneratedSubtitle(id: string, result: AsrUploadResponse, op
       })
     : json3;
   await writeJsonFile(subtitleUri, merged);
+
+  // 2026-08-15: 跟桌面端镜像 — ASR 写完 json3 后立即调 LLM 修标点/大写 +
+  // 本地按标点切/合并, 写 *.en.segmented.json. 翻译 + 显示优先用这个,
+  // 避免每次都调 LLM.
+  // chunked 模式每个 chunk 都会调一次, 慢但简单 (后续可以优化成只调一次 LLM
+  // 修整个 video). 失败/未配 LLM 时回退到纯 logic split (不调 LLM, 仍可写文件).
+  try {
+    const units = json3EventsToSubtitleUnits(merged.events || []);
+    if (units.length > 0) {
+      const segments = await correctThenSplit(units, {
+        onProgress: (msg) => console.log(`[SubtitleSeg] chunked: ${msg}`),
+      });
+      const segmentedUri = getSubtitleSegmentedTargetUri(id);
+      const segmentsWithId = segments.map((s, idx) => ({
+        ...s,
+        id: `cc-seg-${idx}`,
+      }));
+      const segmentedPayload = {
+        sourceSubtitle: subtitleUri.split('/').pop() || subtitleUri,
+        segmentCount: segmentsWithId.length,
+        segmentationMode: 'llm+logic',
+        segments: segmentsWithId,
+      };
+      await writeJsonFile(segmentedUri, segmentedPayload);
+      console.log(`[SubtitleSeg] wrote ${segmentedUri}: ${segmentsWithId.length} segments`);
+    }
+  } catch (e) {
+    // 写 segmented.json 失败不阻塞 commit 流程 — json3 已经写了, 显示侧有
+    // 兜底 (parseJson3Subtitles 没 englishSegments 时回退到本地 groupTokensByEvent).
+    console.warn(`[SubtitleSeg] commit segmented.json 失败, 不影响 json3 写入: ${(e as Error).message}`);
+  }
+
   const updatedAt = new Date().toISOString();
   const isComplete = options?.forceComplete
     || (typeof options?.expectedDurationSeconds === 'number'
@@ -1455,8 +1518,6 @@ async function commitGeneratedSubtitle(id: string, result: AsrUploadResponse, op
 
  function getSourceLabel(provider?: CloudVideoProvider) {
   if (provider === 'baidu_pan') return '百度网盘';
-  // 兼容历史记录中可能残留的未知 provider，统一显示为「云端导入」
-  if (provider === 'pan123_webdav') return '云端导入';
   return '本地导入';
  }
 

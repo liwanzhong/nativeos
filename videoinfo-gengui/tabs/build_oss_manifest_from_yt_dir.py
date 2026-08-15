@@ -102,11 +102,28 @@ def normalize_match_key(text: str) -> str:
 
 def read_info_records(target_dir: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for info_path in sorted(target_dir.glob("*.info.json")):
+    # 用 rglob 递归扫, 兼容 chapter-split 后 info.json 在 target_dir/chapters/<n> - <title>/ 下的情况
+    seen_paths: set[Path] = set()
+    for info_path in sorted(target_dir.rglob("*.info.json")):
+        # 跳过 yt-dlp 的下载归档目录 (.yt-dlp-archives)
+        # parts 里会带点 ('.yt-dlp-archives') 也有可能不带, 都兼容
+        if any(part.lstrip('.').startswith('yt-dlp-archives') for part in info_path.parts):
+            continue
+        if info_path in seen_paths:
+            continue
+        seen_paths.add(info_path)
         if info_path.name == "00 - Learn English with VLOG (Comprehensible Input).info.json":
             continue
         info = load_json(info_path)
         title = normalize_space(str(info.get("title") or info_path.name[:-10]))
+        # yt-dlp 在 --split-chapters 时会给每个章节 info.json 写入 section_number
+        raw_section = info.get("section_number")
+        section_number: int | None = None
+        if raw_section is not None:
+            try:
+                section_number = int(raw_section)
+            except (TypeError, ValueError):
+                section_number = None
         records.append(
             {
                 "stem": info_path.name[:-10],
@@ -114,6 +131,7 @@ def read_info_records(target_dir: Path) -> list[dict[str, Any]]:
                 "info": info,
                 "title": title,
                 "title_key": normalize_match_key(title),
+                "section_number": section_number,
             }
         )
     return records
@@ -194,18 +212,80 @@ def build_en_segmented_maps(target_dir: Path) -> tuple[dict[str, Path], dict[str
 
 
 def find_sets(target_dir: Path) -> list[dict[str, Any]]:
+    """找出 target_dir 下所有可打包的视频集。
+
+    **以 ``*.mp4`` 为锚点** (而不是 info.json), 兼容 chapter-split 后
+    章节子目录里有独立 mp4 + sub + cover 但没 info.json 的情况。
+
+    对每个 mp4, 在它自己的父目录里找 companion files (info/sub/cover/ai/zh),
+    info.json 是可选的, 找不到时用 stem 当 title, 仍可打包。
+
+    同时保留 read_info_records 找到的 record (兼容历史用法, 比如旧章节
+    info.json 还在的情况), 用 (local_dir, stem) 去重避免重复。
+    """
+    SKIP_DIR_NAMES = {"packages", "__pycache__"}
+
+    def _is_skipped_path(p: Path) -> bool:
+        try:
+            rel = p.relative_to(target_dir)
+        except ValueError:
+            return True
+        for part in rel.parts:
+            if part in SKIP_DIR_NAMES:
+                return True
+            if part.lstrip(".").startswith("yt-dlp-archives"):
+                return True
+        return False
+
+    # Step 1: 收集所有 info.json 记录 (兼容老逻辑)
     info_records = read_info_records(target_dir)
-    subtitle_by_stem, subtitle_by_title = build_path_maps(target_dir, ("*.json3",), (".en.json3", ".json3"))
-    video_by_stem, video_by_title = build_path_maps(target_dir, ("*.mp4", "*.webm", "*.mkv"), (".mp4", ".webm", ".mkv"))
-    cover_by_stem, cover_by_title = build_path_maps(target_dir, ("*.jpg", "*.jpeg", "*.png", "*.webp"), (".jpg", ".jpeg", ".png", ".webp"))
-    ai_by_stem, ai_by_title = build_ai_maps(target_dir)
-    zh_by_stem, zh_by_title = build_zh_maps(target_dir)
-    en_segmented_by_stem, en_segmented_by_title = build_en_segmented_maps(target_dir)
+    info_by_anchor: dict[tuple[Path, str], dict[str, Any]] = {}
+    for record in info_records:
+        anchor = (record["info_path"].parent, record["stem"])
+        info_by_anchor[anchor] = record
+
+    # Step 2: 用 mp4 当锚点扫所有视频
+    VIDEO_EXTS = ("mp4", "webm", "mkv")
+    anchors: list[tuple[Path, str]] = []
+    seen: set[tuple[Path, str]] = set()
+    for ext in VIDEO_EXTS:
+        for vid_path in sorted(target_dir.rglob(f"*.{ext}")):
+            if vid_path.name.endswith(".part"):
+                continue
+            if _is_skipped_path(vid_path):
+                continue
+            anchor = (vid_path.parent, vid_path.stem)
+            if anchor in seen:
+                continue
+            seen.add(anchor)
+            anchors.append(anchor)
 
     records: list[dict[str, Any]] = []
-    for record in info_records:
-        stem = record["stem"]
-        title_key = record["title_key"]
+    seen_dedupe: set[str] = set()
+    for local_dir, stem in anchors:
+        # 找 companion files
+        subtitle_by_stem, subtitle_by_title = build_path_maps(local_dir, ("*.json3",), (".en.json3", ".json3"))
+        video_by_stem, video_by_title = build_path_maps(local_dir, ("*.mp4", "*.webm", "*.mkv"), (".mp4", ".webm", ".mkv"))
+        cover_by_stem, cover_by_title = build_path_maps(local_dir, ("*.jpg", "*.jpeg", "*.png", "*.webp"), (".jpg", ".jpeg", ".png", ".webp"))
+        ai_by_stem, ai_by_title = build_ai_maps(local_dir)
+        zh_by_stem, zh_by_title = build_zh_maps(local_dir)
+        en_segmented_by_stem, en_segmented_by_title = build_en_segmented_maps(local_dir)
+
+        info_match = info_by_anchor.get((local_dir, stem))
+        if info_match:
+            title_key = info_match["title_key"]
+            info_path = info_match["info_path"]
+            info_dict = info_match["info"]
+            title = info_match["title"]
+            section_number = info_match.get("section_number")
+        else:
+            # chapter 视频没 info.json, 用 stem 当 title
+            title_key = normalize_match_key(stem)
+            info_path = local_dir / f"{stem}.info.json"
+            info_dict = {}
+            title = normalize_space(stem)
+            section_number = None
+
         subtitle_path = pick_matching_path(stem, title_key, subtitle_by_stem, subtitle_by_title)
         video_path = pick_matching_path(stem, title_key, video_by_stem, video_by_title)
         ai_path = pick_matching_path(stem, title_key, ai_by_stem, ai_by_title)
@@ -214,12 +294,18 @@ def find_sets(target_dir: Path) -> list[dict[str, Any]]:
         en_segmented_path = pick_matching_path(stem, title_key, en_segmented_by_stem, en_segmented_by_title)
         if not subtitle_path or not video_path:
             continue
+        # 用 (local_dir, stem) 去重, 防止父子目录里出现同名 stem 时重复
+        dedupe_key = f'{local_dir}::{stem}'
+        if dedupe_key in seen_dedupe:
+            continue
+        seen_dedupe.add(dedupe_key)
         records.append(
             {
                 "stem": stem,
-                "info_path": record["info_path"],
-                "info": record["info"],
-                "title": record["title"],
+                "info_path": info_path,
+                "info": info_dict,
+                "title": title,
+                "section_number": section_number,
                 "subtitle_path": subtitle_path,
                 "video_path": video_path,
                 "ai_path": ai_path,
@@ -241,6 +327,7 @@ def build_item(record: dict[str, Any]) -> dict[str, Any]:
     zh_path = record.get("zh_path")
     en_segmented_path = record.get("en_segmented_path")
     info = record["info"]
+    section_number = record.get("section_number")
     transcript = extract_utterances(subtitle_path)
     title = str(record["title"])
     description = first_meaningful_sentence(str(info.get("description") or ""))
@@ -261,8 +348,13 @@ def build_item(record: dict[str, Any]) -> dict[str, Any]:
     category = str(ai_analysis.get("category") or "").strip() or category_from_theme(theme)
     video_type = str(ai_analysis.get("type") or "").strip() or type_from_theme(theme)
     numeric_prefix = re.match(r"^(\d+)", stem)
-    prefix = numeric_prefix.group(1) if numeric_prefix else "video"
-    return {
+    if section_number is not None:
+        prefix = f"{section_number:02d}"
+    elif numeric_prefix:
+        prefix = numeric_prefix.group(1)
+    else:
+        prefix = "video"
+    item: dict[str, Any] = {
         "id": f"sprout-{prefix}-{slugify(title)[:60]}",
         "title": title,
         "level": level,
@@ -278,6 +370,9 @@ def build_item(record: dict[str, Any]) -> dict[str, Any]:
         "coverFile": cover_path.name if cover_path else "",
         "hasRoleplay": True,
     }
+    if section_number is not None:
+        item["sectionNumber"] = section_number
+    return item
 
 
 def build_series_episode(record: dict[str, Any], index: int) -> dict[str, Any]:

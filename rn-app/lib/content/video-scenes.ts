@@ -31,6 +31,19 @@ import {
   saveSceneInfoCache,
   type CachedSceneInfo,
 } from '../database/video-cache';
+import {
+  loadEpisodeByIdFromSupabase,
+  loadEpisodeSeriesIdFromSupabase,
+  loadPublishedSeriesFromSupabase,
+  loadSeriesByIdFromSupabase,
+  loadSeriesEpisodesFromSupabase,
+  listAiPracticeCardsFromSupabase,
+  resolveEpisodeAssetUrl,
+  resolveSeriesCoverUrl,
+  type SupabaseAiPracticeRow,
+  type SupabaseEpisodeRow,
+  type SupabaseSeriesRow,
+} from './video-series-supabase';
 
 const OFFICIAL_VIDEO_CATALOG_URL = 'https://nativeos.oss-cn-beijing.aliyuncs.com/videos/official-video-catalog.json';
 const VIDEO_SCENE_LOG_PREFIX = '[VideoScenes]';
@@ -221,6 +234,13 @@ let featuredScenesCache: VideoSceneDetail[] | null = null;
 const remoteSceneCache = new Map<string, VideoSceneDetail>();
 const importedSceneCache = new Map<string, VideoSceneDetail>();
 const aiPracticeCache = new Map<string, ScenarioCard[]>();
+/**
+ * Cache for scenes built from Supabase episode rows. The episode's
+ * parent series row provides `manifest_url` (the OSS base), so we
+ * can resolve subtitle/cover/AI URLs the same way the OSS-manifest
+ * path does. Keyed by episode id.
+ */
+const supabaseSceneCache = new Map<string, VideoSceneDetail>();
 
 export function invalidateVideoSceneCaches(ids?: string[]) {
   manifestCache = null;
@@ -228,11 +248,13 @@ export function invalidateVideoSceneCaches(ids?: string[]) {
   if (!ids || ids.length === 0) {
     remoteSceneCache.clear();
     importedSceneCache.clear();
+    supabaseSceneCache.clear();
     return;
   }
   ids.forEach((id) => {
     remoteSceneCache.delete(id);
     importedSceneCache.delete(id);
+    supabaseSceneCache.delete(id);
   });
 }
 
@@ -568,6 +590,86 @@ function mapOssAiPracticeCard(item: OssVideoManifestItem, raw: OssAiPracticeCard
   };
 }
 
+/**
+ * Map a `SupabaseAiPracticeRow` (snake_case) to the rn-app's
+ * `ScenarioCard` shape. Mirrors `mapOssAiPracticeCard` column-by-
+ * column so the player doesn't care which source the cards came
+ * from.
+ */
+function mapSupabaseAiPracticeCard(
+  item: OssVideoManifestItem,
+  raw: SupabaseAiPracticeRow,
+  index: number,
+): ScenarioCard {
+  const userInitiates = raw.user_initiates === true;
+  const openingLine = userInitiates ? undefined : (raw.opening_line ?? undefined);
+  const environmentalCue = userInitiates ? (raw.environmental_cue ?? undefined) : undefined;
+  const environmentalCueEn = userInitiates ? (raw.environmental_cue_en ?? undefined) : undefined;
+  return {
+    id: raw.id || `${item.id}__ai__${index + 1}`,
+    sourceType: 'ai_scenario',
+    icon: raw.icon || '💬',
+    category: raw.category || item.category,
+    level: raw.level || item.level,
+    title: raw.title || `视频延展 ${index + 1}`,
+    desc: raw.description || `Continue the same topic after watching this ${item.category} video.`,
+    descZh: raw.description_zh ?? undefined,
+    npcEmoji: raw.npc_emoji ?? undefined,
+    npcName: raw.npc_name ?? undefined,
+    npcStatus: raw.npc_status ?? undefined,
+    openingLine,
+    openingLineZh: userInitiates ? undefined : (raw.opening_line_zh ?? undefined),
+    environmentalCue,
+    environmentalCueEn,
+    npcSystemPrompt: raw.npc_system_prompt ?? undefined,
+    taskContract: deriveTaskContract({
+      title: raw.title || `视频延展 ${index + 1}`,
+      desc: raw.description || `Continue the same topic after watching this ${item.category} video.`,
+      category: raw.category || item.category,
+      npcName: raw.npc_name ?? undefined,
+      npcStatus: raw.npc_status ?? undefined,
+      npcSystemPrompt: raw.npc_system_prompt ?? undefined,
+      openingLine,
+      environmentalCue,
+      environmentalCueEn,
+    }, (raw.task_contract as Partial<ScenarioTaskContract> | null) ?? undefined),
+    userInitiates,
+  };
+}
+
+/**
+ * Supabase-first AI practice loader. Tries `official_video_ai_practice`
+ * for the (series_id, episode_id) pair; if Supabase returns 0 rows
+ * (e.g. the episode was migrated by the desktop but the cards weren't
+ * yet, or the player is running against a pre-migration series),
+ * falls back to the OSS-hosted `.ai-practice.json` so the player
+ * doesn't go blank.
+ */
+async function loadSupabaseAiPracticeCards(
+  seriesId: string,
+  episodeId: string,
+  baseUrl: string,
+  item: OssVideoManifestItem,
+): Promise<ScenarioCard[]> {
+  if (!seriesId || !episodeId) return [];
+  try {
+    const rows = await listAiPracticeCardsFromSupabase(seriesId, episodeId);
+    if (rows.length > 0) {
+      return rows
+        .map((row, index) => mapSupabaseAiPracticeCard(item, row, index))
+        .filter((card) => Boolean(card.title));
+    }
+  } catch (err) {
+    warnVideoSceneTrace('loadSupabaseAiPracticeCards threw, falling back to OSS', {
+      seriesId,
+      episodeId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  // Fallback: OSS .ai-practice.json (read-only legacy cache)
+  return loadAiPracticeCards(baseUrl, item);
+}
+
 async function loadAiPracticeCards(baseUrl: string, item: OssVideoManifestItem, options?: RemoteFetchOptions): Promise<ScenarioCard[]> {
   if (!options?.forceRefresh && aiPracticeCache.has(item.id)) {
     return aiPracticeCache.get(item.id)!;
@@ -841,6 +943,12 @@ async function buildUserVideoSceneDetail(entry: UserVideoEntry): Promise<VideoSc
 
   if (entry.subtitleUri) {
     try {
+      // 2026-08-15: 显示侧只用 *.json3 切分, 不传 englishSegments.
+      // 原因: 单词高亮需要 json3 的 word-level timing (每个 seg.tOffsetMs),
+      // segmented.json 只是 sentence-level 引用 (startToken/endToken 回查 json3).
+      // 如果 token 索引算错 / 跨段不连续, 回查就会拿到错的 words, 单词高亮直接废.
+      // 安全做法: 显示侧用 json3 直接切分 (groupTokensByEvent + 标点),
+      // 单词高亮永远用 json3 word timing. segmented.json 只给翻译侧用 (句子级 + 标点修过).
       const [subtitleJson, subtitleZhJson] = await Promise.all([
         readImportedVideoPackJson<Record<string, unknown>>(entry.subtitleUri),
         entry.subtitleZhUri
@@ -848,7 +956,10 @@ async function buildUserVideoSceneDetail(entry: UserVideoEntry): Promise<VideoSc
           : Promise.resolve(null),
       ]);
       if (subtitleJson) {
-        segments = sanitizeUserVideoSegments(parseJson3Subtitles(subtitleJson, subtitleZhJson ?? undefined), summary.durationSeconds);
+        segments = sanitizeUserVideoSegments(
+          parseJson3Subtitles(subtitleJson, subtitleZhJson ?? undefined),
+          summary.durationSeconds,
+        );
       }
     } catch {
       segments = [];
@@ -962,28 +1073,114 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function loadSupabaseManifest(options?: RemoteFetchOptions): Promise<OssVideoManifest | null> {
+  // Reads the official video catalog from Supabase and adapts it into
+  // the legacy OssVideoManifestItem shape so the rest of this file
+  // (cache, asset URL resolution, detail builders) keeps working.
+  //
+  // - series-level fields → groupId / groupTitle / groupCoverUrl / ...
+  // - episode-level fields → id / title / videoKey / subtitleKey / ...
+  // - bare filenames in `subtitle_json3_file` etc. → resolved to
+  //   absolute URLs via `resolveEpisodeAssetUrl(series.manifest_url, ...)`.
+  const seriesRows = await loadPublishedSeriesFromSupabase(options?.forceRefresh === true);
+  if (!seriesRows || seriesRows.length === 0) {
+    logVideoSceneTrace('loadSupabaseManifest no series', {});
+    return null;
+  }
+  logVideoSceneTrace('loadSupabaseManifest series loaded', { seriesCount: seriesRows.length });
+
+  // The bucket base is the same for every series in our setup
+  // (`<bucket>.oss-cn-beijing.aliyuncs.com/videos`). Derive it from
+  // any series' manifest_url so the value is not hard-coded here —
+  // it can drift if the OSS bucket or prefix changes.
+  const bucketBaseUrl = getUrlDirectory(getUrlDirectory(seriesRows[0].manifest_url || OFFICIAL_VIDEO_CATALOG_URL));
+  const items: OssVideoManifestItem[] = [];
+
+  for (const series of seriesRows) {
+    const seriesAssetBaseUrl = `${bucketBaseUrl}/${encodeURIComponent(series.id)}`;
+    const episodes = await loadSeriesEpisodesFromSupabase(series.id);
+    logVideoSceneTrace('loadSupabaseManifest series episodes', {
+      seriesId: series.id,
+      title: series.title,
+      episodeCount: episodes.length,
+    });
+    for (const ep of episodes) {
+      const item: OssVideoManifestItem = {
+        id: ep.id,
+        title: ep.title,
+        level: ep.level,
+        category: ep.category,
+        type: ep.type,
+        sourceLabel: ep.source_label,
+        assetBaseUrl: seriesAssetBaseUrl,
+        groupId: series.id,
+        groupTitle: series.title,
+        groupLevel: series.level,
+        groupDescription: series.description || '',
+        groupCoverUrl: resolveEpisodeAssetUrl(series.manifest_url, series.cover_url) || '',
+        groupTags: Array.isArray(series.tags) ? series.tags : [],
+        groupSortOrder: series.sort_order,
+        episodeIndex: ep.episode_index,
+        episodeTitle: ep.title,
+        videoKey: ep.video_file,
+        subtitleKey: ep.subtitle_json3_file || '',
+        infoKey: ep.info_file || '',
+        coverUrl: resolveEpisodeAssetUrl(series.manifest_url, ep.cover_file) || '',
+        hasRoleplay: ep.has_roleplay,
+        aiPracticeKey: ep.ai_practice_file || '',
+        subtitleZhKey: ep.subtitle_zh_file || '',
+        subtitleEnSegmentedKey: ep.subtitle_en_segmented_file || '',
+      };
+      items.push(item);
+    }
+  }
+
+  logVideoSceneTrace('loadSupabaseManifest ready', {
+    bucketBaseUrl,
+    seriesCount: seriesRows.length,
+    totalItems: items.length,
+  });
+  return {
+    version: 1,
+    bucketBaseUrl,
+    items,
+  };
+}
+
 async function getOssManifest(options?: RemoteFetchOptions) {
-  // v5: three-tier cache. in-memory (warm same-launch) → SQLite (cold start)
-  // → network fetch + write-through.
+  // v6: bypass the legacy 'main' SQLite cache (it was written by the
+  // pre-Supabase OSS-catalog reader and is missing every series that
+  // was uploaded via `series_upload_tab.py` on the desktop side).
+  // We still keep the in-memory `manifestCache` short-circuit for
+  // same-launch repeat reads, but the cold-start path always re-reads
+  // Supabase so the catalog stays in sync with the desktop uploads.
   if (!options?.forceRefresh && manifestCache) {
     logVideoSceneTrace('using cached OSS manifest', { itemCount: manifestCache.items.length, bucketBaseUrl: manifestCache.bucketBaseUrl });
     return manifestCache;
   }
-  if (!options?.forceRefresh) {
-    const persisted = await loadCatalogCache('main');
-    if (persisted) {
-      manifestCache = {
-        version: typeof persisted.manifest?.version === 'number' ? persisted.manifest.version : 1,
-        bucketBaseUrl: persisted.bucketBaseUrl,
-        items: Array.isArray(persisted.manifest?.items) ? persisted.manifest.items : [],
-      };
-      logVideoSceneTrace('using persisted OSS manifest', {
-        itemCount: manifestCache.items.length,
-        bucketBaseUrl: manifestCache.bucketBaseUrl,
-        fetchedAt: persisted.fetchedAt,
+  // v6: prefer Supabase (`official_video_series` + `official_video_episodes`)
+  // over the legacy OSS `official-video-catalog.json`. The OSS catalog is
+  // only kept as a fallback for the brief window between desktop-side
+  // migration and the next app release. New series always live in
+  // Supabase now, so reading the OSS catalog alone misses them.
+  try {
+    const supabaseManifest = await loadSupabaseManifest(options);
+    if (supabaseManifest && supabaseManifest.items.length > 0) {
+      manifestCache = supabaseManifest;
+      void saveCatalogCache({
+        key: 'main',
+        bucketBaseUrl: supabaseManifest.bucketBaseUrl,
+        manifest: supabaseManifest,
+      }).catch((err) => {
+        warnVideoSceneTrace('failed to persist Supabase manifest cache', { error: err instanceof Error ? err.message : String(err) });
       });
-      return manifestCache;
+      return supabaseManifest;
     }
+    logVideoSceneTrace('Supabase manifest empty, falling back to OSS catalog', {});
+  } catch (err) {
+    warnVideoSceneTrace('Supabase manifest load failed, falling back to OSS catalog', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
   const catalogUrl = appendCacheBust(OFFICIAL_VIDEO_CATALOG_URL, options?.cacheBust);
   logVideoSceneTrace('loading official video catalog', { catalogUrl, forceRefresh: options?.forceRefresh === true });
@@ -1235,6 +1432,204 @@ async function buildRemoteVideoSceneDetail(item: OssVideoManifestItem, baseUrl: 
   return detail;
 }
 
+// ── Supabase-backed scenes (replaces OSS-manifest path for official
+//    series managed by the desktop admin app) ────────────────────
+
+/**
+ * Derive the OSS base URL for a series. The Supabase row stores
+ * `manifest_url` as a per-series base URL of the form
+ *   https://nativeos.oss-cn-beijing.aliyuncs.com/videos/<series-id>/series.json
+ * — the basename (`series.json`) is a legacy read-only marker; we
+ * strip it and use the rest as the asset base. This mirrors the
+ * legacy `getOssManifest`'s `bucketBaseUrl` semantics.
+ */
+function deriveSupabaseAssetBaseUrl(series: SupabaseSeriesRow): string {
+  if (!series.manifest_url || !series.manifest_url.trim()) return '';
+  const withoutQuery = series.manifest_url.split('?')[0] || series.manifest_url;
+  const trimmed = withoutQuery.endsWith('/') ? withoutQuery.slice(0, -1) : withoutQuery;
+  const slashIndex = trimmed.lastIndexOf('/');
+  return slashIndex >= 0 ? trimmed.slice(0, slashIndex) : trimmed;
+}
+
+/**
+ * Synthesize a `YoutubeInfoJson`-shaped object from a Supabase episode
+ * row + parent series row. The legacy pipeline feeds `info` (loaded
+ * from the per-episode `info.json` on OSS) into `buildVideoSceneSummary`
+ * for title / thumbnail / duration / description. For Supabase, those
+ * fields live in the row itself, so we project them into the same
+ * shape and reuse the legacy composition logic.
+ */
+function synthesizeEpisodeInfo(episode: SupabaseEpisodeRow, series: SupabaseSeriesRow, coverUri: string | undefined): YoutubeInfoJson {
+  return {
+    title: episode.title,
+    fulltitle: episode.title,
+    description: series.description ?? '',
+    thumbnail: coverUri,
+    duration: typeof episode.duration_seconds === 'number' && Number.isFinite(episode.duration_seconds)
+      ? episode.duration_seconds
+      : 0,
+    uploader: episode.source_label || undefined,
+    playlist_title: series.title,
+  };
+}
+
+/**
+ * Adapter: turn a `(episode, series)` row pair into an
+ * `OssVideoManifestItem` so we can reuse the existing
+ * `buildVideoSceneSummary` pipeline (which expects the legacy
+ * manifest item shape).
+ *
+ * Why an adapter instead of rewriting the composition:
+ *   The player reads ~30 fields off the resulting `VideoSceneDetail`,
+ *   many of them derived through the same helper chain
+ *   (`buildScenarioCard` → `inferVideoIcon` / `inferCoverAccent`,
+ *   `buildRoles` / `buildGoals`, `loadAiPracticeCards`,
+ *   `getOfficialSceneProviderStates`, `getDefaultCloudProvider`).
+ *   Rewriting all of it for one source variant would double the
+ *   maintenance surface; an adapter keeps the composition in one
+ *   place and just changes the input shape.
+ */
+function buildSupabaseVideoSceneItem(episode: SupabaseEpisodeRow, series: SupabaseSeriesRow): OssVideoManifestItem | null {
+  // `video_file` is required (it's the logical mp4 name the user
+  // binds to a baidu pan path). Without it the player has no
+  // way to resolve a video source. `subtitle_json3_file` is also
+  // required for the subtitle pipeline.
+  const videoKey = typeof episode.video_file === 'string' ? episode.video_file.trim() : '';
+  const subtitleKey = typeof episode.subtitle_json3_file === 'string' ? episode.subtitle_json3_file.trim() : '';
+  if (!videoKey || !subtitleKey) {
+    return null;
+  }
+  const baseUrl = deriveSupabaseAssetBaseUrl(series);
+  const coverUri = resolveEpisodeAssetUrl(series.manifest_url, episode.cover_file);
+  const groupCoverUri = resolveSeriesCoverUrl(series.manifest_url, series.cover_url);
+  return {
+    id: episode.id,
+    title: episode.title,
+    level: episode.level || series.level || 'B1',
+    category: episode.category || series.category || '综合',
+    type: episode.type || series.type || 'vlog',
+    sourceLabel: episode.source_label || '',
+    assetBaseUrl: baseUrl,
+    groupId: series.id,
+    groupTitle: series.title,
+    groupLevel: series.level,
+    groupDescription: series.description ?? undefined,
+    groupCoverUrl: groupCoverUri,
+    groupTags: Array.isArray(series.tags) ? series.tags.filter((t): t is string => typeof t === 'string' && t.trim().length > 0) : undefined,
+    groupSortOrder: series.sort_order,
+    episodeIndex: episode.episode_index,
+    episodeTitle: episode.title,
+    videoKey,
+    subtitleKey,
+    subtitleEnSegmentedKey: episode.subtitle_en_segmented_file?.trim() || undefined,
+    infoKey: episode.info_file?.trim() || undefined,
+    coverUrl: coverUri,
+    hasRoleplay: episode.has_roleplay === true,
+    aiPracticeKey: episode.ai_practice_file?.trim() || undefined,
+    subtitleZhKey: episode.subtitle_zh_file?.trim() || undefined,
+  };
+}
+
+/**
+ * Supabase-path variant of `buildVideoSceneSummary`. Reuses the
+ * existing composition by synthesizing an info object from the
+ * episode + series rows. Returns a `VideoSceneDetail` that mirrors
+ * what the OSS-manifest path produces for the same logical scene.
+ */
+async function buildSupabaseVideoSceneSummary(
+  item: OssVideoManifestItem,
+  seriesRow: SupabaseSeriesRow,
+  episodeRow: SupabaseEpisodeRow,
+): Promise<VideoSceneDetail> {
+  const baseUrl = item.assetBaseUrl || deriveSupabaseAssetBaseUrl(seriesRow);
+  const coverUri = resolveEpisodeAssetUrl(seriesRow.manifest_url, episodeRow.cover_file);
+  const info = synthesizeEpisodeInfo(episodeRow, seriesRow, coverUri);
+
+  // Compose the AI practice / cloud-provider / default-provider
+  // slices the same way the OSS-manifest path does. AI practice
+  // goes Supabase-first (new `official_video_ai_practice` table)
+  // with an OSS fallback for episodes that haven't been migrated
+  // yet.
+  const [aiPracticeCards, availableCloudProviders, selectedCloudProvider] = await Promise.all([
+    loadSupabaseAiPracticeCards(seriesRow.id, episodeRow.id, baseUrl, item),
+    getOfficialSceneProviderStates(item.id),
+    getDefaultCloudProvider(),
+  ]);
+
+  return {
+    id: item.id,
+    sourceLabel: info?.playlist_title || info?.uploader || item.sourceLabel || 'Official Video',
+    durationSeconds: typeof info?.duration === 'number' ? info.duration : 0,
+    coverAccent: inferCoverAccent(item),
+    coverImageUri: item.coverUrl || info?.thumbnail,
+    contentOrigin: 'official',
+    groupId: item.groupId,
+    groupTitle: item.groupTitle,
+    groupLevel: item.groupLevel,
+    groupDescription: item.groupDescription,
+    groupCoverImageUri: item.groupCoverUrl,
+    groupTags: Array.isArray(item.groupTags) ? item.groupTags.filter((tag): tag is string => typeof tag === 'string' && tag.trim().length > 0) : undefined,
+    groupSortOrder: typeof item.groupSortOrder === 'number' && Number.isFinite(item.groupSortOrder) ? item.groupSortOrder : undefined,
+    episodeIndex: typeof item.episodeIndex === 'number' && Number.isFinite(item.episodeIndex) ? item.episodeIndex : undefined,
+    episodeTitle: item.episodeTitle,
+    officialAssetKeys: {
+      videoKey: item.videoKey,
+      subtitleKey: item.subtitleKey,
+      subtitleEnSegmentedKey: item.subtitleEnSegmentedKey,
+      subtitleZhKey: item.subtitleZhKey,
+    },
+    availableCloudProviders,
+    selectedCloudProvider,
+    videoFileName: item.videoKey,
+    subtitleFileName: item.subtitleKey,
+    videoSourcePath: buildOssObjectUrl(baseUrl, item.videoKey),
+    subtitleSourcePath: buildOssObjectUrl(baseUrl, item.subtitleKey),
+    transcriptSource: 'youtube_json3',
+    card: buildScenarioCard(item, info),
+    aiPracticeCards,
+    userRole: buildRoles(item).userRole,
+    npcRole: buildRoles(item).npcRole,
+    goals: buildGoals(item),
+    segments: [],
+  };
+}
+
+/**
+ * Supabase-path variant of `buildRemoteVideoSceneDetail`. Loads
+ * the subtitle files (json3, en-segmented, zh translations) from
+ * OSS, parses them into segments, and stitches the result onto
+ * the summary. Cached in `supabaseSceneCache` keyed by episode id.
+ */
+async function buildSupabaseVideoSceneDetail(
+  item: OssVideoManifestItem,
+  seriesRow: SupabaseSeriesRow,
+  episodeRow: SupabaseEpisodeRow,
+  options?: RemoteFetchOptions,
+): Promise<VideoSceneDetail> {
+  if (!options?.forceRefresh && supabaseSceneCache.has(item.id)) {
+    return supabaseSceneCache.get(item.id)!;
+  }
+  const baseUrl = item.assetBaseUrl || deriveSupabaseAssetBaseUrl(seriesRow);
+  const coverUri = resolveEpisodeAssetUrl(seriesRow.manifest_url, episodeRow.cover_file);
+  const info = synthesizeEpisodeInfo(episodeRow, seriesRow, coverUri);
+  const subtitlePromise = fetchJson<Record<string, unknown>>(buildOssObjectUrl(baseUrl, item.subtitleKey, options?.cacheBust));
+  const englishPromise: Promise<EnglishSegmentedSubtitles | null> = item.subtitleEnSegmentedKey
+    ? fetchJson<EnglishSegmentedSubtitles>(buildOssObjectUrl(baseUrl, item.subtitleEnSegmentedKey, options?.cacheBust)).catch(() => null)
+    : Promise.resolve(null);
+  const zhPromise: Promise<SubtitleTranslations | null> = item.subtitleZhKey
+    ? fetchJson<SubtitleTranslations>(buildOssObjectUrl(baseUrl, item.subtitleZhKey, options?.cacheBust)).catch(() => null)
+    : Promise.resolve(null);
+  const [subtitleJson, englishSegments, zhTranslations] = await Promise.all([subtitlePromise, englishPromise, zhPromise]);
+
+  const summary = await buildSupabaseVideoSceneSummary(item, seriesRow, episodeRow);
+  const detail: VideoSceneDetail = {
+    ...summary,
+    segments: parseJson3Subtitles(subtitleJson, zhTranslations ?? undefined, englishSegments ?? undefined),
+  };
+  supabaseSceneCache.set(item.id, detail);
+  return detail;
+}
+
 export async function getFeaturedVideoSceneCards(): Promise<ScenarioCard[]> {
   const scenes = await getFeaturedVideoScenes();
   return scenes.map(scene => scene.card);
@@ -1323,6 +1718,16 @@ export async function getFeaturedVideoScenes(forceRefresh: boolean = false): Pro
 }
 
 export async function getVideoSceneSummaryById(id: string, forceRefresh: boolean = false): Promise<VideoSceneDetail | null> {
+  // Supabase first: it's the new source of truth for official series
+  // managed by the desktop admin app. Returns null if no Supabase
+  // episode matches the id (e.g. user-imported or legacy OSS-only
+  // scenes) so the legacy branches below get a chance.
+  try {
+    const supabaseScene = await getVideoSceneSummaryByIdFromSupabase(id, forceRefresh);
+    if (supabaseScene) return supabaseScene;
+  } catch {
+  }
+
   try {
     const importedEntry = await getImportedVideoPackEntryById(id);
     if (importedEntry) {
@@ -1354,6 +1759,13 @@ export async function getVideoSceneSummaryById(id: string, forceRefresh: boolean
 }
 
 export async function getVideoSceneById(id: string, forceRefresh: boolean = false): Promise<VideoSceneDetail | null> {
+  // Supabase first: same rationale as `getVideoSceneSummaryById`.
+  try {
+    const supabaseScene = await getVideoSceneByIdFromSupabase(id, forceRefresh);
+    if (supabaseScene) return supabaseScene;
+  } catch {
+  }
+
   try {
     const importedEntry = await getImportedVideoPackEntryById(id);
     if (importedEntry) {
@@ -1386,4 +1798,81 @@ export async function getVideoSceneById(id: string, forceRefresh: boolean = fals
   } catch {
   }
   return null;
+}
+
+/**
+ * Supabase-path entry: load the episode row + parent series row,
+ * build the `OssVideoManifestItem` adapter, then run the existing
+ * `buildSupabaseVideoSceneSummary` composition. Returns `null` if
+ * the id doesn't match any Supabase episode (so the caller falls
+ * through to the legacy paths).
+ *
+ * Performance: one Supabase round-trip (episode lookup) followed by
+ * one Supabase round-trip (series lookup, possibly parallelized if
+ * the episode has a known `series_id`). For an episode that doesn't
+ * exist, the episode lookup alone is enough and the series lookup
+ * is skipped.
+ */
+async function getVideoSceneSummaryByIdFromSupabase(
+  id: string,
+  forceRefresh: boolean = false,
+): Promise<VideoSceneDetail | null> {
+  if (!id || !id.trim()) return null;
+  if (!forceRefresh && supabaseSceneCache.has(id)) {
+    return supabaseSceneCache.get(id)!;
+  }
+  try {
+    // Try the cheap "is this even a Supabase episode" probe first.
+    // Skip the row fetch — go straight to series_id lookup, then full
+    // row fetch once we know the series. This avoids pulling the full
+    // episode row when it doesn't exist.
+    const seriesId = await loadEpisodeSeriesIdFromSupabase(id);
+    if (!seriesId) return null;
+    const [episode, series] = await Promise.all([
+      loadEpisodeByIdFromSupabase(id, seriesId),
+      loadSeriesByIdFromSupabase(seriesId),
+    ]);
+    if (!episode || !series) return null;
+    const item = buildSupabaseVideoSceneItem(episode, series);
+    if (!item) return null;
+    return await buildSupabaseVideoSceneSummary(item, series, episode);
+  } catch (err) {
+    warnVideoSceneTrace('getVideoSceneSummaryByIdFromSupabase threw', {
+      id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Supabase-path entry for the full scene (with subtitle segments
+ * loaded from OSS). Same lookup pattern as the summary entry.
+ */
+async function getVideoSceneByIdFromSupabase(
+  id: string,
+  forceRefresh: boolean = false,
+): Promise<VideoSceneDetail | null> {
+  if (!id || !id.trim()) return null;
+  if (!forceRefresh && supabaseSceneCache.has(id)) {
+    return supabaseSceneCache.get(id)!;
+  }
+  try {
+    const seriesId = await loadEpisodeSeriesIdFromSupabase(id);
+    if (!seriesId) return null;
+    const [episode, series] = await Promise.all([
+      loadEpisodeByIdFromSupabase(id, seriesId),
+      loadSeriesByIdFromSupabase(seriesId),
+    ]);
+    if (!episode || !series) return null;
+    const item = buildSupabaseVideoSceneItem(episode, series);
+    if (!item) return null;
+    return await buildSupabaseVideoSceneDetail(item, series, episode, { forceRefresh, cacheBust: forceRefresh ? `${Date.now()}` : undefined });
+  } catch (err) {
+    warnVideoSceneTrace('getVideoSceneByIdFromSupabase threw', {
+      id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }

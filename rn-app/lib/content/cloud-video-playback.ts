@@ -16,6 +16,20 @@ const BAIDU_API_BASE = 'https://pan.baidu.com';
 const BAIDU_DOWNLOAD_URL_TTL_MS = 7.5 * 60 * 60 * 1000;
 const DOWNLOAD_PROGRESS_PERSIST_INTERVAL_MS = 600;
 
+const CLOUD_PLAYBACK_LOG_PREFIX = '[CloudPlayback]';
+
+function logCloudPlayback(message: string, payload?: unknown) {
+  if (payload === undefined) {
+    console.log(`${CLOUD_PLAYBACK_LOG_PREFIX} ${message}`);
+    return;
+  }
+  try {
+    console.log(`${CLOUD_PLAYBACK_LOG_PREFIX} ${message} ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`${CLOUD_PLAYBACK_LOG_PREFIX} ${message}`, payload);
+  }
+}
+
 const activeDownloadTasks: Record<string, ReturnType<typeof createDownloadResumable>> = {};
 const downloadSpeedSamples: Record<string, { bytes: number; timestamp: number }> = {};
 const progressPersistTimestamps: Record<string, number> = {};
@@ -263,35 +277,167 @@ function buildBaiduStreamingUrl(accessToken: string, path: string, adToken?: str
   return `${BAIDU_API_BASE}/rest/2.0/xpan/file?${qs.toString()}`;
 }
 
-async function resolveBaiduStreamingUrl(accessToken: string, path: string) {
-  const requestBody = async (url: string) => {
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: { 'User-Agent': 'pan.baidu.com' },
-    });
-    return resp.text();
+interface BaiduVideoSource {
+  videoUri: string;
+  /**
+   * Maps to expo-av's `content-type` prop:
+   *  - 'hls' for the m3u8 streaming path (force HLS parser)
+   *  - 'auto' for the dlink mp4 path (let the player sniff Content-Type)
+   */
+  videoContentType: 'hls' | 'auto';
+  videoHeaders: Record<string, string>;
+  /**
+   * Android's ExoPlayer sometimes needs the file extension hint on
+   * the URL. We mirror the content type: 'm3u8' for HLS, 'mp4' for
+   * the dlink fallback. iOS ignores this.
+   */
+  videoOverrideFileExtensionAndroid: 'm3u8' | 'mp4';
+  /**
+   * Which delivery mode won. 'hls' = m3u8 streaming (fast start,
+   * adaptive). 'mp4' = dlink direct download (HTTP Range). Used for
+   * log + analytics only.
+   */
+  delivery: 'hls' | 'mp4';
+}
+
+async function tryBaiduHlsOnce(accessToken: string, path: string): Promise<{ url: string } | { errno: number; errmsg: string }> {
+  const requestBody = async (url: string, label: string): Promise<string> => {
+    logCloudPlayback('baidu stream fetch start', { label, url: url.slice(0, 120) + '...' });
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: { 'User-Agent': 'pan.baidu.com' },
+      });
+      const ms = Date.now() - t0;
+      logCloudPlayback('baidu stream fetch got response', { label, status: resp.status, ms });
+      const text = await resp.text();
+      const textMs = Date.now() - t0;
+      logCloudPlayback('baidu stream fetch body done', { label, bodyLen: text.length, totalMs: textMs, bodyStart: text.slice(0, 60) });
+      return text;
+    } catch (err) {
+      const ms = Date.now() - t0;
+      logCloudPlayback('baidu stream fetch threw', { label, ms, error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
   };
   const parseJson = (body: string) => {
     try {
-      return JSON.parse(body) as { errno?: number; adToken?: string; errmsg?: string };
+      return JSON.parse(body) as { errno?: number; adToken?: string; errmsg?: string; error_code?: number };
     } catch {
       return null;
     }
   };
   const firstUrl = buildBaiduStreamingUrl(accessToken, path);
-  const firstBody = await requestBody(firstUrl);
+  const firstBody = await requestBody(firstUrl, 'first');
   if (firstBody.trimStart().startsWith('#EXTM3U')) {
-    return firstUrl;
+    logCloudPlayback('baidu stream first body is m3u8', {});
+    return { url: firstUrl };
   }
   const firstJson = parseJson(firstBody);
+  const firstErrno = typeof firstJson?.errno === 'number'
+    ? firstJson.errno
+    : typeof firstJson?.error_code === 'number'
+      ? firstJson.error_code
+      : -1;
+  logCloudPlayback('baidu stream first json', { errno: firstErrno, errmsg: firstJson?.errmsg, hasAdToken: !!firstJson?.adToken });
   if (firstJson?.errno === 133 && firstJson.adToken) {
     const secondUrl = buildBaiduStreamingUrl(accessToken, path, firstJson.adToken);
-    const secondBody = await requestBody(secondUrl);
+    const secondBody = await requestBody(secondUrl, 'retry-with-adToken');
     if (secondBody.trimStart().startsWith('#EXTM3U')) {
-      return secondUrl;
+      logCloudPlayback('baidu stream retry body is m3u8', {});
+      return { url: secondUrl };
     }
+    const secondJson = parseJson(secondBody);
+    const secondErrno = typeof secondJson?.errno === 'number'
+      ? secondJson.errno
+      : typeof secondJson?.error_code === 'number'
+        ? secondJson.error_code
+        : -1;
+    logCloudPlayback('baidu stream retry json', { errno: secondErrno, errmsg: secondJson?.errmsg });
+    return { errno: secondErrno, errmsg: secondJson?.errmsg || '' };
   }
-  throw new Error(firstJson?.errmsg || '百度网盘流媒体地址解析失败');
+  return { errno: firstErrno, errmsg: firstJson?.errmsg || '' };
+}
+
+const HLS_RETRY_DELAY_MS = 2000;
+
+/**
+ * Resolve a Baidu pan file into a video source the player can play.
+ *
+ * Three-stage pipeline (m3u8 first, then dlink fallback):
+ *  1. Try Baidu's HLS streaming endpoint (`?method=streaming`). On
+ *     `errno 31341` (transcoding not ready), wait 2s and try again.
+ *  2. If HLS is still failing, fall back to the direct dlink
+ *     (`getBaiduFileMetas` + `?access_token=...`). dlink supports
+ *     HTTP Range so expo-av can play it like any HTTP-served mp4.
+ *  3. If dlink also fails (rare — file missing, fsid lookup
+ *     collision), throw and let the UI surface "视频源不可用".
+ *
+ * Why this is a robust fix for the "first click fails, retry works"
+ * pattern: Baidu's HLS cluster transcodes uploaded mp4s on demand
+ * and 31341 means "transcode job not done yet". Two seconds is
+ * enough for the cluster to land the job. The dlink fallback covers
+ * the rare case where the transcode never finishes (e.g. unsupported
+ * codec).
+ */
+async function resolveBaiduVideoSource(accessToken: string, path: string): Promise<BaiduVideoSource> {
+  const baseHeaders = { 'User-Agent': 'pan.baidu.com' };
+  // Stage 1: m3u8, with one retry after a short delay.
+  const first = await tryBaiduHlsOnce(accessToken, path);
+  if ('url' in first) {
+    logCloudPlayback('baidu video source: hls first try', { path });
+    return {
+      videoUri: first.url,
+      videoContentType: 'hls',
+      videoHeaders: baseHeaders,
+      videoOverrideFileExtensionAndroid: 'm3u8',
+      delivery: 'hls',
+    };
+  }
+  // 31341 = "高速视频播放媒体信息获取失败" (transcoding not ready). Worth
+  // waiting a couple of seconds and retrying — the second click "always
+  // works" symptom we saw in the wild is exactly this: by the time the
+  // user re-tapped the scene, the cluster had finished the transcode.
+  const isTransient = first.errno === 31341 || first.errno === 0 || first.errno < 0;
+  if (isTransient) {
+    logCloudPlayback('baidu hls first try transient, sleeping before retry', { errno: first.errno, delayMs: HLS_RETRY_DELAY_MS });
+    await new Promise<void>((resolve) => setTimeout(resolve, HLS_RETRY_DELAY_MS));
+    const second = await tryBaiduHlsOnce(accessToken, path);
+    if ('url' in second) {
+      logCloudPlayback('baidu video source: hls after retry', { path });
+      return {
+        videoUri: second.url,
+        videoContentType: 'hls',
+        videoHeaders: baseHeaders,
+        videoOverrideFileExtensionAndroid: 'm3u8',
+        delivery: 'hls',
+      };
+    }
+    logCloudPlayback('baidu hls still failing after retry', { errno: second.errno, errmsg: second.errmsg });
+  } else {
+    logCloudPlayback('baidu hls first try non-transient, skipping retry', { errno: first.errno, errmsg: first.errmsg });
+  }
+  // Stage 2: dlink fallback.
+  logCloudPlayback('baidu video source: falling back to dlink', { path });
+  let downloadUrl: string;
+  try {
+    downloadUrl = await getBaiduDownloadUrl(accessToken, path);
+  } catch (err) {
+    logCloudPlayback('baidu video source: dlink FAILED', {
+      path,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+  logCloudPlayback('baidu video source: dlink resolved', { path, url: downloadUrl.slice(0, 80) + '...' });
+  return {
+    videoUri: downloadUrl,
+    videoContentType: 'auto',
+    videoHeaders: baseHeaders,
+    videoOverrideFileExtensionAndroid: 'mp4',
+    delivery: 'mp4',
+  };
 }
 
 async function getBaiduDownloadUrl(accessToken: string, fullPath: string) {
@@ -533,6 +679,20 @@ export async function resolveOfficialSceneVideoSource(params: {
   providerStates?: VideoSourceProviderState[];
 }): Promise<ResolvedCloudVideoSource | null> {
   const providerStates = params.providerStates ?? await getOfficialSceneProviderStates(params.sceneId);
+  logCloudPlayback('resolveOfficialSceneVideoSource start', {
+    sceneId: params.sceneId,
+    officialVideoKey: params.officialAssetKeys?.videoKey,
+    providerStateSummaries: providerStates.map((s) => ({
+      provider: s.provider,
+      isConfigured: s.isConfigured,
+      isSelected: s.isSelected,
+      syncStatus: s.syncStatus,
+      hasLocalCache: s.hasLocalCache,
+      hasRemotePath: !!s.remotePath,
+      playbackMode: s.playbackMode,
+      rootPath: s.rootPath,
+    })),
+  });
   const providerStateMap = new Map(providerStates.map((item) => [item.provider, item]));
   const preferredProviders: CloudVideoProvider[] = [];
   const selectedProvider = providerStates.find((item) => item.isSelected)?.provider;
@@ -551,7 +711,19 @@ export async function resolveOfficialSceneVideoSource(params: {
 
   for (const provider of preferredProviders) {
     const localEntry = await getDownloadedSceneSource(params.sceneId, provider);
+    logCloudPlayback('check local cache', {
+      sceneId: params.sceneId,
+      provider,
+      hasEntry: !!localEntry,
+      hasUri: !!localEntry?.localVideoUri,
+      status: localEntry?.status,
+    });
     if (localEntry?.localVideoUri && localEntry.status === 'completed' && await hasPlayableLocalCache(localEntry.localVideoUri)) {
+      logCloudPlayback('using local cache', {
+        sceneId: params.sceneId,
+        provider,
+        localVideoUri: localEntry.localVideoUri,
+      });
       return {
         provider,
         playbackMode: 'local' as const,
@@ -564,26 +736,62 @@ export async function resolveOfficialSceneVideoSource(params: {
     const providerState = providerStateMap.get(provider);
 
     if (!providerState || (providerState.syncStatus !== 'available' && providerState.syncStatus !== 'cached') || !providerState.remotePath) {
+      logCloudPlayback('skip provider', {
+        sceneId: params.sceneId,
+        provider,
+        reason: !providerState
+          ? 'no providerState'
+          : providerState.syncStatus === 'available' || providerState.syncStatus === 'cached'
+            ? !providerState.remotePath
+              ? 'no remotePath'
+              : 'unknown'
+            : `syncStatus=${providerState.syncStatus}`,
+        syncStatus: providerState?.syncStatus,
+        remotePath: providerState?.remotePath,
+      });
       continue;
     }
 
     if (provider === 'baidu_pan') {
       const binding = await getBaiduPanBinding();
       if (binding?.token?.accessToken) {
+        logCloudPlayback('resolving baidu source', {
+          sceneId: params.sceneId,
+          remotePath: providerState.remotePath,
+          accessTokenLen: binding.token.accessToken.length,
+        });
+        const source = await resolveBaiduVideoSource(binding.token.accessToken, providerState.remotePath);
+        logCloudPlayback('baidu source resolved', {
+          sceneId: params.sceneId,
+          delivery: source.delivery,
+          videoUri: source.videoUri.slice(0, 80) + '...',
+        });
         return {
           provider,
           playbackMode: 'remote' as const,
-          videoUri: await resolveBaiduStreamingUrl(binding.token.accessToken, providerState.remotePath),
-          videoHeaders: {
-            'User-Agent': 'pan.baidu.com',
-          },
-          videoContentType: 'hls',
-          videoOverrideFileExtensionAndroid: 'm3u8',
+          videoUri: source.videoUri,
+          videoHeaders: source.videoHeaders,
+          videoContentType: source.videoContentType,
+          videoOverrideFileExtensionAndroid: source.videoOverrideFileExtensionAndroid,
         };
+      } else {
+        logCloudPlayback('skip baidu: no accessToken', {
+          sceneId: params.sceneId,
+        });
       }
     }
   }
 
+  logCloudPlayback('resolveOfficialSceneVideoSource returning null', {
+    sceneId: params.sceneId,
+    preferredProviders,
+    providerStateSummaries: providerStates.map((s) => ({
+      provider: s.provider,
+      syncStatus: s.syncStatus,
+      hasRemotePath: !!s.remotePath,
+      isReady: s.isReady,
+    })),
+  });
   return null;
 }
 
@@ -597,18 +805,25 @@ export async function resolveCloudReferencedVideoSource(params: {
   }
 
   const binding = await getBaiduPanBinding();
+  logCloudPlayback('resolveCloudReferencedVideoSource', {
+    provider: params.provider,
+    remotePath,
+    hasBinding: !!binding,
+    hasAccessToken: !!(binding?.token?.accessToken),
+    accessTokenLen: binding?.token?.accessToken ? binding.token.accessToken.length : 0,
+    rootPath: binding?.rootPath || '(empty)',
+  });
   if (!binding?.token?.accessToken) {
     throw new Error('百度网盘尚未授权');
   }
+  const source = await resolveBaiduVideoSource(binding.token.accessToken, remotePath);
   return {
     provider: params.provider,
     playbackMode: 'remote' as const,
-    videoUri: await resolveBaiduStreamingUrl(binding.token.accessToken, remotePath),
-    videoHeaders: {
-      'User-Agent': 'pan.baidu.com',
-    },
-    videoContentType: 'hls',
-    videoOverrideFileExtensionAndroid: 'm3u8',
+    videoUri: source.videoUri,
+    videoHeaders: source.videoHeaders,
+    videoContentType: source.videoContentType,
+    videoOverrideFileExtensionAndroid: source.videoOverrideFileExtensionAndroid,
   };
 }
 

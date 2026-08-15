@@ -10,6 +10,7 @@ import shutil
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from PySide6.QtCore import QThread, Signal, Qt
@@ -17,10 +18,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -35,17 +38,96 @@ DOWNLOAD_TYPES = [
     ('博主全部播放列表', 'channel', '粘贴博主播放列表页 URL，例: https://www.youtube.com/@xxx/playlists'),
 ]
 
-COMMON_YT_DLP_ARGS = [
-    '-S', 'vcodec:h264,ext:mp4:m4a',
-    '--merge-output-format', 'mp4',
-    '--write-subs', '--write-auto-subs',
-    '--sub-format', 'json3',
-    '--sub-langs', 'en',
-    '--write-thumbnail', '--convert-thumbnails', 'jpg',
-    '--write-info-json',
-    '--sponsorblock-remove', 'sponsor,intro,outro,interaction',
-    '--newline',
+# ---- 高级选项 (用户可配置的 yt-dlp 参数) ----
+
+DEFAULT_DOWNLOAD_OPTIONS: dict[str, Any] = {
+    'video_format': 'h264_mp4',
+    'write_subs': True,
+    'sub_langs': 'en',
+    'sub_format': 'json3',
+    'write_thumbnail': True,
+    'write_info_json': True,
+    'sponsorblock_action': 'remove',
+    'sponsorblock_categories': 'sponsor,intro,outro,interaction',
+    'split_chapters': False,
+}
+
+VIDEO_FORMAT_OPTIONS = [
+    ('H.264 MP4 (兼容，默认)', 'h264_mp4'),
+    ('最佳画质 (按 yt-dlp 默认排序)', 'best'),
+    ('H.265/AV1 (体积小，MP4)', 'h265_av1'),
+    ('原始格式 (不转封装)', 'original'),
 ]
+
+SUB_FORMAT_OPTIONS = [
+    ('json3 (推荐)', 'json3'),
+    ('vtt', 'vtt'),
+    ('srt', 'srt'),
+    ('best (任一可用)', 'best'),
+]
+
+SPONSORBLOCK_ACTIONS = [
+    ('不处理', 'none'),
+    ('仅标记 (在章节里打 marker)', 'mark'),
+    ('移除片段 (默认)', 'remove'),
+]
+
+# yt-dlp 官方 6 个 SponsorBlock 类别 (可组合)
+SPONSORBLOCK_CATEGORY_HELP = (
+    '可选: sponsor, intro, outro, interaction, self-prom, music_offtopic, '
+    'preview, filler (逗号分隔)'
+)
+
+
+def build_yt_dlp_args(options: dict[str, Any]) -> list[str]:
+    """根据用户选项生成 yt-dlp 参数列表 (URL 之前的部分)。
+
+    默认选项严格匹配旧版 ``COMMON_YT_DLP_ARGS`` 的行为。
+    """
+    args: list[str] = []
+
+    fmt = str(options.get('video_format', 'h264_mp4'))
+    if fmt == 'h264_mp4':
+        args += ['-S', 'vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4']
+    elif fmt == 'h265_av1':
+        args += ['-S', 'vcodec:av1,ext:mp4:m4a', '--merge-output-format', 'mp4']
+    elif fmt == 'best':
+        pass  # 让 yt-dlp 按默认排序
+    elif fmt == 'original':
+        # 不加 -S 也不加 --merge-output-format，保留源格式
+        pass
+
+    if bool(options.get('write_subs', True)):
+        args += ['--write-subs', '--write-auto-subs']
+        sub_format = str(options.get('sub_format', 'json3') or '').strip()
+        if sub_format and sub_format != 'best':
+            args += ['--sub-format', sub_format]
+        sub_langs = str(options.get('sub_langs', 'en')).strip()
+        if sub_langs:
+            args += ['--sub-langs', sub_langs]
+
+    if bool(options.get('write_thumbnail', True)):
+        args += ['--write-thumbnail', '--convert-thumbnails', 'jpg']
+
+    if bool(options.get('write_info_json', True)):
+        args += ['--write-info-json']
+
+    sb_action = str(options.get('sponsorblock_action', 'remove'))
+    sb_cats = str(options.get('sponsorblock_categories', 'sponsor,intro,outro,interaction')).strip()
+    if sb_action in ('mark', 'remove') and sb_cats:
+        args += [f'--sponsorblock-{sb_action}', sb_cats]
+
+    if bool(options.get('split_chapters', False)):
+        # 用 yt-dlp 自带的 --split-chapters, 配合 chapter: 前缀的 -o 模板控制输出结构
+        # --no-keep-video 切完删整片, 父字幕/缩略图/info.json 仍按主模板 (真实标题) 保留
+        args += ['--split-chapters', '--no-keep-video']
+
+    args += ['--newline']
+    return args
+
+
+# 保留旧名字以防外部代码引用 (等价于 build_yt_dlp_args(DEFAULT_DOWNLOAD_OPTIONS))
+COMMON_YT_DLP_ARGS = build_yt_dlp_args(DEFAULT_DOWNLOAD_OPTIONS)
 
 TYPE_EXTRA_ARGS: dict[str, list[str]] = {
     'single': [
@@ -83,7 +165,7 @@ class DownloadWorker(QThread):
     log_line = Signal(str)
     finished_signal = Signal(int)
 
-    def __init__(self, url: str, download_dir: str, download_type: str, ffmpeg_dir: str = '', cookies_browser: str = '', js_runtime: str = 'auto', strip_emoji: bool = True, download_asr_audio: bool = True) -> None:
+    def __init__(self, url: str, download_dir: str, download_type: str, ffmpeg_dir: str = '', cookies_browser: str = '', js_runtime: str = 'auto', strip_emoji: bool = True, download_asr_audio: bool = True, download_options: dict[str, Any] | None = None) -> None:
         super().__init__()
         self.url = url
         self.download_dir = download_dir
@@ -93,6 +175,12 @@ class DownloadWorker(QThread):
         self.js_runtime = js_runtime
         self.strip_emoji = strip_emoji
         self.download_asr_audio = download_asr_audio
+        self.download_options: dict[str, Any] = dict(download_options or DEFAULT_DOWNLOAD_OPTIONS)
+        # 章节切分是否真正生效: 探测后才知道 (有的视频没有 chapter 标记)
+        self._split_chapters_effective: bool = bool(self.download_options.get('split_chapters', False))
+        # 父 video 路径信息 (single 模式 _resolve_output_template 里填充, 章节字幕切分/封面提取用)
+        self._parent_video_dir: Path | None = None
+        self._parent_video_stem: str | None = None
         self.process: subprocess.Popen | None = None
         self._paused = False
         self._stopped = False
@@ -327,6 +415,32 @@ class DownloadWorker(QThread):
         if not metadata:
             self.log_line.emit('[调试] 未拿到可用的预探测元数据，沿用原始输出模板')
             return extra
+
+        # 检测是否有真正的章节标记 (有且 > 1 个才视为分章节视频; YouTube 偶尔会塞 1 个伪章节)
+        raw_chapters = metadata.get('chapters')
+        has_real_chapters = isinstance(raw_chapters, list) and len(raw_chapters) > 1
+        if has_real_chapters:
+            self.log_line.emit(f'[提示] 检测到 {len(raw_chapters)} 个章节，将按章节切分为独立视频。')
+            self._split_chapters_effective = True
+        else:
+            self._split_chapters_effective = False
+            # 2026-08-15: 用户在 UI 勾选了"按章节切分"但视频本身没 chapter 标记
+            # (YouTube 老视频/创作者没加章节的情况), 显式 log 提示, 让用户知道
+            # 这个选项被忽略了, 而不是默默下载为单段.
+            if bool(self.download_options.get('split_chapters', False)):
+                chapters_field = metadata.get('chapters')
+                if chapters_field is None:
+                    reason = '视频本身没有章节标记'
+                elif isinstance(chapters_field, list) and len(chapters_field) <= 1:
+                    reason = f'视频只有 {len(chapters_field)} 个章节标记 (YouTube 偶尔会塞 1 个伪章节), 不够切分'
+                else:
+                    reason = f'chapters 字段格式异常: type={type(chapters_field).__name__}'
+                self.log_line.emit(
+                    f'[章节切分] 已忽略: {reason}. '
+                    f'"按章节切分"依赖 yt-dlp 拿到的视频章节元数据, '
+                    f'没数据就没法切 — 本次将下载为单段.'
+                )
+
         raw_uploader = str(metadata.get('uploader') or metadata.get('channel') or '下载内容')
         uploader_name = self._sanitize_path_component(raw_uploader)
         self._log_sanitize_mapping('uploader', raw_uploader, uploader_name)
@@ -336,19 +450,42 @@ class DownloadWorker(QThread):
             video_title = self._sanitize_path_component(raw_video_title)
             self._log_sanitize_mapping('single.title', raw_video_title, video_title)
             output_template = f'{uploader_name}/{video_title}.%(ext)s'
+            # 父 video 预期路径（章节切分后续步骤读父 info.json 用）
+            # 注意: chapter: 前缀模板是 ``<uploader>/<title>/chapters/...`` (多一层 <title>/),
+            # 所以父 video dir 必须包含 <title> 这一层
+            self._parent_video_dir = Path(self.download_dir) / uploader_name / video_title
+            self._parent_video_stem = video_title
         elif self.download_type == 'playlist':
             raw_playlist_title = str(metadata.get('title') or metadata.get('playlist_title') or 'playlist')
             playlist_title = self._sanitize_path_component(raw_playlist_title)
             self._log_sanitize_mapping('playlist.title', raw_playlist_title, playlist_title)
             output_template = f'{uploader_name}/{playlist_title}/%(playlist_index)02d - %(title)s.%(ext)s'
+            # playlist 模式下每条 video 是独立子目录, 由 yt-dlp 落盘后才知道具体路径
+            self._parent_video_dir = None
+            self._parent_video_stem = None
         elif self.download_type == 'channel':
             output_template = f'{uploader_name}/%(playlist)s/%(playlist_index)02d - %(title)s.%(ext)s'
+            self._parent_video_dir = None
+            self._parent_video_stem = None
         if not output_template:
             return extra
         resolved = list(extra)
         output_index = resolved.index('-o') + 1
         resolved[output_index] = output_template
-        self.log_line.emit(f'[提示] 已预清理下载路径：{output_template}')
+
+        # 章节切分时, 加一个 chapter: 前缀的输出模板, 控制每章文件的目录
+        # yt-dlp 文档: "The 'chapter:' prefix can be used with '--paths' and '--output'"
+        # 父文件 (字幕/缩略图/info.json) 用主模板 (不再有 NA - NA 占位符问题)
+        if self._split_chapters_effective:
+            # 在主模板基础上, 把文件名部分替换成 chapters/<section>/<section>.ext
+            chapter_dir_path = f'{output_template.rsplit(".%(ext)s", 1)[0]}/chapters/%(section_number)02d - %(section_title)s'
+            chapter_filename = '%(section_number)02d - %(section_title)s.%(ext)s'
+            chapter_template = f'{chapter_dir_path}/{chapter_filename}'
+            resolved += ['-o', f'chapter:{chapter_template}']
+            self.log_line.emit(f'[提示] 主模板: {output_template}')
+            self.log_line.emit(f'[提示] 章节模板: chapter:{chapter_template}')
+        else:
+            self.log_line.emit(f'[提示] 已预清理下载路径：{output_template}')
         return resolved
 
     @staticmethod
@@ -485,12 +622,30 @@ class DownloadWorker(QThread):
             return True
         return self._playlist_finished and (self._private_video_error_count > 0 or self._saw_unavailable_video)
 
+    def _has_ffmpeg(self) -> bool:
+        ffmpeg_dir = resolve_ffmpeg_dir(self.ffmpeg_dir)
+        if ffmpeg_dir:
+            p = Path(ffmpeg_dir)
+            if (p / 'ffmpeg.exe').exists() or (p / 'ffprobe.exe').exists():
+                return True
+        return shutil.which('ffmpeg') is not None or shutil.which('ffprobe') is not None
+
     def run(self) -> None:
         yt_dlp = resolve_executable('yt-dlp')
         if not yt_dlp:
             self.log_line.emit('[错误] 未找到 yt-dlp，可将 yt-dlp.exe 放到程序目录或 vendor 目录中')
             self.finished_signal.emit(1)
             return
+
+        # 预检: 章节切分 / SponsorBlock 移除 / ASR 音频 都依赖 ffmpeg
+        needs_ffmpeg = (
+            self.download_asr_audio
+            or self.download_options.get('sponsorblock_action') == 'remove'
+            or self.download_options.get('split_chapters', False)
+        )
+        if needs_ffmpeg and not self._has_ffmpeg():
+            self.log_line.emit('[警告] 当前选项需要 ffmpeg (SponsorBlock 移除 / 章节切分 / ASR 音频)，但未检测到 ffmpeg/ffmpeg.exe。')
+            self.log_line.emit('[警告] 请在页面上方填写 ffmpeg 目录 (内含 ffmpeg.exe/ffprobe.exe)，否则下载会在后处理阶段失败。')
 
         extra = self._resolve_type_extra_args()
         ffmpeg_args = []
@@ -517,7 +672,10 @@ class DownloadWorker(QThread):
         if self.download_asr_audio:
             asr_exec_args = self._asr_audio_exec_args(ffmpeg_dir)
             self.log_line.emit('[ASR音频] 已启用随视频下载生成 ASR WAV：每个视频落盘后立即转换')
-        cmd = [yt_dlp] + extra + ffmpeg_args + cookies_args + js_runtime_args + remote_component_args + asr_exec_args + list(COMMON_YT_DLP_ARGS) + [self.url]
+        # 章节切分是否真的生效取决于探测结果 (没有 chapter 标记的会回退)
+        effective_options = {**self.download_options, 'split_chapters': self._split_chapters_effective}
+        yt_dlp_common_args = build_yt_dlp_args(effective_options)
+        cmd = [yt_dlp] + extra + ffmpeg_args + cookies_args + js_runtime_args + remote_component_args + asr_exec_args + yt_dlp_common_args + [self.url]
         self.log_line.emit(f'[执行] {" ".join(cmd)}')
         self.log_line.emit(f'[目录] {self.download_dir}')
 
@@ -549,8 +707,362 @@ class DownloadWorker(QThread):
                 self.log_line.emit('[提示] 播放列表已处理完成，但存在不可访问条目；仍将执行一次文件名 Emoji 兜底清理。')
             self._cleanup_download_names()
             self._cleanup_info_json_metadata()
+        # 章节切分成功后, 把父字幕按章节切片, 然后从每段视频抽一帧作为封面
+        if self._split_chapters_effective and returncode == 0:
+            try:
+                self._split_subtitles_by_chapter()
+            except Exception as exc:
+                self.log_line.emit(f'[字幕切分][异常] {exc}')
+            try:
+                self._extract_chapter_thumbnails()
+            except Exception as exc:
+                self.log_line.emit(f'[章节封面][异常] {exc}')
         self._emit_diagnostics(returncode)
         self.finished_signal.emit(returncode)
+
+    @staticmethod
+    def _parse_vtt_timestamp(stamp: str) -> float:
+        """解析 VTT/SRT 时间戳 (HH:MM:SS.mmm 或 MM:SS.mmm) 为秒。"""
+        s = stamp.strip().replace(',', '.')
+        parts = s.split(':')
+        if len(parts) == 3:
+            h, m, sec = parts
+        elif len(parts) == 2:
+            h, m, sec = '0', parts[0], parts[1]
+        else:
+            return 0.0
+        try:
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+        except ValueError:
+            return 0.0
+
+    def _extract_chapter_thumbnails(self) -> None:
+        """章节切分成功后, 用 ffmpeg 从每个章节视频抽一帧作为封面 jpg。
+
+        抽帧位置: 章节起点 + 2s, 避开片头黑屏。
+
+        章节的 start_time 从父 info.json 的 ``chapters`` 数组里读 (yt-dlp
+        不会为每个章节生成独立 info.json)。
+        """
+        if self._stopped:
+            return
+        parent_info, parent_video_dir, _, chapters_root = self._find_chapter_assets()
+        if not parent_info or not chapters_root:
+            return
+        root = Path(self.download_dir)
+        if not root.exists():
+            return
+        # 找 ffmpeg
+        ffmpeg_path = self._resolve_ffmpeg_executable(self.ffmpeg_dir)
+        if not ffmpeg_path or not Path(ffmpeg_path).exists():
+            alt = shutil.which('ffmpeg')
+            if alt:
+                ffmpeg_path = alt
+            else:
+                self.log_line.emit('[章节封面] 找不到 ffmpeg, 跳过封面提取')
+                return
+
+        try:
+            parent_payload = json.loads(parent_info.read_text('utf-8'))
+        except Exception as exc:
+            self.log_line.emit(f'[章节封面] 读父 info.json 失败: {exc}')
+            return
+        raw_chapters = parent_payload.get('chapters')
+        if not isinstance(raw_chapters, list) or len(raw_chapters) < 2:
+            return
+
+        self.log_line.emit(f'[章节封面] 开始为 {len(raw_chapters)} 个章节抽封面...')
+        success = 0
+        for idx, ch in enumerate(raw_chapters, start=1):
+            if self._stopped:
+                return
+            title = str(ch.get('title') or '').strip()
+            start_time = ch.get('start_time')
+            if not title or start_time is None:
+                continue
+            chapter_stem = f'{idx:02d} - {title}'
+            chapter_dir = chapters_root / chapter_stem
+            video_path = chapter_dir / f'{chapter_stem}.mp4'
+            if not video_path.exists():
+                continue
+            jpg_path = chapter_dir / f'{chapter_stem}.jpg'
+            if jpg_path.exists():
+                continue
+            # chapter mp4 已被 ffmpeg 切出来, 视频 0 秒 = 章节起点, 所以 seek 用章节内偏移 (2.0s)
+            # 而非 ``start_time + 2.0`` (那是父视频的绝对时间, 加后会 seek 到 chapter 视频外)
+            seek_to = 2.0
+            cmd = [
+                ffmpeg_path, '-y',
+                '-ss', f'{seek_to:.3f}',
+                '-i', str(video_path),
+                '-frames:v', '1',
+                '-q:v', '2',
+                str(jpg_path),
+            ]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=60,
+                )
+                if result.returncode == 0 and jpg_path.exists():
+                    success += 1
+                    self.log_line.emit(f'[章节封面] {chapter_stem}.jpg 已生成')
+                else:
+                    err = (result.stderr or '').strip().splitlines()[-1] if result.stderr else 'unknown'
+                    self.log_line.emit(f'[章节封面] {chapter_stem}: ffmpeg 失败: {err}')
+            except Exception as exc:
+                self.log_line.emit(f'[章节封面] {chapter_stem}: {exc}')
+        if success > 0:
+            self.log_line.emit(f'[章节封面] 完成, 共 {success} 个章节封面已生成')
+
+    @staticmethod
+    def _format_vtt_timestamp(seconds: float) -> str:
+        """把秒格式化为 HH:MM:SS.mmm。"""
+        if seconds < 0:
+            seconds = 0
+        total_ms = int(round(seconds * 1000))
+        h, rem = divmod(total_ms, 3600 * 1000)
+        m, rem = divmod(rem, 60 * 1000)
+        s, ms = divmod(rem, 1000)
+        return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
+
+    def _slice_subtitle_file(self, sub_path: Path, target_dir: Path, chapter_stem: str, start_time: float, end_time: float) -> int:
+        """把单个父字幕文件按章节切片, 写到 ``<target_dir>/<chapter_stem><原后缀>``。
+
+        返回切片后的时间点 (cue/event) 数量; 0 = 这个章节没有字幕内容。
+        """
+        name = sub_path.name
+        suffix = sub_path.suffix.lower()  # .json3 / .vtt / .srt
+        first_dot = name.find('.')
+        if first_dot <= 0:
+            new_name = f'{chapter_stem}{name}'
+        else:
+            new_name = f'{chapter_stem}{name[first_dot:]}'
+        new_path = target_dir / new_name
+        if new_path.exists():
+            self.log_line.emit(f'[字幕切分] {new_name} 已存在, 跳过')
+            return 0
+
+        if suffix == '.json3':
+            try:
+                payload = json.loads(sub_path.read_text('utf-8'))
+            except Exception as exc:
+                self.log_line.emit(f'[字幕切分] 读取 {name} 失败: {exc}')
+                return 0
+            events = payload.get('events') or []
+            sliced: list[dict] = []
+            for event in events:
+                # yt-dlp 输出的 json3 用驼峰字段 (tStartMs / dDurationMs, YouTube 原生名);
+                # 兼容蛇形 (t_start_ms / d_duration_ms) 方便其它来源 / 自定义生成
+                t_start = event.get('tStartMs') if 'tStartMs' in event else event.get('t_start_ms')
+                t_dur = event.get('dDurationMs') if 'dDurationMs' in event else event.get('d_duration_ms')
+                if t_start is None:
+                    continue
+                ev_start = t_start / 1000.0
+                ev_end = ev_start + (t_dur / 1000.0 if t_dur else 0)
+                # 交集条件: 字幕时间与章节时间有重叠
+                if ev_end <= start_time or ev_start >= end_time:
+                    continue
+                new_event = dict(event)
+                # 裁剪到章节边界内, 时间码重新对齐章节起点
+                clipped_start = max(ev_start, start_time)
+                clipped_end = min(ev_end, end_time) if ev_end > 0 else end_time
+                new_event['t_start_ms'] = int(round((clipped_start - start_time) * 1000))
+                new_event['d_duration_ms'] = int(round((clipped_end - clipped_start) * 1000))
+                sliced.append(new_event)
+            if not sliced:
+                return 0
+            new_payload = dict(payload)
+            new_payload['events'] = sliced
+            try:
+                new_path.write_text(json.dumps(new_payload, ensure_ascii=False), 'utf-8')
+            except Exception as exc:
+                self.log_line.emit(f'[字幕切分] 写入 {new_name} 失败: {exc}')
+                return 0
+            return len(sliced)
+
+        if suffix in ('.vtt', '.srt'):
+            is_vtt = suffix == '.vtt'
+            try:
+                raw = sub_path.read_text('utf-8', errors='replace')
+            except Exception as exc:
+                self.log_line.emit(f'[字幕切分] 读取 {name} 失败: {exc}')
+                return 0
+            # 解析 cues: cue = (start_str, end_str, text_lines)
+            cues: list[tuple[str, str, list[str]]] = []
+            current: list[str] | None = None
+            for line in raw.splitlines():
+                if is_vtt and line.strip().startswith('WEBVTT'):
+                    continue
+                if '-->' in line:
+                    parts = line.split('-->', 1)
+                    start_str = parts[0].strip()
+                    end_str = parts[1].strip().split(' ', 1)[0]
+                    current = [start_str, end_str, []]
+                    cues.append((current[0], current[1], current[2]))
+                elif current is not None and line.strip():
+                    current[2].append(line)
+                elif not line.strip():
+                    current = None
+            sliced_cues: list[tuple[float, float, list[str]]] = []
+            for start_str, end_str, text_lines in cues:
+                ev_start = self._parse_vtt_timestamp(start_str)
+                ev_end = self._parse_vtt_timestamp(end_str)
+                if ev_end <= start_time or ev_start >= end_time:
+                    continue
+                clipped_start = max(ev_start, start_time)
+                clipped_end = min(ev_end, end_time) if ev_end > 0 else end_time
+                if clipped_end <= clipped_start:
+                    continue
+                sliced_cues.append((clipped_start - start_time, clipped_end - start_time, text_lines))
+            if not sliced_cues:
+                return 0
+            out_lines: list[str] = []
+            if is_vtt:
+                out_lines.append('WEBVTT')
+                out_lines.append('')
+            for i, (c_start, c_end, text_lines) in enumerate(sliced_cues, start=1):
+                if not is_vtt:
+                    out_lines.append(str(i))
+                start_ts = self._format_vtt_timestamp(c_start)
+                end_ts = self._format_vtt_timestamp(c_end)
+                if is_vtt:
+                    out_lines.append(f'{start_ts} --> {end_ts}')
+                else:
+                    out_lines.append(f'{start_ts} --> {end_ts}'.replace('.', ','))
+                out_lines.extend(text_lines)
+                out_lines.append('')
+            try:
+                new_path.write_text('\n'.join(out_lines), 'utf-8')
+            except Exception as exc:
+                self.log_line.emit(f'[字幕切分] 写入 {new_name} 失败: {exc}')
+                return 0
+            return len(sliced_cues)
+
+        # 其它格式不处理
+        self.log_line.emit(f'[字幕切分] {name} 是不支持的字幕格式 ({suffix}), 跳过')
+        return 0
+
+    def _find_chapter_assets(self) -> tuple[Path | None, Path | None, list[Path], Path | None]:
+        """定位章节切分后的关键资产:
+        - 父 info.json (含 chapters 数组)
+        - 父 video dir (uploader 目录, 父 info.json 所在目录, 用来 glob 父字幕)
+        - 父字幕列表 (json3 / vtt / srt, 跟 info.json 同目录)
+        - chapters 根目录 (实际章节子目录的父: ``<uploader>/<title>/chapters/``,
+          chapter: 模板比主模板多一层 ``<title>/``)
+
+        优先用本次下载记录的 ``self._parent_video_dir`` (single 模式下确切的
+        ``<download_dir>/<uploader>/<title>`` 路径, 跟本次 yt-dlp 任务的输出
+        template 一一对应, 不会扫到老视频的 .info.json)。fallback 才用 rglob
+        (playlist 模式没记录具体 video 路径), 并按 mtime 取最新, 避免 rglob
+        顺序随机返回老文件。
+        """
+        root = Path(self.download_dir)
+        if not root.exists():
+            return None, None, [], None
+        parent_info: Path | None = None
+        parent_video_dir: Path | None = None
+        # Path 1: 用本次下载记录的目标路径 (single 模式)
+        if self._parent_video_dir is not None and self._parent_video_stem:
+            candidate_dir = Path(self._parent_video_dir)
+            candidate_info = candidate_dir / f'{self._parent_video_stem}.info.json'
+            if candidate_info.exists():
+                parent_info = candidate_info
+                parent_video_dir = candidate_dir
+        # Path 2: fallback rglob, 排除 chapters/ 和 .yt-dlp-archives/, mtime 最新优先
+        if parent_info is None:
+            candidates: list[Path] = []
+            for info_path in root.rglob('*.info.json'):
+                if any(part.lstrip('.').startswith('yt-dlp-archives') for part in info_path.parts):
+                    continue
+                if 'chapters' in info_path.parts:
+                    continue
+                candidates.append(info_path)
+            if candidates:
+                # mtime 最新优先, 避免 rglob 顺序随机返回老的 .info.json
+                candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                parent_info = candidates[0]
+                parent_video_dir = parent_info.parent
+        if not parent_info or not parent_video_dir:
+            return None, None, [], None
+        # 父字幕: 跟父 info.json 同目录, 跟父 info.json 同 stem, 字幕后缀
+        stem = parent_info.stem
+        if stem.endswith('.info'):
+            stem = stem[:-5]
+        subs: list[Path] = []
+        for pattern in ('*.json3', '*.vtt', '*.srt'):
+            subs.extend(parent_video_dir.glob(f'{stem}.{pattern}'))
+        # ASR wav 不是字幕, 不会匹配
+        # chapters 根目录: chapter: 模板是 <uploader>/<title>/chapters/...,
+        # 父 info.json 落在 <uploader>/<title>.info.json, 所以 chapters 根在
+        # ``parent_video_dir / <title> / 'chapters'``。
+        chapters_root = parent_video_dir / stem / 'chapters' if stem else None
+        self.log_line.emit(f'[调试] _find_chapter_assets: parent_video_dir={self._parent_video_dir!r} parent_video_stem={self._parent_video_stem!r} resolved_parent_info={parent_info!r} chapters_root={chapters_root!r}')
+        return parent_info, parent_video_dir, subs, chapters_root
+
+    def _split_subtitles_by_chapter(self) -> None:
+        """章节切分成功后, 把父字幕按章节切片, 写到对应章节子目录。
+
+        yt-dlp 的 --split-chapters 不会为每个章节生成独立 info.json,
+        章节元数据 (start_time / end_time / title) 只在父 info.json 的 ``chapters`` 数组里。
+        流程:
+        1. 找父 info.json (download_dir 下, 不在 chapters/ 或 .yt-dlp-archives/ 里)
+        2. 读 ``chapters`` 数组
+        3. 对每个章节, 找到对应章节子目录 (chapter_stem = ``<n>02d - <title>``)
+        4. 把父字幕切片写到章节子目录里
+        """
+        if self._stopped:
+            return
+        parent_info, parent_video_dir, parent_subs, chapters_root = self._find_chapter_assets()
+        if not parent_info:
+            self.log_line.emit('[字幕切分] 找不到父 info.json, 跳过')
+            return
+        if not parent_subs:
+            self.log_line.emit('[字幕切分] 父 video 目录下没找到字幕文件, 跳过')
+            return
+        if not chapters_root:
+            self.log_line.emit('[字幕切分] 推不出 chapters 根目录, 跳过')
+            return
+        try:
+            parent_payload = json.loads(parent_info.read_text('utf-8'))
+        except Exception as exc:
+            self.log_line.emit(f'[字幕切分] 读父 info.json 失败: {exc}')
+            return
+        raw_chapters = parent_payload.get('chapters')
+        if not isinstance(raw_chapters, list) or len(raw_chapters) < 2:
+            self.log_line.emit('[字幕切分] 父 info.json 里没有 chapters 数组 (或不足 2 个), 跳过')
+            return
+        self.log_line.emit(f'[字幕切分] 发现 {len(raw_chapters)} 个章节 + {len(parent_subs)} 个父字幕, 开始按章节切分... (chapters 根目录: {chapters_root})')
+        sliced_files = 0
+        sliced_cues = 0
+        for idx, ch in enumerate(raw_chapters, start=1):
+            if self._stopped:
+                return
+            title = str(ch.get('title') or '').strip()
+            start_time = ch.get('start_time')
+            end_time = ch.get('end_time')
+            if not title or start_time is None or end_time is None:
+                self.log_line.emit(f'[字幕切分] ch{idx}: 缺字段, 跳过 (title={title!r}, start={start_time}, end={end_time})')
+                continue
+            chapter_stem = f'{idx:02d} - {title}'
+            chapter_dir = chapters_root / chapter_stem
+            if not chapter_dir.exists():
+                self.log_line.emit(f'[字幕切分] {chapter_stem}: 子目录不存在 ({chapter_dir}), 跳过')
+                continue
+            for sub_path in parent_subs:
+                count = self._slice_subtitle_file(sub_path, chapter_dir, chapter_stem, float(start_time), float(end_time))
+                if count > 0:
+                    sliced_files += 1
+                    sliced_cues += count
+                    self.log_line.emit(f'[字幕切分] {chapter_stem}: {count} 个时间点 ← {sub_path.name}')
+        if sliced_files > 0:
+            self.log_line.emit(f'[字幕切分] 完成, 共 {sliced_files} 个字幕文件, {sliced_cues} 个时间点')
+        else:
+            self.log_line.emit('[字幕切分] 没有可切的父字幕 (子文件可能已经存在, 或没下载字幕)')
 
     def _suspend_resume_win(self, suspend: bool) -> bool:
         """Use NtSuspendProcess / NtResumeProcess to truly freeze the process tree on Windows."""
@@ -663,14 +1175,15 @@ class DownloadTab(QWidget):
         dir_row.addWidget(self.browse_btn)
         params_layout.addLayout(dir_row)
 
-        # ffmpeg 路径
+        # ffmpeg 路径 — 配置统一在系统设置 tab, 这里只读显示 + 跳过去改
         ffmpeg_row = QHBoxLayout()
         ffmpeg_row.addWidget(QLabel('ffmpeg 目录'))
         self.ffmpeg_input = QLineEdit()
-        self.ffmpeg_input.setPlaceholderText('可选：选择 ffmpeg 所在目录（含 ffmpeg.exe）')
+        self.ffmpeg_input.setReadOnly(True)
+        self.ffmpeg_input.setPlaceholderText('在「系统设置 → 视频处理」里配置')
         ffmpeg_row.addWidget(self.ffmpeg_input)
-        self.ffmpeg_browse_btn = QPushButton('选择目录')
-        self.ffmpeg_browse_btn.clicked.connect(self._choose_ffmpeg_dir)
+        self.ffmpeg_browse_btn = QPushButton('去系统设置改…')
+        self.ffmpeg_browse_btn.clicked.connect(self._jump_to_ffmpeg_settings)
         ffmpeg_row.addWidget(self.ffmpeg_browse_btn)
         params_layout.addLayout(ffmpeg_row)
 
@@ -699,9 +1212,57 @@ class DownloadTab(QWidget):
         self.download_asr_audio_checkbox.setChecked(True)
         params_layout.addWidget(self.download_asr_audio_checkbox)
 
-        self._load_config()
-
         layout.addWidget(params)
+
+        # --- 高级选项 (可折叠，展开后看到 yt-dlp 详细参数) ---
+        self.advanced_group = QGroupBox('高级选项 (yt-dlp 参数，默认折叠)')
+        self.advanced_group.setCheckable(True)
+        self.advanced_group.setChecked(False)
+        adv_layout = QFormLayout(self.advanced_group)
+        adv_layout.setLabelAlignment(Qt.AlignRight)
+        adv_layout.setContentsMargins(12, 8, 12, 12)
+        adv_layout.setHorizontalSpacing(8)
+        adv_layout.setVerticalSpacing(6)
+
+        self.format_combo = QComboBox()
+        for label, value in VIDEO_FORMAT_OPTIONS:
+            self.format_combo.addItem(label, value)
+        self.format_combo.setMinimumWidth(220)
+        adv_layout.addRow('视频格式', self.format_combo)
+
+        self.write_subs_checkbox = QCheckBox('下载字幕（含自动字幕）')
+        adv_layout.addRow(self.write_subs_checkbox)
+
+        self.sub_langs_input = QLineEdit()
+        self.sub_langs_input.setPlaceholderText('en,zh-Hans,en.*,zh-Hans.*')
+        adv_layout.addRow('字幕语言', self.sub_langs_input)
+
+        self.sub_format_combo = QComboBox()
+        for label, value in SUB_FORMAT_OPTIONS:
+            self.sub_format_combo.addItem(label, value)
+        adv_layout.addRow('字幕格式', self.sub_format_combo)
+
+        self.write_thumbnail_checkbox = QCheckBox('写缩略图 (jpg)')
+        adv_layout.addRow(self.write_thumbnail_checkbox)
+        self.write_info_json_checkbox = QCheckBox('写 info.json')
+        adv_layout.addRow(self.write_info_json_checkbox)
+
+        self.sponsorblock_action_combo = QComboBox()
+        for label, value in SPONSORBLOCK_ACTIONS:
+            self.sponsorblock_action_combo.addItem(label, value)
+        adv_layout.addRow('SponsorBlock', self.sponsorblock_action_combo)
+
+        self.sponsorblock_categories_input = QLineEdit()
+        self.sponsorblock_categories_input.setPlaceholderText(SPONSORBLOCK_CATEGORY_HELP)
+        adv_layout.addRow('SponsorBlock 类别', self.sponsorblock_categories_input)
+
+        self.split_chapters_checkbox = QCheckBox('按章节切分为独立视频（用 yt-dlp 原生 --split-chapters，章节子目录结构: chapters/<n> - <title>/）')
+        adv_layout.addRow(self.split_chapters_checkbox)
+
+        layout.addWidget(self.advanced_group)
+
+        # 所有控件就位后再加载配置 (高级选项需要 format_combo 等)
+        self._load_config()
 
         # --- 操作按钮 ---
         btn_row = QHBoxLayout()
@@ -728,13 +1289,18 @@ class DownloadTab(QWidget):
         log_layout.addWidget(self.log_box)
         layout.addWidget(log_group, 1)
 
-    def _choose_ffmpeg_dir(self) -> None:
-        initial = self.ffmpeg_input.text().strip() or str(Path.home())
-        chosen = QFileDialog.getExistingDirectory(self, '选择 ffmpeg 所在目录', initial)
-        if chosen:
-            self.ffmpeg_input.setText(chosen)
-            self._save_config(ffmpeg_dir=chosen)
-            self.log_box.appendPlainText(f'ffmpeg 目录已设置：{chosen}')
+    def _choose_ffmpeg_dir(self) -> None:  # 保留以防旧 import 调用, 跳到系统设置
+        self._jump_to_ffmpeg_settings()
+
+    def _jump_to_ffmpeg_settings(self) -> None:
+        # 跳到系统设置 tab, 由用户在「视频处理」sub-tab 里改
+        from services.tab_bus import bus
+        from tabs.settings_tab import SettingsTab
+        target = SettingsTab.get_instance()
+        if target is not None:
+            bus.request_focus_tab.emit(target)
+        else:
+            QMessageBox.information(self, '提示', '请切到「系统设置」tab 改 ffmpeg 目录。')
 
     @staticmethod
     def _config_path() -> Path:
@@ -763,8 +1329,60 @@ class DownloadTab(QWidget):
         self.strip_emoji_checkbox.setChecked(bool(data.get('download_strip_emoji', True)))
         self.download_asr_audio_checkbox.setChecked(bool(data.get('download_asr_audio', True)))
 
+        # 高级选项
+        video_format = data.get('download_video_format', DEFAULT_DOWNLOAD_OPTIONS['video_format'])
+        for index in range(self.format_combo.count()):
+            if self.format_combo.itemData(index) == video_format:
+                self.format_combo.setCurrentIndex(index)
+                break
+        self.write_subs_checkbox.setChecked(bool(data.get('download_write_subs', DEFAULT_DOWNLOAD_OPTIONS['write_subs'])))
+        self.sub_langs_input.setText(str(data.get('download_sub_langs', DEFAULT_DOWNLOAD_OPTIONS['sub_langs'])))
+        sub_format = str(data.get('download_sub_format', DEFAULT_DOWNLOAD_OPTIONS['sub_format']))
+        for index in range(self.sub_format_combo.count()):
+            if self.sub_format_combo.itemData(index) == sub_format:
+                self.sub_format_combo.setCurrentIndex(index)
+                break
+        self.write_thumbnail_checkbox.setChecked(bool(data.get('download_write_thumbnail', DEFAULT_DOWNLOAD_OPTIONS['write_thumbnail'])))
+        self.write_info_json_checkbox.setChecked(bool(data.get('download_write_info_json', DEFAULT_DOWNLOAD_OPTIONS['write_info_json'])))
+        sb_action = str(data.get('download_sponsorblock_action', DEFAULT_DOWNLOAD_OPTIONS['sponsorblock_action']))
+        for index in range(self.sponsorblock_action_combo.count()):
+            if self.sponsorblock_action_combo.itemData(index) == sb_action:
+                self.sponsorblock_action_combo.setCurrentIndex(index)
+                break
+        self.sponsorblock_categories_input.setText(str(data.get('download_sponsorblock_categories', DEFAULT_DOWNLOAD_OPTIONS['sponsorblock_categories'])))
+        self.split_chapters_checkbox.setChecked(bool(data.get('download_split_chapters', DEFAULT_DOWNLOAD_OPTIONS['split_chapters'])))
+
     def _save_config(self, **updates: str) -> None:
         save_json_config(updates)
+
+    def _collect_download_options(self) -> dict[str, Any]:
+        """从 UI 读取当前高级选项。"""
+        return {
+            'video_format': str(self.format_combo.currentData() or DEFAULT_DOWNLOAD_OPTIONS['video_format']),
+            'write_subs': self.write_subs_checkbox.isChecked(),
+            'sub_langs': self.sub_langs_input.text().strip() or DEFAULT_DOWNLOAD_OPTIONS['sub_langs'],
+            'sub_format': str(self.sub_format_combo.currentData() or DEFAULT_DOWNLOAD_OPTIONS['sub_format']),
+            'write_thumbnail': self.write_thumbnail_checkbox.isChecked(),
+            'write_info_json': self.write_info_json_checkbox.isChecked(),
+            'sponsorblock_action': str(self.sponsorblock_action_combo.currentData() or DEFAULT_DOWNLOAD_OPTIONS['sponsorblock_action']),
+            'sponsorblock_categories': self.sponsorblock_categories_input.text().strip() or DEFAULT_DOWNLOAD_OPTIONS['sponsorblock_categories'],
+            'split_chapters': self.split_chapters_checkbox.isChecked(),
+        }
+
+    @staticmethod
+    def _download_options_to_config(options: dict[str, Any]) -> dict[str, str]:
+        """转成 config.json 友好的字符串键值对。"""
+        return {
+            'download_video_format': str(options['video_format']),
+            'download_write_subs': str(bool(options['write_subs'])),
+            'download_sub_langs': str(options['sub_langs']),
+            'download_sub_format': str(options['sub_format']),
+            'download_write_thumbnail': str(bool(options['write_thumbnail'])),
+            'download_write_info_json': str(bool(options['write_info_json'])),
+            'download_sponsorblock_action': str(options['sponsorblock_action']),
+            'download_sponsorblock_categories': str(options['sponsorblock_categories']),
+            'download_split_chapters': str(bool(options['split_chapters'])),
+        }
 
     def _on_type_changed(self, idx: int) -> None:
         if 0 <= idx < len(DOWNLOAD_TYPES):
@@ -812,16 +1430,24 @@ class DownloadTab(QWidget):
         js_runtime = str(self.js_runtime_combo.currentData() or 'auto')
         strip_emoji = self.strip_emoji_checkbox.isChecked()
         download_asr_audio = self.download_asr_audio_checkbox.isChecked()
-        self._save_config(
-            download_dir=download_dir,
-            download_cookies_browser=cookies_browser,
-            download_js_runtime=js_runtime,
-            download_strip_emoji=strip_emoji,
-            download_asr_audio=download_asr_audio,
-        )
+        download_options = self._collect_download_options()
+        config_updates = {
+            'download_dir': download_dir,
+            'download_cookies_browser': cookies_browser,
+            'download_js_runtime': js_runtime,
+            'download_strip_emoji': str(strip_emoji),
+            'download_asr_audio': str(download_asr_audio),
+        }
+        config_updates.update(self._download_options_to_config(download_options))
+        self._save_config(**config_updates)
 
         self.log_box.appendPlainText(f'--- 开始下载 [{DOWNLOAD_TYPES[idx][0]}] ---')
-        self.worker = DownloadWorker(url, download_dir, download_type, ffmpeg_dir, cookies_browser, js_runtime, strip_emoji, download_asr_audio)
+        if download_options.get('split_chapters'):
+            self.log_box.appendPlainText('[提示] 已启用按章节切分，每个章节会下载为独立视频。')
+        self.worker = DownloadWorker(
+            url, download_dir, download_type, ffmpeg_dir, cookies_browser, js_runtime,
+            strip_emoji, download_asr_audio, download_options,
+        )
         self.worker.log_line.connect(self.log_box.appendPlainText)
         self.worker.finished_signal.connect(self._on_finished)
         self.worker.start()

@@ -124,7 +124,8 @@ interface VcSubmitResponse {
 }
 
 async function submitCaptionTask(
-  wavBytes: Uint8Array,
+  wavUri: string,
+  wavSize: number,
   taskId: string,
   language: string,
 ): Promise<string> {
@@ -146,26 +147,71 @@ async function submitCaptionTask(
   console.log('[FileAsr] submit start', {
     label: taskId,
     urlPreview: url.slice(0, 120) + (url.length > 120 ? '…' : ''),
-    wavBytes: wavBytes.length,
+    wavSize,
     contentType: 'audio/wav',
   });
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': buildAuthHeader(),
-      'Content-Type': 'audio/wav',
-      'Content-Length': String(wavBytes.length),
-    },
-    // RN fetch: Buffer 需转 ArrayBuffer,ArrayBuffer view 也行
-    body: wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength) as ArrayBuffer,
+  // 2026-08-15 改: 桌面版 Python urllib 走 OS socket 能直接发大 body, RN fetch
+  // 在 Android emulator 上大 body (>30MB) 触发 Hermes/OkHttp bug ("Network request
+  // failed", 实际上 fetch 静默挂起或被 AbortController 干掉). 跟之前 rn-app PUT
+  // OSS 卡死是同一类问题 — 改用 expo-file-system.uploadAsync 走 native OkHttp,
+  // 读 fileUri 的 stream 上传, 绕开 Hermes 路径.
+  //
+  // 注意: uploadAsync 在 emulator 上对 simple PUT 也有 "100-continue 卡死" 风险
+  // (memory 里 oss-rest.ts.dead-bak 的教训), 但火山 submit 是 POST + 不同的
+  // 端点, 100-continue 协商可能不一样. 失败的话再切 chunked 路径 (用
+  // transcribeChunkedWavSubtitleGeneration 切 90s/段).
+  console.log('[FileAsr] submit uploadAsync start', {
+    label: taskId,
+    urlPreview: url.slice(0, 120) + (url.length > 120 ? '…' : ''),
+    wavSize,
+    wavUriPreview: wavUri.slice(0, 80),
+    contentType: 'audio/wav',
+  });
+  let uploadResult: { status: number; body?: string };
+  try {
+    const FileSystemMod = await import('expo-file-system/legacy');
+    const result = await FileSystemMod.uploadAsync(url, wavUri, {
+      httpMethod: 'POST',
+      headers: {
+        'Authorization': buildAuthHeader(),
+        'Content-Type': 'audio/wav',
+        'Content-Length': String(wavSize),
+      },
+      uploadType: (FileSystemMod as any).FileSystemUploadType?.BINARY_CONTENT ?? 0,
+    });
+    uploadResult = { status: result.status, body: result.body };
+  } catch (uploadErr) {
+    const err = uploadErr as Error & { name?: string; stack?: string };
+    console.error('[FileAsr] submit uploadAsync FAILED', {
+      label: taskId,
+      errorName: err?.name,
+      errorMessage: err?.message,
+      errorStack: err?.stack?.split('\n').slice(0, 5).join('\n'),
+    });
+    throw new Error(
+      `video caption submit 失败: name=${err?.name || 'unknown'} message=${err?.message || String(uploadErr)}`
+    );
+  }
+
+  console.log('[FileAsr] submit uploadAsync response', {
+    label: taskId,
+    status: uploadResult.status,
+    bodyPreview: (uploadResult.body || '').slice(0, 300),
   });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`video caption submit HTTP 失败: status=${response.status} body=${errText.slice(0, 300)}`);
+  if (uploadResult.status < 200 || uploadResult.status >= 300) {
+    throw new Error(
+      `video caption submit HTTP 失败: status=${uploadResult.status} body=${(uploadResult.body || '').slice(0, 300)}`,
+    );
   }
-  const result = (await response.json()) as VcSubmitResponse;
+
+  let result: VcSubmitResponse;
+  try {
+    result = JSON.parse(uploadResult.body || '{}') as VcSubmitResponse;
+  } catch (parseErr) {
+    throw new Error(`video caption submit 响应 JSON 解析失败: ${(uploadResult.body || '').slice(0, 300)}`);
+  }
   console.log('[FileAsr] submit response', { label: taskId, code: result.code, message: result.message, id: result.id });
   if (result.code !== 0) {
     throw new Error(`video caption submit 失败: code=${result.code} message=${result.message}`);
@@ -221,6 +267,18 @@ async function queryCaptionResult(
       },
       signal: controller.signal,
     });
+  } catch (fetchErr) {
+    const err = fetchErr as Error & { name?: string; stack?: string };
+    console.error('[FileAsr] query fetch FAILED', {
+      label: taskId,
+      jobId,
+      errorName: err?.name,
+      errorMessage: err?.message,
+      isAbortError: err?.name === 'AbortError',
+    });
+    throw new Error(
+      `video caption query 失败: name=${err?.name || 'unknown'} message=${err?.message || String(fetchErr)}`
+    );
   } finally {
     clearTimeout(timer);
   }
@@ -277,35 +335,34 @@ export async function transcribeWavFileDirect(params: {
   const language = params.language || 'en-US';
   const taskId = buildRequestId();
 
-  // 1) 读 wav 文件
+  // 1) 拿 wav 大小 (不读文件内容, 用 getInfoAsync 拿 size, 避免 OOM)
+  // 2026-08-15 改: 之前 readAsStringAsync 整个 wav 一次性 base64 编码进 JS 内存,
+  // 36MB wav → ~48MB base64 + 原 wav 副本 + 临时字符串 ≈ 100MB, 触发 Java OOM
+  // (Android emulator heap 通常 128-256MB, 50MB 剩余时申请 98MB 直接挂).
+  // 改用 getInfoAsync 拿 size, 不读 wav 内容. 跳过头部校验 (桌面版也不校验,
+  // 注释 "server 不校验, 但我们要保证不是 client bug" — RN 端 ffmpeg 抽 wav 用的
+  // 固定 16kHz/16bit/mono 参数, 可信). 提交走 FileSystem.uploadAsync native
+  // OkHttp 流式上传, 不读 JS 内存.
   console.log('[FileAsr] === start === (volc video caption /api/v1/vc/submit)', { label, wavUri: params.wavUri });
-  const fileResp = await fetch(params.wavUri);
-  if (!fileResp.ok) {
-    throw new Error(`读取 wav 失败: ${fileResp.status} ${params.wavUri}`);
+  const FileSystemMod = await import('expo-file-system/legacy');
+  let wavSize = 0;
+  try {
+    // expo-file-system/legacy 的 getInfoAsync 默认就在 FileInfo 里返回 size 字段,
+    // 不需要传 options. (新 expo-file-system API 是分开的 getInfo + size, legacy 是合并的)
+    const fileInfo = await FileSystemMod.getInfoAsync(params.wavUri);
+    wavSize = (fileInfo as { size?: number }).size ?? 0;
+    console.log('[FileAsr] wav size (via getInfoAsync)', { size: wavSize });
+  } catch (infoErr) {
+    const err = infoErr as Error;
+    throw new Error(`读取 wav size 失败: name=${err?.name || 'unknown'} message=${err?.message || String(infoErr)} uri=${params.wavUri}`);
   }
-  const arrayBuffer = await fileResp.arrayBuffer();
-  const wavBytes = new Uint8Array(arrayBuffer);
-  console.log('[FileAsr] wav loaded', { size: wavBytes.length });
+  if (wavSize <= 44) {
+    throw new Error(`wav 文件过小: size=${wavSize} uri=${params.wavUri}`);
+  }
 
-  // 2) 校验 wav header,提取 sample rate/channels/bits 用于 submit 包 (server 不校验,但我们要保证不是 client bug 发了错的 wav)
-  const wavInfo = findWavPcmOffset(wavBytes);
-  if (!wavInfo) {
-    throw new Error(`wav header 解析失败(不是合法 RIFF/WAVE): ${params.wavUri}`);
-  }
-  const { sampleRate, channels, bitsPerSample } = wavInfo;
-  if (sampleRate !== 16000 || channels !== 1 || bitsPerSample !== 16) {
-    throw new Error(
-      `wav 不是 16kHz/16bit/mono PCM: sampleRate=${sampleRate} channels=${channels} bits=${bitsPerSample} (${params.wavUri})`,
-    );
-  }
-  const durationSec = (wavBytes.length - wavInfo.pcmOffset) / (sampleRate * channels * (bitsPerSample / 8));
-  console.log('[FileAsr] wav validated', {
-    pcmOffset: wavInfo.pcmOffset,
-    durationSec: Math.round(durationSec * 10) / 10,
-  });
-
-  // 3) submit (HTTP POST audio body)
-  const jobId = await submitCaptionTask(wavBytes, taskId, language);
+  // 2) submit (HTTP POST audio body) — 直接用 FileSystem.uploadAsync 走 native OkHttp
+  // 流式上传 fileUri, 不读 wav 到 JS 内存. 大文件不再 OOM.
+  const jobId = await submitCaptionTask(params.wavUri, wavSize, taskId, language);
 
   // 4) query 阻塞 (GET blocking=1)
   const result = await queryCaptionResult(jobId, taskId, language);

@@ -285,24 +285,92 @@ def build_items(stem: str, info: dict[str, Any], transcript_lines: list[str]) ->
     return items
 
 
-def find_video_sets(target_dir: Path) -> list[tuple[str, Path, Path]]:
-    info_files = {p.name[:-10]: p for p in target_dir.glob("*.info.json")}
-    subtitle_files = {p.name[:-9]: p for p in target_dir.glob("*.json3")}
-    video_stems = set()
-    for ext in ("*.webm", "*.mp4", "*.mkv"):
-        for p in target_dir.glob(ext):
-            video_stems.add(p.stem)
-    stems = sorted(set(info_files) & set(subtitle_files) & video_stems)
-    return [(stem, info_files[stem], subtitle_files[stem]) for stem in stems]
+def find_video_sets(target_dir: Path, recursive: bool = False) -> list[tuple[str, Path, Path]]:
+    """找出 target_dir 下所有可生成 AI 陪练的视频集 (video + json3 + info.json)。
+
+    ``recursive=False`` (默认): 只看 ``target_dir`` 直接子目录下的文件, 跟旧版行为一致。
+
+    ``recursive=True``: 递归扫所有层子目录, 适配 yt-dlp 的 ``<uploader>/<title>/``
+    落盘结构 (用户选 uploader 目录当 series 根目录也能跑)。
+    - 以 ``*.mp4`` 为锚点而不是 info.json, 因为 chapter 视频没有 .info.json
+    - 父 video 和 ``chapters/`` 下的 chapter 切片都算独立 set
+      (chapter 视频是独立可用的短视频, 有 mp4 + json3 + jpg, 只是没 info.json)
+    - 跳过 ``packages/`` / ``.yt-dlp-archives/`` / ``__pycache__/`` 这些真正是
+      副产物的目录
+    - mp4 + json3 必须在**同一个目录**下, 否则不算完整 set
+    """
+    if not recursive:
+        info_files = {p.name[:-10]: p for p in target_dir.glob("*.info.json")}
+        subtitle_files = {p.name[:-9]: p for p in target_dir.glob("*.json3")}
+        video_stems: set[str] = set()
+        for ext in ("*.webm", "*.mp4", "*.mkv"):
+            for p in target_dir.glob(ext):
+                video_stems.add(p.stem)
+        stems = sorted(set(info_files) & set(subtitle_files) & video_stems)
+        return [(stem, info_files[stem], subtitle_files[stem]) for stem in stems]
+
+    # recursive 模式: 找所有 mp4, 跳过 packages/ 和 yt-dlp 归档目录
+    # chapter 视频 (chapters/<name>/*.mp4) 保留, 算独立 set
+    SKIP_DIR_NAMES = {"packages", "__pycache__"}
+
+    def _is_skipped(path: Path) -> bool:
+        rel = path.relative_to(target_dir)
+        parts = rel.parts
+        # 跳过 yt-dlp-archives (.yt-dlp-archives / yt-dlp-archives 两种命名)
+        if any(p.lstrip(".").startswith("yt-dlp-archives") for p in parts):
+            return True
+        # 跳过 packages/ / __pycache__/
+        if any(p in SKIP_DIR_NAMES for p in parts):
+            return True
+        return False
+
+    sets: list[tuple[str, Path, Path]] = []
+    # 用 mp4 当锚点, 兼容 chapter 视频没 .info.json 的情况
+    VIDEO_EXTS = ("mp4", "webm", "mkv")
+    seen: set[tuple[Path, str]] = set()
+    for ext in VIDEO_EXTS:
+        for vid_path in sorted(target_dir.rglob(f"*.{ext}")):
+            if vid_path.name.endswith(".part"):
+                continue
+            if _is_skipped(vid_path):
+                continue
+            local_dir = vid_path.parent
+            stem = vid_path.stem
+            if (local_dir, stem) in seen:
+                continue
+            seen.add((local_dir, stem))
+            # companion files 必须在 mp4 同一个目录里
+            sub_path = None
+            for cand in (local_dir / f"{stem}.en.json3", local_dir / f"{stem}.json3"):
+                if cand.exists():
+                    sub_path = cand
+                    break
+            if not sub_path:
+                continue
+            # info.json 是可选的 (chapter 视频通常没有), 找得到就用, 找不到也能跑
+            info_path = local_dir / f"{stem}.info.json"
+            if not info_path.exists():
+                info_path = local_dir / f"{stem}.info.json"  # placeholder, caller 会 None-check
+            sets.append((stem, info_path if info_path.exists() else Path(""), sub_path))
+    return sets
 
 
 def generate_for_dir(target_dir: Path) -> list[Path]:
     created: list[Path] = []
     for stem, info_path, subtitle_path in find_video_sets(target_dir):
-        info = load_json(info_path)
+        # info.json 在 chapter 视频里可能不存在, 这种情况下用 stem 当 title
+        if info_path and info_path.exists():
+            info = load_json(info_path)
+        else:
+            info = {"title": stem}
         transcript_lines = extract_utterances(subtitle_path)
         items = build_items(stem, info, transcript_lines)
-        output_path = target_dir / f"{stem}.ai-practice.json"
+        # 写到 mp4 所在的目录 (chapter 视频应该跟 mp4 同目录, 而不是 target_dir)
+        if info_path and info_path.exists():
+            output_dir = info_path.parent
+        else:
+            output_dir = subtitle_path.parent
+        output_path = output_dir / f"{stem}.ai-practice.json"
         payload = {
             "sourceVideo": stem,
             "videoTitle": info.get("title") or stem,

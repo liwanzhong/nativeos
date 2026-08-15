@@ -34,6 +34,8 @@ export interface BackupItemSpec {
   /** Hide from the items sheet by default (legacy migration cruft). */
   advanced?: boolean;
   sensitive?: boolean;
+  /** Read-only info row (Supabase data); never in the zip. */
+  cloudOnly?: boolean;
 }
 
 export const BACKUP_ITEMS: BackupItemSpec[] = [
@@ -54,8 +56,10 @@ export const BACKUP_ITEMS: BackupItemSpec[] = [
   },
   {
     kind: 'ai_practice',
-    label: 'AI 口语练习',
-    description: '为视频场景生成的 AI 练习题及生成状态',
+    // "我生成的" disambiguates from the official `official_video_ai_practice`
+    // table (which lives in Supabase, not in this backup).
+    label: '我生成的 AI 练习题',
+    description: '你手动触发生成的 AI 陪练题及生成状态（官方 AI 卡片在 Supabase，云端自动同步）',
     source: 'db',
     sourceRef: 'video_ai_practice_card + video_ai_practice_state',
   },
@@ -104,11 +108,26 @@ export const BACKUP_ITEMS: BackupItemSpec[] = [
     sourceRef: 'scene_provider_selection',
   },
   {
+    // "网盘绑定 + 下载元数据" disambiguates from the old "已下载视频"
+    // label — now this item is mostly the baidu-pan binding rows in
+    // `official_scene_sync_record` (since mp4 is no longer on OSS,
+    // there's no official download metadata to back up here).
     kind: 'downloaded_videos',
-    label: '已下载视频记录',
-    description: '官方视频的本地下载元数据（不含视频文件本身）',
+    label: '网盘绑定 + 下载元数据',
+    description: '每集的百度网盘绑定关系 + 导入视频的本地下载元数据（不含视频文件本身）',
     source: 'db',
     sourceRef: 'downloaded_scene_source + official_scene_sync_record',
+  },
+  {
+    // Cold-start cache. Without this, a fresh install / device
+    // migration has to re-fetch every `info.json` and the OSS catalog
+    // before the UI is responsive. With this, the first launch is
+    // instant.
+    kind: 'scene_caches',
+    label: '场景冷启缓存',
+    description: 'OSS 官方目录 + 每集 info.json 的本地缓存表。删了不影响数据，只是首次启动会重新拉',
+    source: 'db',
+    sourceRef: 'oss_video_catalog + video_scene_info',
   },
 
   // ── P1: AsyncStorage / settings ────────────────────────────────────
@@ -171,6 +190,18 @@ export const BACKUP_ITEMS: BackupItemSpec[] = [
     source: 'files',
     sourceRef: 'documentDirectory/audio',
   },
+
+  // ── Cloud-only info (NOT in the zip) ──────────────────────────────
+  {
+    kind: 'cloud_synced',
+    label: '云端数据（不备份）',
+    description:
+      '我的跟练 · 我的合集 · 官方合集目录 · 官方剧集 · 官方 AI 陪练卡片 — 都在 Supabase 上，登录同一账号后自动同步，无需备份。',
+    source: 'cloud',
+    sourceRef:
+      'supabase:user_picked_video_series + user_collections + official_video_series + official_video_episodes + official_video_ai_practice',
+    cloudOnly: true,
+  },
 ];
 
 /** True if any item the user might select is a file/folder. */
@@ -178,20 +209,21 @@ export function hasFileItems(items: BackupItemSpec[]): boolean {
   return items.some((it) => it.source === 'files' || it.source === 'mixed');
 }
 
-/** Default selection = everything checked, except advanced. */
+/** Default selection = everything checked, except advanced and cloud-only. */
 export function defaultSelection(): Set<BackupItemKind> {
   const set = new Set<BackupItemKind>();
   for (const it of BACKUP_ITEMS) {
-    if (!it.advanced) set.add(it.kind);
+    if (!it.advanced && !it.cloudOnly) set.add(it.kind);
   }
   return set;
 }
 
-/** Items the user actually selected, intersected with the spec table. */
+/** Items the user actually selected, intersected with the spec table.
+ *  Cloud-only items are filtered out — they never enter the export. */
 export function resolveSelectedItems(
   selected: Set<BackupItemKind>,
 ): BackupItemSpec[] {
-  return BACKUP_ITEMS.filter((it) => selected.has(it.kind));
+  return BACKUP_ITEMS.filter((it) => selected.has(it.kind) && !it.cloudOnly);
 }
 
 // ── Live sizing ──────────────────────────────────────────────────────
@@ -400,6 +432,25 @@ export async function scanBackupInventory(): Promise<BackupItem[]> {
         ]);
         recordCount = a + b;
         sizeBytes = recordCount * 300;
+        break;
+      }
+      case 'scene_caches': {
+        const [a, b] = await Promise.all([
+          tableRowCount('oss_video_catalog'),
+          tableRowCount('video_scene_info'),
+        ]);
+        recordCount = a + b;
+        // Both tables store JSON blobs; rough estimate is 8 KB
+        // per scene_info row + ~50 KB per catalog row.
+        sizeBytes = a * 50_000 + b * 8_000;
+        break;
+      }
+      case 'cloud_synced': {
+        // Read-only info row — not actually in the backup. Size 0
+        // because it's never packed into the zip; the UI uses
+        // `cloudOnly` to render the section differently.
+        sizeBytes = 0;
+        recordCount = undefined;
         break;
       }
 

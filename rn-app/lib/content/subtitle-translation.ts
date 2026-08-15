@@ -223,9 +223,24 @@ export function parseJson3ToSentenceSegments(json3: Json3FileLike): SentenceSegm
 export async function generateSubtitleTranslationPayload(
   json3: Json3FileLike,
   sourceSubtitle: string,
-  options?: { onProgress?: (message: string) => void },
+  options?: { onProgress?: (message: string) => void; segmentedPayload?: { sourceSubtitle?: string; segmentCount?: number; segments?: Array<{ id?: string; text?: string; startMs?: number; endMs?: number }> } },
 ): Promise<SubtitleTranslations> {
-  const sentences = parseJson3ToSentenceSegments(json3);
+  // 2026-08-15: 跟桌面端镜像 — 优先用 *.en.segmented.json 里的 segments
+  // (由 subtitle-segmenter 调 LLM 修标点/大写 + 本地按标点切/合并生成的).
+  // 没有才回退到本地 groupTokensByEvent 切分.
+  let sentences: SentenceSegment[];
+  if (options?.segmentedPayload?.segments && options.segmentedPayload.segments.length > 0) {
+    sentences = options.segmentedPayload.segments.map((seg, idx) => ({
+      id: seg.id || `cc-seg-${idx}`,
+      startMs: typeof seg.startMs === 'number' ? seg.startMs : 0,
+      endMs: typeof seg.endMs === 'number' ? seg.endMs : 0,
+      text: (seg.text || '').trim(),
+    })).filter((s) => s.text);
+    console.log(`[SubtitleTrans] use segmented.json: ${sentences.length} sentences`);
+  } else {
+    sentences = parseJson3ToSentenceSegments(json3);
+    console.log(`[SubtitleTrans] use local parseJson3ToSentenceSegments: ${sentences.length} sentences`);
+  }
   if (sentences.length === 0) {
     throw new Error('字幕文件中没有找到有效句子');
   }

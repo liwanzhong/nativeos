@@ -17,6 +17,32 @@
 
 import { getDatabase } from './schema';
 
+const CLOUD_BINDING_LOG_PREFIX = '[CloudBinding]';
+
+function logCloudBinding(message: string, payload?: unknown) {
+  if (payload === undefined) {
+    console.log(`${CLOUD_BINDING_LOG_PREFIX} ${message}`);
+    return;
+  }
+  try {
+    console.log(`${CLOUD_BINDING_LOG_PREFIX} ${message} ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`${CLOUD_BINDING_LOG_PREFIX} ${message}`, payload);
+  }
+}
+
+function warnCloudBinding(message: string, payload?: unknown) {
+  if (payload === undefined) {
+    console.warn(`${CLOUD_BINDING_LOG_PREFIX} ${message}`);
+    return;
+  }
+  try {
+    console.warn(`${CLOUD_BINDING_LOG_PREFIX} ${message} ${JSON.stringify(payload)}`);
+  } catch {
+    console.warn(`${CLOUD_BINDING_LOG_PREFIX} ${message}`, payload);
+  }
+}
+
 export type CloudVideoProvider = 'baidu_pan';
 export type BaiduPanAuthMode = 'code' | 'token';
 
@@ -593,6 +619,19 @@ export async function getOfficialSceneProviderStates(
   const defaultProvider = await getDefaultCloudProvider();
   const hasLocalCache = !!(cached?.localVideoUri && cached.status === 'completed');
   const isConfigured = Boolean(binding?.token?.accessToken && binding.rootPath);
+  logCloudBinding('getOfficialSceneProviderStates decision', {
+    sceneId,
+    bindingExists: !!binding,
+    hasAccessToken: !!(binding?.token?.accessToken),
+    accessTokenLen: binding?.token?.accessToken ? binding.token.accessToken.length : 0,
+    rootPath: binding?.rootPath || '(empty)',
+    defaultProvider: defaultProvider || '(none)',
+    hasLocalCache,
+    syncStatus: sync?.status || '(none)',
+    syncRemotePath: sync?.remotePath || '(empty)',
+    syncOfficialVideoKey: sync?.officialVideoKey || '(empty)',
+    isConfigured,
+  });
   const syncStatus: VideoSourceProviderState['syncStatus'] = hasLocalCache
     ? 'cached'
     : !isConfigured

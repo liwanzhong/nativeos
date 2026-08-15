@@ -30,11 +30,11 @@
 import {
   loadPublishedSeriesFromSupabase,
   loadMyPickedSeriesFromSupabase,
-  loadSeriesManifestFromOss,
+  loadSeriesEpisodesFromSupabase,
   resolveSeriesCoverUrl,
   type SupabaseSeriesRow,
+  type SupabaseEpisodeRow,
   type PickedSeriesDetail,
-  type RawSeriesManifest,
 } from './video-series-supabase';
 import { getOfficialVideoSeriesById } from './video-series';
 import {
@@ -341,8 +341,8 @@ export async function listMyCollections(forceRefresh: boolean = false): Promise<
   const officialSummaries: CollectionSummary[] = [];
   for (const p of picked) {
     if (!p.series || !p.series.is_published) continue;
-    const manifest = await loadSeriesManifestFromOss(p.series.manifest_url);
-    const summary = officialToSummary(p.series, manifest, metaMap, p);
+    const episodes = await loadSeriesEpisodesFromSupabase(p.series.id);
+    const summary = officialToSummary(p.series, episodes, metaMap, p);
     if (summary) officialSummaries.push(summary);
   }
 
@@ -372,11 +372,11 @@ export async function listMyCollections(forceRefresh: boolean = false): Promise<
 
 function officialToSummary(
   series: SupabaseSeriesRow,
-  manifest: RawSeriesManifest | null,
+  episodes: SupabaseEpisodeRow[],
   metaMap: Record<string, VideoUserMetaRecord>,
   picked: PickedSeriesDetail,
 ): CollectionSummary | null {
-  const episodeIds = (Array.isArray(manifest?.episodes) ? manifest!.episodes : [])
+  const episodeIds = episodes
     .map((ep) => typeof ep.id === 'string' && ep.id.trim() ? ep.id.trim() : null)
     .filter((id): id is string => Boolean(id));
 
@@ -405,7 +405,7 @@ function officialToSummary(
     id: encodeCollectionId('official', series.id),
     kind: 'official',
     title: series.title,
-    description: series.description ?? manifest?.series?.description ?? undefined,
+    description: series.description ?? undefined,
     // `cover_url` on the Supabase row is a bare filename; the
     // manifest URL gives us the bucket + path prefix. Resolve
     // here so the card receives a fully-loadable image URL.

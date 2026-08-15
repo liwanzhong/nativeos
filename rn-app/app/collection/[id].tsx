@@ -1062,9 +1062,6 @@ function VideoRow({
           {video.title}
         </Text>
         <View style={styles.videoMetaRow}>
-          {typeof video.episodeIndex === 'number' ? (
-            <Text style={styles.videoMetaText}>{video.episodeIndex}.</Text>
-          ) : null}
           {typeof video.durationSeconds === 'number' && video.durationSeconds > 0 ? (
             <Text style={styles.videoMetaText}>
               {formatVideoDuration(video.durationSeconds)}

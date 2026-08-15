@@ -1,0 +1,26 @@
+# Secrets — must NEVER be committed
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+
+# Local app data
+.smoke_test.txt
+.smoke_*.bak.py
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -30,17 +30,25 @@
 import {
   loadPublishedSeriesFromSupabase,
   loadMyPickedSeriesFromSupabase,
+  loadSeriesEpisodesFromSupabase,
+  loadEpisodesForSeriesBatch,
   loadSeriesManifestFromOss,
+  loadSeriesByIdFromSupabase,
   resolveSeriesCoverUrl,
+  resolveEpisodeAssetUrl,
   type SupabaseSeriesRow,
+  type SupabaseEpisodeRow,
   type PickedSeriesDetail,
   type RawSeriesManifest,
 } from './video-series-supabase';
 import {
   getOfficialVideoSeriesList,
+  type OfficialVideoSeriesDetail,
   type OfficialVideoSeriesSummary,
 } from './video-series';
 import { listVideoUserMeta, type VideoUserMetaRecord } from './video-user-meta';
+import type { VideoSceneDetail, VideoSceneRole } from './video-scenes';
+import type { ScenarioCard } from '../ai/scenario-generator';
 
 const VIDEO_SERIES_VIEWS_LOG_PREFIX = '[VideoSeriesViews]';
 
@@ -108,6 +116,50 @@ async function fetchSeriesManifest(manifestUrl: string, cacheBust?: string): Pro
   const raw = await loadSeriesManifestFromOss(manifestUrl, cacheBust);
   if (!raw) return null;
   return normalizeSeriesManifest(raw, manifestUrl);
+}
+
+/**
+ * Build a `NormalizedSeriesManifest`-shaped object from the Supabase
+ * episode rows. The shape matches the OSS-manifest path so the rest
+ * of the file (buildSummaryFromSupabase etc.) doesn't have to branch.
+ *
+ * `manifestUrl` is still required to derive `seriesBaseUrl` (the
+ * bucket + path prefix) — every row in the Supabase `official_video_series`
+ * table has a `manifest_url` field even though we no longer fetch
+ * the manifest itself; the desktop admin writes it as a per-series
+ * base URL when uploading.
+ */
+function buildNormalizedFromEpisodes(
+  episodes: SupabaseEpisodeRow[],
+  manifestUrl: string | null | undefined,
+): NormalizedSeriesManifest {
+  const fallbackBaseUrl = manifestUrl
+    ? manifestUrl.split('?')[0].split('/').slice(0, -1).join('/')
+    : '';
+  return {
+    seriesBaseUrl: fallbackBaseUrl,
+    episodes: episodes
+      .map((ep): NormalizedEpisode | null => {
+        const id = typeof ep.id === 'string' && ep.id.trim() ? ep.id.trim() : null;
+        if (!id) return null;
+        return {
+          id,
+          episodeIndex: typeof ep.episode_index === 'number' && Number.isFinite(ep.episode_index)
+            ? ep.episode_index
+            : undefined,
+        };
+      })
+      .filter((ep): ep is NormalizedEpisode => ep !== null),
+  };
+}
+
+async function fetchSeriesEpisodesFromSupabase(
+  seriesId: string,
+  manifestUrl: string | null | undefined,
+): Promise<NormalizedSeriesManifest | null> {
+  const rows = await loadSeriesEpisodesFromSupabase(seriesId);
+  if (rows.length === 0) return null;
+  return buildNormalizedFromEpisodes(rows, manifestUrl);
 }
 
 function normalizeSeriesManifest(raw: RawSeriesManifest, manifestUrl: string): NormalizedSeriesManifest {
@@ -234,10 +286,12 @@ export async function getOfficialVideoSeriesListFromSupabase(
     return legacy;
   }
 
-  // Per-series manifest fetch (concurrent)
+  // Per-series episode fetch (concurrent, from Supabase — the
+  // per-series `manifest.json` on OSS is now a legacy read-only
+  // cache; the rn-app's source of truth is `official_video_episodes`)
   const summaries: OfficialVideoSeriesSummary[] = (await Promise.all(
     rows.map(async (row) => {
-      const manifest = await fetchSeriesManifest(row.manifest_url, cacheBust);
+      const manifest = await fetchSeriesEpisodesFromSupabase(row.id, row.manifest_url);
       return buildSummaryFromSupabase(row, manifest, metaList);
     }),
   )).sort((a, b) => {
@@ -298,7 +352,7 @@ export async function getMyPickedVideoSeriesListFromSupabase(
 
   const summaries: OfficialVideoSeriesSummary[] = (await Promise.all(
     liveRows.map(async ({ row: pickedRow, series }) => {
-      const manifest = await fetchSeriesManifest(series.manifest_url, cacheBust);
+      const manifest = await fetchSeriesEpisodesFromSupabase(series.id, series.manifest_url);
       const summary = buildSummaryFromSupabase(series, manifest, metaList);
       // Use the Supabase last_practiced_at as a fallback when the
       // local video_user_meta hasn't been touched yet (e.g. series
@@ -338,4 +392,362 @@ export async function getMyPickedVideoSeriesListFromSupabase(
 export function invalidateVideoSeriesViewsCache() {
   libraryCache.entry = null;
   myPickedCache.entry = null;
+  detailCache.clear();
+  officialScenesCache.entry = null;
+}
+
+// ── Per-series detail (Supabase series row + per-episode rows) ─────
+
+/**
+ * Per-seriesId cache for the detail view. Same 60s TTL as the list
+ * cache — detail pages re-fetch on focus, and we don't want to
+ * hammer Supabase when the user pops in and out.
+ */
+const detailCache = new Map<string, CacheEntry<OfficialVideoSeriesDetail | null>>();
+
+function readDetailCache(seriesId: string, forceRefresh: boolean): OfficialVideoSeriesDetail | null | undefined {
+  if (forceRefresh) return undefined;
+  const entry = detailCache.get(seriesId);
+  if (!entry) return undefined;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) return undefined;
+  return entry.data;
+}
+
+function writeDetailCache(seriesId: string, data: OfficialVideoSeriesDetail | null) {
+  detailCache.set(seriesId, { ts: Date.now(), data });
+}
+
+/**
+ * Color hint for the episode cover. The detail-page list doesn't
+ * actually read this, but `VideoSceneDetail` requires it, so we
+ * derive something stable from the series category.
+ */
+function pickCoverAccent(category: string, type: string): string {
+  if (type === 'film') return '#F59E0B';
+  if (type === 'dialogue') return '#3B82F6';
+  if (type === 'lecture') return '#10B981';
+  if (category.includes('旅行')) return '#06B6D4';
+  if (category.includes('社交')) return '#8B5CF6';
+  if (category.includes('学习')) return '#6366F1';
+  return '#6366F1';
+}
+
+function buildEmptyRoles(): { userRole: VideoSceneRole; npcRole: VideoSceneRole } {
+  return {
+    userRole: { title: '学习者', description: '正在练习英语口语', tone: '友好' },
+    npcRole: { title: '视频角色', description: '视频中的对话对象', tone: '自然' },
+  };
+}
+
+/**
+ * Build a skeleton `VideoSceneDetail` from a single Supabase episode row.
+ * This is the "summary view" used by the detail page lists — not the
+ * full composition the player needs. The player does its own lazy
+ * enrichment (separate function, step 2) when the user actually
+ * opens a video.
+ *
+ * Fields populated here are the ones the detail page reads:
+ *   - id, coverImageUri, durationSeconds, episodeIndex, episodeTitle
+ *   - card.title, card.category
+ *   - groupId/groupTitle/groupLevel/groupCoverImageUri (from series row)
+ *   - sourceLabel, coverAccent, contentOrigin
+ * Fields left as placeholders / empty (player will hydrate):
+ *   - goals=[], segments=[], aiPracticeCards=undefined
+ *   - videoUri, cloudRemotePath, subtitleFileName, etc. (resolved on play)
+ */
+function buildSkeletonSceneFromEpisode(
+  episode: SupabaseEpisodeRow,
+  series: SupabaseSeriesRow,
+  practicedEpisodeIds: ReadonlySet<string>,
+  completedEpisodeCount: number,
+): VideoSceneDetail {
+  const manifestUrl = series.manifest_url;
+  const coverUri = resolveEpisodeAssetUrl(manifestUrl, episode.cover_file);
+  const category = episode.category || series.category || '综合';
+  const level = episode.level || series.level || 'B1';
+  const type = episode.type || series.type || 'vlog';
+  const title = episode.title || `Episode ${episode.episode_index}`;
+  const roles = buildEmptyRoles();
+  const isPracticed = practicedEpisodeIds.has(episode.id);
+
+  const card: ScenarioCard = {
+    id: `${episode.id}__card`,
+    sourceType: 'video_scene',
+    icon: '📹',
+    category,
+    level,
+    title,
+    desc: `Practice English with the "${title}" episode from ${series.title}.`,
+  };
+
+  // Stash the practice state on the scene for detail-page rendering
+  // (e.g. the "已学习" badge in `app/series/[id].tsx`). We don't
+  // touch the official VideoSceneDetail type — just attach a hidden
+  // marker via a metadata field. The detail page reads
+  // `series.completedEpisodeCount` for the badge, so this is
+  // belt-and-suspenders; the only purpose is to make the skeleton
+  // visually consistent if anything ever introspects it.
+  void isPracticed;
+  void completedEpisodeCount;
+
+  return {
+    id: episode.id,
+    sourceLabel: episode.source_label || '',
+    durationSeconds: typeof episode.duration_seconds === 'number' && Number.isFinite(episode.duration_seconds)
+      ? Math.max(0, episode.duration_seconds)
+      : 0,
+    coverAccent: pickCoverAccent(category, type),
+    coverImageUri: coverUri,
+    contentOrigin: 'official',
+    // Per-series context (lifted from the Supabase series row)
+    groupId: series.id,
+    groupTitle: series.title,
+    groupLevel: series.level,
+    groupDescription: series.description ?? undefined,
+    groupCoverImageUri: resolveSeriesCoverUrl(manifestUrl, series.cover_url),
+    groupTags: Array.isArray(series.tags) ? series.tags.filter((t) => typeof t === 'string' && t.trim()) : undefined,
+    groupSortOrder: series.sort_order,
+    // Per-episode context
+    episodeIndex: episode.episode_index,
+    episodeTitle: title,
+    totalEpisodesInGroup: undefined, // filled by caller
+    // Skeleton card + roles — the player will replace these with
+    // a real composition on focus.
+    card,
+    ...roles,
+    goals: [],
+    segments: [],
+  };
+}
+
+/**
+ * Load one official series (with its full episode list) from Supabase.
+ * Returns `null` if the series isn't found in `official_video_series`
+ * — the caller can fall back to the legacy OSS-catalog path.
+ *
+ * Unlike the list helpers, this does NOT fall back internally: detail
+ * pages deserve to know whether the data really came from Supabase
+ * (for cache invalidation, debug logging, and future migration tracking).
+ *
+ * Episode `VideoSceneDetail` objects here are skeletons — the detail
+ * page list uses them to render title/cover/duration, and the player
+ * does its own full composition when the user opens a video. Don't
+ * try to use the skeleton to drive playback.
+ */
+export async function getOfficialVideoSeriesDetailFromSupabase(
+  seriesId: string,
+  forceRefresh: boolean = false,
+): Promise<OfficialVideoSeriesDetail | null> {
+  if (!seriesId || !seriesId.trim()) return null;
+  const trimmedId = seriesId.trim();
+  const cached = readDetailCache(trimmedId, forceRefresh);
+  if (cached !== undefined) {
+    logViewsTrace('detail cache hit', { seriesId: trimmedId });
+    return cached;
+  }
+
+  try {
+    const [seriesRow, episodeRows, metaList] = await Promise.all([
+      loadSeriesByIdFromSupabase(trimmedId),
+      loadSeriesEpisodesFromSupabase(trimmedId),
+      listVideoUserMeta().catch(() => [] as VideoUserMetaRecord[]),
+    ]);
+
+    if (!seriesRow) {
+      logViewsTrace('detail series not found', { seriesId: trimmedId });
+      writeDetailCache(trimmedId, null);
+      return null;
+    }
+
+    const metaMap = Object.fromEntries(metaList.map((m) => [m.sceneId, m]));
+    const practicedEpisodeIds = new Set(
+      Object.entries(metaMap)
+        .filter(([, m]) => typeof m.lastPracticedAt === 'number')
+        .map(([id]) => id),
+    );
+    const completedEpisodeCount = practicedEpisodeIds.size;
+
+    const sortedEpisodes = [...episodeRows].sort((a, b) => a.episode_index - b.episode_index);
+    const totalEpisodes = sortedEpisodes.length;
+    const scenes: VideoSceneDetail[] = sortedEpisodes.map((ep) => {
+      const scene = buildSkeletonSceneFromEpisode(ep, seriesRow, practicedEpisodeIds, completedEpisodeCount);
+      scene.totalEpisodesInGroup = totalEpisodes;
+      return scene;
+    });
+
+    // Build the summary shape the detail page uses.
+    // Prefer Supabase series fields; fall back to series-episode aggregates.
+    const tags = (Array.isArray(seriesRow.tags) ? seriesRow.tags : []).filter((t) => typeof t === 'string' && t.trim()).slice(0, 4);
+    const firstScene = scenes[0];
+    const lastPracticedScene = scenes
+      .map((s) => ({ scene: s, ts: metaMap[s.id]?.lastPracticedAt as number | undefined }))
+      .filter((x): x is { scene: VideoSceneDetail; ts: number } => typeof x.ts === 'number')
+      .sort((a, b) => b.ts - a.ts)[0]?.scene ?? null;
+    const resumeScene = lastPracticedScene ?? firstScene;
+
+    const detail: OfficialVideoSeriesDetail = {
+      id: seriesRow.id,
+      title: seriesRow.title,
+      level: seriesRow.level,
+      description: seriesRow.description ?? undefined,
+      coverImageUri: resolveSeriesCoverUrl(seriesRow.manifest_url, seriesRow.cover_url),
+      tags,
+      category: seriesRow.category || (scenes[0]?.card.category ?? '综合'),
+      episodeCount: totalEpisodes,
+      completedEpisodeCount,
+      lastPracticedAt: lastPracticedScene
+        ? (metaMap[lastPracticedScene.id]?.lastPracticedAt as number | undefined)
+        : undefined,
+      resumeSceneId: resumeScene?.id,
+      resumeEpisodeIndex: resumeScene?.episodeIndex,
+      firstSceneId: firstScene?.id,
+      firstEpisodeIndex: firstScene?.episodeIndex,
+      sortOrder: seriesRow.sort_order,
+      episodes: scenes,
+    };
+
+    logViewsTrace('detail built from Supabase', {
+      seriesId: trimmedId,
+      episodeCount: totalEpisodes,
+    });
+    writeDetailCache(trimmedId, detail);
+    return detail;
+  } catch (err) {
+    warnViewsTrace('getOfficialVideoSeriesDetailFromSupabase threw', {
+      seriesId: trimmedId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+// ── Flat scene list (used by the AI 陪练 hub) ─────────────────────
+
+/**
+ * In-memory cache for the flat official-scene list. The AI 陪练
+ * tab calls this on focus; the 60s TTL matches the list-page
+ * cache so the user doesn't refetch on every keystroke or
+ * tab-switch, but stale data never lingers longer than a minute.
+ */
+const officialScenesCache: { entry: CacheEntry<VideoSceneDetail[]> | null } = { entry: null };
+
+/**
+ * Build a skeleton `VideoSceneDetail` from a Supabase episode row,
+ * with the parent series row lifting `groupId` / `groupTitle` /
+ * `groupLevel` etc. Same shape as the per-series detail skeleton
+ * (the AI 陪练 hub only reads `id`, `contentOrigin`, `groupId`,
+ * `card.title`, `sourceLabel`, and `aiPracticeCards` — all populated
+ * here).
+ */
+function buildSkeletonSceneForList(
+  episode: SupabaseEpisodeRow,
+  series: SupabaseSeriesRow,
+): VideoSceneDetail {
+  const manifestUrl = series.manifest_url;
+  const coverUri = resolveEpisodeAssetUrl(manifestUrl, episode.cover_file);
+  const category = episode.category || series.category || '综合';
+  const level = episode.level || series.level || 'B1';
+  const type = episode.type || series.type || 'vlog';
+  const title = episode.title || `Episode ${episode.episode_index}`;
+  const roles = {
+    userRole: { title: '学习者', description: '正在练习英语口语', tone: '友好' },
+    npcRole: { title: '视频角色', description: '视频中的对话对象', tone: '自然' },
+  };
+  const card: ScenarioCard = {
+    id: `${episode.id}__card`,
+    sourceType: 'video_scene',
+    icon: '📹',
+    category,
+    level,
+    title,
+    desc: `Practice English with the "${title}" episode from ${series.title}.`,
+  };
+  return {
+    id: episode.id,
+    sourceLabel: episode.source_label || '',
+    durationSeconds: typeof episode.duration_seconds === 'number' && Number.isFinite(episode.duration_seconds)
+      ? Math.max(0, episode.duration_seconds)
+      : 0,
+    coverAccent: '#6366F1',
+    coverImageUri: coverUri,
+    contentOrigin: 'official',
+    groupId: series.id,
+    groupTitle: series.title,
+    groupLevel: series.level,
+    groupDescription: series.description ?? undefined,
+    groupCoverImageUri: resolveSeriesCoverUrl(manifestUrl, series.cover_url),
+    episodeIndex: episode.episode_index,
+    episodeTitle: title,
+    card,
+    ...roles,
+    goals: [],
+    segments: [],
+    // AI practice cards are loaded on-demand by `loadSceneAiCards` in
+    // `ai-practice-hub.ts` — the skeleton is enough to dispatch the
+    // load (the hub falls back to `loadGeneratedVideoAiPracticeCards`
+    // when this is empty).
+    aiPracticeCards: [],
+  };
+}
+
+/**
+ * Flat list of all published official scenes (one per episode,
+ * across every published series). The shape matches the legacy
+ * `getFeaturedVideoScenes()` output so callers — currently only the
+ * AI 陪练 hub — can swap one for the other without code changes
+ * elsewhere.
+ *
+ * Returns `[]` on any Supabase error. The caller should fall back
+ * to the legacy `getFeaturedVideoScenes()` so an outage doesn't
+ * black out the AI 陪练 tab.
+ *
+ * Performance: two Supabase round-trips (series list, episodes
+ * batch) and N skeleton constructions. 1-min cache shared with the
+ * rest of the views file.
+ */
+export async function listOfficialScenesFromSupabase(
+  forceRefresh: boolean = false,
+): Promise<VideoSceneDetail[]> {
+  const cached = readCache(officialScenesCache.entry, forceRefresh);
+  if (cached) {
+    logViewsTrace('official_scenes cache hit', { count: cached.length });
+    return cached;
+  }
+
+  try {
+    // One series-list call feeds both the cache-content decision
+    // (empty → bail) and the episodes-batch ids, so we fetch it
+    // once and reuse the result.
+    const rows = await loadPublishedSeriesFromSupabase(forceRefresh);
+    if (rows.length === 0) {
+      logViewsTrace('official_scenes empty (no published series)', { forceRefresh });
+      writeCache(officialScenesCache, []);
+      return [];
+    }
+
+    const ids = rows.map((r) => r.id);
+    const episodesBySeries = await loadEpisodesForSeriesBatch(ids);
+
+    const seriesById = new Map<string, SupabaseSeriesRow>(rows.map((r) => [r.id, r]));
+    const scenes: VideoSceneDetail[] = [];
+    for (const [seriesId, episodes] of episodesBySeries.entries()) {
+      const series = seriesById.get(seriesId);
+      if (!series) continue;
+      for (const ep of episodes) {
+        scenes.push(buildSkeletonSceneForList(ep, series));
+      }
+    }
+
+    logViewsTrace('official_scenes built from Supabase', {
+      sceneCount: scenes.length,
+      forceRefresh,
+    });
+    writeCache(officialScenesCache, scenes);
+    return scenes;
+  } catch (err) {
+    warnViewsTrace('listOfficialScenesFromSupabase threw', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
 }

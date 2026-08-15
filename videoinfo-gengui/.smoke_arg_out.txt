@@ -1,0 +1,55 @@
+﻿=== 模拟实际 yt-dlp 命令 (Peppa Pig 单视频, 启用章节切分) ===
+
+主模板 + chapter: 前缀模板:
+  -o 'Peppa Pig - Official Channel/SUMMER FUN at the Water Park.%(ext)s'
+  -o 'chapter:Peppa Pig - Official Channel/SUMMER FUN at the Water Park/chapters/%(section_number)02d - %(section_title)s/%(section_number)02d - %(section_title)s.%(ext)s'
+
+完整命令片段 (URL 之前部分):
+  yt-dlp \
+      --no-playlist \
+      -o \
+      Peppa Pig - Official Channel/SUMMER FUN at the Water Park.%(ext)s \
+      -o \
+      chapter:Peppa Pig - Official Channel/SUMMER FUN at the Water Park/chapters/%(section_number)02d - %(section_title)s/%(section_number)02d - %(section_title)s.%(ext)s \
+      --ffmpeg-location \
+      D:/ffmpeg \
+      --cookies-from-browser \
+      chrome \
+      --remote-components \
+      ejs:github \
+      -S \
+      vcodec:h264,ext:mp4:m4a \
+      --merge-output-format \
+      mp4 \
+      --write-subs \
+      --write-auto-subs \
+      --sub-format \
+      json3 \
+      --sub-langs \
+      en.*,zh-Hans.* \
+      --write-thumbnail \
+      --convert-thumbnails \
+      jpg \
+      --write-info-json \
+      --sponsorblock-remove \
+      sponsor,intro,outro,interaction \
+      --split-chapters \
+      --no-keep-video \
+      --newline \
+      URL
+
+预期产出:
+  Peppa Pig - Official Channel/
+  ├── SUMMER FUN at the Water Park.mp4  (主视频, --no-keep-video 后删除)
+  ├── SUMMER FUN at the Water Park.en.json3  (主字幕, 真实标题)
+  ├── SUMMER FUN at the Water Park.info.json  (主信息, 真实标题)
+  ├── SUMMER FUN at the Water Park.jpg  (主缩略图, 真实标题)
+  ├── SUMMER FUN at the Water Park.asr.wav  (ASR 音频)
+  └── chapters/
+      ├── 01 - Intro/
+      │   ├── 01 - Intro.mp4  (章节视频, yt-dlp 切分后)
+      │   ├── 01 - Intro.info.json  (章节信息, yt-dlp 写入)
+      │   ├── 01 - Intro.en.json3  (切片字幕, 我们的代码生成)
+      │   └── 01 - Intro.jpg  (章节封面, ffmpeg 抽帧)
+      ├── 02 - Pool Time/...
+      └── 03 - End/...

@@ -34,7 +34,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { TriangleAlert, X } from 'lucide-react-native';
+import { Cloud, TriangleAlert, X } from 'lucide-react-native';
 import { borderRadius, colors, fontSize, fontWeight, spacing } from '../../../../constants/theme';
 import { BACKUP_ITEMS, defaultSelection, formatBytes } from '../../../../lib/backup/inventory';
 import type { BackupItem, BackupItemKind } from '../../../../lib/backup/types';
@@ -80,6 +80,19 @@ export function BackupItemsSheet({ visible, onClose, inventory, onStart }: Props
     return false;
   }, [selected]);
 
+  // Split the inventory into the "can pick" and "cloud-only info"
+  // sections. The cloud section is rendered last with a divider so
+  // it visually reads as a separate group, and its rows don't get
+  // a checkbox (the data lives in Supabase, not in the zip).
+  const cloudItems = useMemo(
+    () => (inventory ?? []).filter((it) => it.cloudOnly),
+    [inventory],
+  );
+  const pickableItems = useMemo(
+    () => (inventory ?? []).filter((it) => !it.cloudOnly),
+    [inventory],
+  );
+
   const toggle = (kind: BackupItemKind) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -89,12 +102,13 @@ export function BackupItemsSheet({ visible, onClose, inventory, onStart }: Props
     });
   };
 
-  const selectAll = () => setSelected(new Set(BACKUP_ITEMS.map((it) => it.kind)));
+  const selectAll = () =>
+    setSelected(new Set(BACKUP_ITEMS.filter((it) => !it.cloudOnly).map((it) => it.kind)));
   const selectHighValue = () => {
-    // 10 P0 items (no files) — fast, safe baseline
+    // 11 P0 items (no files) — fast, safe baseline. Skip cloudOnly.
     const set = new Set<BackupItemKind>();
     for (const it of BACKUP_ITEMS) {
-      if (it.source === 'db') set.add(it.kind);
+      if (it.source === 'db' && !it.cloudOnly) set.add(it.kind);
     }
     setSelected(set);
   };
@@ -165,60 +179,85 @@ export function BackupItemsSheet({ visible, onClose, inventory, onStart }: Props
                 <Text style={styles.loadingText}>正在扫描可备份内容…</Text>
               </View>
             ) : (
-              inventory.map((it) => {
-                const spec = BACKUP_ITEMS.find((s) => s.kind === it.kind)!;
-                const isSelected = selected.has(it.kind);
-                return (
-                  <Pressable
-                    key={it.kind}
-                    style={({ pressed }) => [
-                      styles.itemRow,
-                      pressed && styles.itemRowPressed,
-                    ]}
-                    onPress={() => toggle(it.kind)}
-                  >
-                    <View
-                      style={[
-                        styles.checkbox,
-                        isSelected && styles.checkboxOn,
+              <>
+                {pickableItems.map((it) => {
+                  const spec = BACKUP_ITEMS.find((s) => s.kind === it.kind)!;
+                  const isSelected = selected.has(it.kind);
+                  return (
+                    <Pressable
+                      key={it.kind}
+                      style={({ pressed }) => [
+                        styles.itemRow,
+                        pressed && styles.itemRowPressed,
                       ]}
+                      onPress={() => toggle(it.kind)}
                     >
-                      {isSelected ? <Text style={styles.checkmark}>✓</Text> : null}
-                    </View>
-                    <View style={styles.itemText}>
-                      <View style={styles.itemTitleRow}>
-                        {spec.sensitive ? (
-                          <TriangleAlert
-                            size={14}
-                            color="#F59E0B"
-                            style={{ marginRight: 4 }}
-                          />
-                        ) : null}
-                        <Text style={styles.itemTitle} numberOfLines={1}>
-                          {it.label}
+                      <View
+                        style={[
+                          styles.checkbox,
+                          isSelected && styles.checkboxOn,
+                        ]}
+                      >
+                        {isSelected ? <Text style={styles.checkmark}>✓</Text> : null}
+                      </View>
+                      <View style={styles.itemText}>
+                        <View style={styles.itemTitleRow}>
+                          {spec.sensitive ? (
+                            <TriangleAlert
+                              size={14}
+                              color="#F59E0B"
+                              style={{ marginRight: 4 }}
+                            />
+                          ) : null}
+                          <Text style={styles.itemTitle} numberOfLines={1}>
+                            {it.label}
+                          </Text>
+                        </View>
+                        <Text style={styles.itemDesc} numberOfLines={2}>
+                          {it.description}
                         </Text>
                       </View>
-                      <Text style={styles.itemDesc} numberOfLines={2}>
-                        {it.description}
-                      </Text>
+                      <View style={styles.itemMeta}>
+                        <Text style={styles.itemSize}>{formatBytes(it.sizeBytes)}</Text>
+                        {it.recordCount ? (
+                          <Text style={styles.itemCount}>
+                            {it.recordCount > 1
+                              ? `${it.recordCount} 条`
+                              : it.sizeBytes > 0
+                                ? '1 项'
+                                : '空'}
+                          </Text>
+                        ) : it.sizeBytes === 0 ? (
+                          <Text style={styles.itemCount}>空</Text>
+                        ) : null}
+                      </View>
+                    </Pressable>
+                  );
+                })}
+                {cloudItems.length > 0 ? (
+                  <>
+                    <View style={styles.cloudDivider} />
+                    <View style={styles.cloudHeaderRow}>
+                      <Cloud size={14} color={colors.text.tertiary} />
+                      <Text style={styles.cloudHeader}>云端数据（不备份）</Text>
                     </View>
-                    <View style={styles.itemMeta}>
-                      <Text style={styles.itemSize}>{formatBytes(it.sizeBytes)}</Text>
-                      {it.recordCount ? (
-                        <Text style={styles.itemCount}>
-                          {it.recordCount > 1
-                            ? `${it.recordCount} 条`
-                            : it.sizeBytes > 0
-                              ? '1 项'
-                              : '空'}
-                        </Text>
-                      ) : it.sizeBytes === 0 ? (
-                        <Text style={styles.itemCount}>空</Text>
-                      ) : null}
-                    </View>
-                  </Pressable>
-                );
-              })
+                    {cloudItems.map((it) => (
+                      <View key={it.kind} style={styles.cloudItemRow}>
+                        <View style={styles.itemText}>
+                          <View style={styles.itemTitleRow}>
+                            <Text style={styles.cloudItemTitle} numberOfLines={1}>
+                              {it.label}
+                            </Text>
+                          </View>
+                          <Text style={styles.itemDesc} numberOfLines={3}>
+                            {it.description}
+                          </Text>
+                        </View>
+                      </View>
+                    ))}
+                  </>
+                ) : null}
+              </>
             )}
           </ScrollView>
 
@@ -404,5 +443,37 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: fontSize.sm,
     fontWeight: fontWeight.bold,
+  },
+
+  // ── Cloud-only info section ──────────────────────────────────────
+  cloudDivider: {
+    height: 1,
+    backgroundColor: colors.border.light,
+    marginVertical: spacing.md,
+  },
+  cloudHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: spacing.sm,
+    marginBottom: spacing.xs,
+  },
+  cloudHeader: {
+    fontSize: fontSize.xs,
+    color: colors.text.tertiary,
+    fontWeight: '500',
+  },
+  cloudItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    borderRadius: borderRadius.md,
+    backgroundColor: 'transparent',
+  },
+  cloudItemTitle: {
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+    fontWeight: '500',
   },
 });

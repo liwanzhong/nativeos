@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { ScenarioCard } from './scenario-generator';
 import { getFeaturedVideoScenes, type VideoSceneDetail } from '../content/video-scenes';
+import { listOfficialScenesFromSupabase } from '../content/video-series-supabase-views';
 import { loadGeneratedVideoAiPracticeCards } from '../content/video-ai-practice';
 import {
   buildAiPracticeTopicSnapshot,
@@ -165,7 +166,17 @@ export async function listVideoAiTopicGroups(
   forceRefresh: boolean = false,
   pickedSeriesIds: Set<string> | null = null,
 ): Promise<VideoAiTopicGroup[]> {
-  const scenes = await getFeaturedVideoScenes(forceRefresh);
+  // Supabase first: same shape as the legacy OSS path (`getFeaturedVideoScenes`
+  // returns the same `VideoSceneDetail[]` fields the rest of this
+  // function reads — `id`, `contentOrigin`, `groupId`, `card.title`,
+  // `sourceLabel`, plus `aiPracticeCards` for the on-demand load).
+  // Fall back to OSS if Supabase is empty (e.g. user hasn't been
+  // migrated, or the per-series detail path is mid-migration for a
+  // brand-new series).
+  let scenes = await listOfficialScenesFromSupabase(forceRefresh);
+  if (scenes.length === 0) {
+    scenes = await getFeaturedVideoScenes(forceRefresh);
+  }
 
   // After the videos-tab redesign ("我的跟练" entry), the AI practice
   // tab only shows topics derived from series the user has explicitly

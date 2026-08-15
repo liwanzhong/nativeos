@@ -595,7 +595,12 @@ export async function runRestore(opts: RestoreOptions): Promise<RestoreResult> {
       manifest,
       rollbackPath,
       proStatusAfter: proStatus,
-      restoredKinds: manifest.items.map((it) => it.kind),
+      // Defensive: cloudOnly items are info rows in v2+ manifests;
+      // they should never actually be in a real backup, but if a
+      // malformed zip sneaks one in, don't count it as "restored".
+      restoredKinds: manifest.items
+        .filter((it) => !it.cloudOnly)
+        .map((it) => it.kind),
     };
   } catch (err) {
     progress(

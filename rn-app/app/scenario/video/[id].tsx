@@ -2039,6 +2039,27 @@ function VideoLearningPlayer({
     : null;
   const shouldShowPosterOverlay = Boolean(scene.coverImageUri && !hasStartedPlaybackOnce);
 
+  // Trace video surface render state. Answers "is the cover showing?
+  // why is the spinner there? did the player error out?" without a
+  // trial-and-error session. Fire on every change so the log shows
+  // the exact transition (e.g. "overlay false -> true, source null
+  // -> uri"). Helps diagnose why the user is staring at a black box
+  // instead of the cover image during the 1-4s cloud-stream wait.
+  useEffect(() => {
+    console.log('[VideoScene] video surface state', {
+      sceneId: scene.id,
+      hasResolvedPlayerSource: !!resolvedPlayerSource,
+      resolvedVideoUriPrefix: typeof resolvedPlayerSource === 'object' && resolvedPlayerSource !== null
+        ? (resolvedPlayerSource.uri?.slice(0, 60) || '(empty)')
+        : '(empty)',
+      shouldShowPosterOverlay,
+      coverImageUri: scene.coverImageUri || '(empty)',
+      hasStartedPlaybackOnce,
+      isVideoSourcePreparing,
+      playerError: playerError || '(none)',
+    });
+  }, [scene.id, resolvedPlayerSource, shouldShowPosterOverlay, hasStartedPlaybackOnce, isVideoSourcePreparing, playerError]);
+
   const renderVideoSurface = (fullscreen: boolean) => (
     <View style={fullscreen ? styles.fullscreenViewport : undefined}>
       <View
@@ -2406,35 +2427,55 @@ function VideoLearningPlayer({
       {Platform.OS === 'web' || !isFullscreen ? (
         <View ref={fullscreenHostRef} style={[styles.videoCard, isFullscreen && styles.videoCardFullscreen]}>
           {playerSource ? renderVideoSurface(isFullscreen) : (
-            <View style={styles.videoPlaceholder}>
-              <Clapperboard size={28} color="#64748B" />
-              <Text style={styles.videoPlaceholderTitle}>
-                {canUseOfficialCloudSource
-                  ? hasStaleProvider
-                    ? '当前场景的网盘内容需要更新'
-                    : hasConfiguredProvider && !currentProviderState
-                      ? '当前还没有设置推荐默认网盘'
-                    : hasConnectedProvider
-                      ? '当前场景还没有同步到可播放状态'
-                      : '当前场景还没有可用云来源'
-                  : isImportedCloudReference
-                    ? '当前网盘视频暂时无法解析播放'
-                    : '当前场景还没有绑定真实视频'}
-              </Text>
-              <Text style={styles.videoPlaceholderText}>
-                {canUseOfficialCloudSource
-                  ? hasStaleProvider
-                    ? '请先在「我的」→「我的网盘」里重新扫描并同步最新内容，然后再回来播放。'
-                    : hasConfiguredProvider && !currentProviderState
-                      ? '请先在「我的」→「我的网盘」里设置推荐默认网盘，然后再回来播放。'
-                    : hasConnectedProvider
-                      ? '请先在「我的」→「我的网盘」里完成同步，然后再回来播放。'
-                      : '请先在「我的」→「我的网盘」里连接百度网盘，然后再回来播放。'
-                  : isImportedCloudReference
-                    ? '请检查网盘授权状态、文件路径是否仍然有效，然后稍后重试。'
-                    : '先用下面的句子列表做基础预习，后面再接入真实画面。'}
-              </Text>
-            </View>
+            // When the player source isn't ready we have two visually
+            // different states to communicate:
+            //  - PREPARING: a stream/dlink lookup is in flight. Show the
+            //    cover image as a backdrop + a spinner so the user
+            //    sees "the system is doing something" instead of a
+            //    scary "not synced" error.
+            //  - NOT_READY: no source is expected (truly missing).
+            //    Show the existing "not synced" empty state.
+            // The default placeholder text "当前场景还没有同步到
+            // 可播放状态" was misleading during the 1-4s window when
+            // we ARE actively preparing — see logs in 2026-08-15
+            // session showing `isVideoSourcePreparing: true` while
+            // `playerSource` is still null.
+            isVideoSourcePreparing ? (
+              <View style={styles.videoPlaceholder}>
+                <ActivityIndicator color="#F8FAFC" size="large" />
+                <Text style={styles.videoPlaceholderText}>正在准备视频…</Text>
+              </View>
+            ) : (
+              <View style={styles.videoPlaceholder}>
+                <Clapperboard size={28} color="#64748B" />
+                <Text style={styles.videoPlaceholderTitle}>
+                  {canUseOfficialCloudSource
+                    ? hasStaleProvider
+                      ? '当前场景的网盘内容需要更新'
+                      : hasConfiguredProvider && !currentProviderState
+                        ? '当前还没有设置推荐默认网盘'
+                      : hasConnectedProvider
+                        ? '当前场景还没有同步到可播放状态'
+                        : '当前场景还没有可用云来源'
+                    : isImportedCloudReference
+                      ? '当前网盘视频暂时无法解析播放'
+                      : '当前场景还没有绑定真实视频'}
+                </Text>
+                <Text style={styles.videoPlaceholderText}>
+                  {canUseOfficialCloudSource
+                    ? hasStaleProvider
+                      ? '请先在「我的」→「我的网盘」里重新扫描并同步最新内容，然后再回来播放。'
+                      : hasConfiguredProvider && !currentProviderState
+                        ? '请先在「我的」→「我的网盘」里设置推荐默认网盘，然后再回来播放。'
+                      : hasConnectedProvider
+                        ? '请先在「我的」→「我的网盘」里完成同步，然后再回来播放。'
+                        : '请先在「我的」→「我的网盘」里连接百度网盘，然后再回来播放。'
+                    : isImportedCloudReference
+                      ? '请检查网盘授权状态、文件路径是否仍然有效，然后稍后重试。'
+                      : '先用下面的句子列表做基础预习，后面再接入真实画面。'}
+                </Text>
+              </View>
+            )
           )}
           {playerError ? <Text style={styles.playerErrorText}>{playerError}</Text> : null}
         </View>
@@ -2980,6 +3021,10 @@ export default function VideoSceneDetailScreen() {
       sceneId: scene.id,
       hasVideoAsset: !!scene.videoAsset,
       hasVideoUri: !!scene.videoUri,
+      coverImageUri: scene.coverImageUri || '(empty)',
+      groupCoverImageUri: scene.groupCoverImageUri || '(empty)',
+      contentOrigin: scene.contentOrigin,
+      videoContentType: scene.videoContentType || '(none)',
       clipStartMs: scene.clipStartMs,
       clipEndMs: scene.clipEndMs,
     });
@@ -4493,6 +4538,7 @@ const styles = StyleSheet.create({
     textAlign: 'right',
   },
   videoPlaceholder: {
+    width: '100%',
     aspectRatio: 16 / 9,
     borderRadius: 0,
     backgroundColor: '#0F172A',
@@ -4500,6 +4546,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: spacing.lg,
     gap: spacing.sm,
+    overflow: 'hidden',
   },
   videoDeferredPlaceholder: {
     flex: 1,

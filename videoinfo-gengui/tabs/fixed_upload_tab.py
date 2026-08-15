@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -21,7 +22,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from tabs.upload_tab import UploadWorker, load_oss_config, save_oss_config
+from tabs.runtime_support import load_oss_config, save_oss_config
+
+if TYPE_CHECKING:
+    from tabs.upload_tab import UploadWorker
 
 SERIES_IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp'}
 VIDEO_SUFFIXES = {'.mp4', '.webm', '.mkv', '.mov', '.avi'}
@@ -62,27 +66,9 @@ class FixedUploadTab(QWidget):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        config_group = QGroupBox('OSS 配置（固定上传）')
-        config_form = QFormLayout(config_group)
-        self.endpoint_input = QLineEdit()
-        self.endpoint_input.setPlaceholderText('例: https://oss-cn-beijing.aliyuncs.com')
-        self.bucket_input = QLineEdit()
-        self.bucket_input.setPlaceholderText('仅填 Bucket 名称，例: nativeos')
-        self.access_key_input = QLineEdit()
-        self.access_key_input.setPlaceholderText('AccessKey ID')
-        self.access_secret_input = QLineEdit()
-        self.access_secret_input.setPlaceholderText('AccessKey Secret')
-        self.access_secret_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.fixed_prefix_label = QLabel('固定上传目录：videos/')
-        self.save_config_btn = QPushButton('保存 OSS 配置')
-        self.save_config_btn.clicked.connect(self._save_config)
-        config_form.addRow('Endpoint', self.endpoint_input)
-        config_form.addRow('Bucket', self.bucket_input)
-        config_form.addRow('AccessKey ID', self.access_key_input)
-        config_form.addRow('AccessKey Secret', self.access_secret_input)
-        config_form.addRow('固定目录', self.fixed_prefix_label)
-        config_form.addRow('', self.save_config_btn)
-        layout.addWidget(config_group)
+        hint = QLabel('OSS 配置（Endpoint / Bucket / AccessKey）请到 系统设置 → OSS。固定上传目录为 videos/。')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         catalog_group = QGroupBox('1. 上传总系列文件')
         catalog_layout = QVBoxLayout(catalog_group)
@@ -158,24 +144,8 @@ class FixedUploadTab(QWidget):
         layout.addWidget(log_group)
 
     def _load_saved_config(self) -> None:
-        cfg = load_oss_config()
-        if not cfg:
-            return
-        self.endpoint_input.setText(cfg.get('endpoint', ''))
-        self.bucket_input.setText(cfg.get('bucket', ''))
-        self.access_key_input.setText(cfg.get('access_key_id', ''))
-        self.access_secret_input.setText(cfg.get('access_key_secret', ''))
-
-    def _save_config(self) -> None:
-        cfg = {
-            'endpoint': self.endpoint_input.text().strip(),
-            'bucket': self.bucket_input.text().strip(),
-            'access_key_id': self.access_key_input.text().strip(),
-            'access_key_secret': self.access_secret_input.text().strip(),
-            'prefix': 'videos/',
-        }
-        save_oss_config(cfg)
-        self.log_box.appendPlainText('固定上传页的 OSS 配置已保存。')
+        # OSS 配置在 系统设置 → OSS（这里不持有 widget）
+        pass
 
     def _choose_catalog_file(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, '选择总系列 JSON 文件', str(Path.home()), 'JSON Files (*.json)')
@@ -230,12 +200,13 @@ class FixedUploadTab(QWidget):
         except ImportError:
             self.log_box.appendPlainText('[错误] 未安装 oss2，请执行 pip install oss2')
             return None
-        endpoint = self.endpoint_input.text().strip()
-        bucket_name = self.bucket_input.text().strip()
-        ak = self.access_key_input.text().strip()
-        sk = self.access_secret_input.text().strip()
+        cfg = load_oss_config()
+        endpoint = cfg.get('endpoint', '').strip()
+        bucket_name = cfg.get('bucket', '').strip()
+        ak = cfg.get('access_key_id', '').strip()
+        sk = cfg.get('access_key_secret', '').strip()
         if not all([endpoint, bucket_name, ak, sk]):
-            self.log_box.appendPlainText('[提示] 请先填写完整的 OSS 配置。')
+            self.log_box.appendPlainText('[提示] 请先到 系统设置 → OSS 填写完整 OSS 配置。')
             return None
         try:
             auth = oss2.Auth(ak, sk)
@@ -293,7 +264,6 @@ class FixedUploadTab(QWidget):
         self.upload_series_btn.setEnabled(enabled)
         self.choose_catalog_btn.setEnabled(enabled)
         self.choose_series_dir_btn.setEnabled(enabled)
-        self.save_config_btn.setEnabled(enabled)
 
     def _toggle_pause(self) -> None:
         if not self.worker:

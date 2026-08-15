@@ -1,0 +1,26 @@
+﻿yt-dlp: C:\Users\admin\AppData\Local\Programs\Python\Python311\Scripts\yt-dlp.EXE
+node: D:\nodejs\node.EXE
+
+=== Probing video for chapters ===
+title: SUMMER FUN at the Water Park! ☀️ Mummy Pig Gets SPLASHED 💦 Peppa Pig Full Episodes | 30 Minutes
+chapters field: list [{'start_time': 0.0, 'title': 'Water Park', 'end_time': 270.0}, {'start_time': 270.0, 'title': 'Swimming Lesson', 'end_time': 540.0}, {'start_time': 540.0, 'title': 'Swimming', 'end_time': 809.0}, {'s
+chapter count: 7
+  ch1: title='Water Park'  0.0-270.0
+  ch2: title='Swimming Lesson'  270.0-540.0
+  ch3: title='Swimming'  540.0-809.0
+  ch4: title='Sunny Day Games'  809.0-1079.0
+  ch5: title='Cruise Ship Holiday'  1079.0-1348.0
+  ch6: title='On the Sea'  1348.0-1618.0
+  ch7: title='Surfing'  1618.0-1887
+
+=== Checking D:/yt-dlp for ffmpeg ===
+D:\yt-dlp contents:
+  ffmpeg.exe  (96.4 MB) <-- FFMPEG
+  ffplay.exe  (97.8 MB)
+  ffprobe.exe  (96.2 MB) <-- FFPROBE
+  yt-dlp.exe  (17.6 MB) <-- YTDLP
+
+=== PATH check ===
+  ffmpeg: NOT FOUND
+  ffprobe: NOT FOUND
+  yt-dlp: C:\Users\admin\AppData\Local\Programs\Python\Python311\Scripts\yt-dlp.EXE

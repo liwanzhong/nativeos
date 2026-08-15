@@ -77,3 +77,14 @@ def resolve_ffmpeg_dir(preferred_dir: str = '') -> str:
     if (vendor_dir / 'ffmpeg.exe').exists() or (vendor_dir / 'ffprobe.exe').exists():
         return str(vendor_dir)
     return preferred_dir
+
+
+def load_oss_config() -> dict[str, str]:
+    """读 config.json 里的 oss 段。"""
+    data = load_json_config()
+    return data.get('oss', {}) or {}
+
+
+def save_oss_config(cfg: dict[str, str]) -> None:
+    """把 oss 段写回 config.json。"""
+    save_json_config({'oss': cfg})

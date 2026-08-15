@@ -4,7 +4,11 @@ import { ActivityIndicator, ImageBackground, Pressable, RefreshControl, ScrollVi
 import { ChevronLeft } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../constants/theme';
-import { getOfficialVideoSeriesById, type OfficialVideoSeriesDetail } from '../../lib/content/video-series';
+import {
+  getOfficialVideoSeriesById as getOfficialVideoSeriesByIdLegacy,
+  type OfficialVideoSeriesDetail,
+} from '../../lib/content/video-series';
+import { getOfficialVideoSeriesDetailFromSupabase } from '../../lib/content/video-series-supabase-views';
 
 const LEVEL_COLORS: Record<string, { bg: string; text: string }> = {
   A1: { bg: '#DCFCE7', text: '#166534' },
@@ -40,8 +44,19 @@ export default function SeriesDetailScreen() {
       setIsLoading(true);
     }
     try {
-      const result = await getOfficialVideoSeriesById(params.id, forceRefresh);
-      setSeries(result);
+      // Supabase is the source of truth (per-series row in
+      // `official_video_series` + per-episode rows in
+      // `official_video_episodes`). Fall back to the legacy
+      // OSS-catalog path if Supabase doesn't know the series —
+      // e.g. a series that was uploaded but never re-imported
+      // after the table was created.
+      const supabaseResult = await getOfficialVideoSeriesDetailFromSupabase(params.id, forceRefresh);
+      if (supabaseResult) {
+        setSeries(supabaseResult);
+        return;
+      }
+      const legacy = await getOfficialVideoSeriesByIdLegacy(params.id, forceRefresh);
+      setSeries(legacy);
     } finally {
       setIsLoading(false);
     }

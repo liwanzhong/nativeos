@@ -1,0 +1,84 @@
+﻿============================================================
+Test 1: DEFAULT_DOWNLOAD_OPTIONS cleanup
+============================================================
+  [OK] removed fields are gone from DEFAULT_DOWNLOAD_OPTIONS
+  [OK] keys: ['split_chapters', 'sponsorblock_action', 'sponsorblock_categories', 'sub_format', 'sub_langs', 'video_format', 'write_info_json', 'write_subs', 'write_thumbnail']
+
+============================================================
+Test 2: build_yt_dlp_args defaults match old COMMON_YT_DLP_ARGS
+============================================================
+  [info] args: ['-S', 'vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4', '--write-subs', '--write-auto-subs', '--sub-format', 'json3', '--sub-langs', 'en', '--write-thumbnail', '--convert-thumbnails', 'jpg', '--write-info-json', '--sponsorblock-remove', 'sponsor,intro,outro,interaction', '--newline']
+  [OK] default args match old COMMON_YT_DLP_ARGS
+  [OK] --split-chapters absent in default (split_chapters=False)
+
+============================================================
+Test 3: build_yt_dlp_args with split_chapters=True
+============================================================
+  [info] args: ['-S', 'vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4', '--write-subs', '--write-auto-subs', '--sub-format', 'json3', '--sub-langs', 'en', '--write-thumbnail', '--convert-thumbnails', 'jpg', '--write-info-json', '--sponsorblock-remove', 'sponsor,intro,outro,interaction', '--split-chapters', '--no-keep-video', '--newline']
+  [OK] --split-chapters --no-keep-video present
+
+============================================================
+Test 4: video_format options
+============================================================
+  [OK] h264_mp4: args look correct
+  [OK] h265_av1: args look correct
+  [OK] best: args look correct
+  [OK] original: args look correct
+
+============================================================
+Test 5: UI has no force_keyframes_checkbox / chapter_suffix_input
+============================================================
+  [OK] no removed UI fields or option keys in source
+
+============================================================
+Test 6: _slice_subtitle_file json3 / vtt / srt
+============================================================
+  [OK] json3: 2 events sliced, timestamps re-anchored
+  [OK] vtt: 1 cue sliced, timestamp re-anchored
+  [OK] srt: 1 cue sliced, timestamp re-anchored
+  [OK] empty chapter: no file written
+
+============================================================
+Test 7: _split_subtitles_by_chapter reads parent info.json chapters array
+============================================================
+  [OK] reads parent info.json chapters array, slices parent subtitle to chapter subdir
+
+============================================================
+Test 8: _split_subtitles_by_chapter gracefully handles missing chapter subdir
+============================================================
+  [OK] missing chapter subdir is gracefully skipped
+
+============================================================
+Test 9: build_oss_manifest_from_yt_dir section_number
+============================================================
+  [OK] manifest module imports OK
+  [info] find_sets returned 1 set(s)
+  [info] read_info_records returned 2 record(s)
+  [OK] section_number extracted from chapter info.json
+
+============================================================
+Test 10: mixed chapter-split + regular video in same target_dir
+============================================================
+  [info] find_sets returned 2 set(s) (expected 2)
+  [OK] mixed case: 1 regular + 1 chapter-split detected
+  [OK] regular item: id='sprout-02-regular-video'
+  [OK] chapter item: id='sprout-01-chapter-one', sectionNumber=1
+
+============================================================
+Test 11: .yt-dlp-archives are skipped
+============================================================
+  [OK] .yt-dlp-archives/ contents are ignored
+
+============================================================
+Test 12: build_series_manifest end-to-end with chapter-split
+============================================================
+  [info] series.id = test-series
+  [info] series.title = Test Series
+  [info] episodes = 3
+  [OK] ep1: id='sprout-01-intro', title='Intro'
+  [OK] ep2: id='sprout-02-main-story', title='Main Story'
+  [OK] ep3: id='sprout-03-outro', title='Outro'
+
+============================================================
+All tests passed!
+============================================================

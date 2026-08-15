@@ -72,6 +72,7 @@ const AS_KEYS_BY_KIND: Record<BackupItemKind, string[] | null> = {
   cloud_drive: null,
   scene_providers: null,
   downloaded_videos: null,
+  scene_caches: null,
   settings: ['tts_config', 'sandbox_config', 'show_avatar', 'practice_mode'],
   staged_scenarios: ['staged_scenario', 'staged_scenario_ref'],
   evaluator_state: ['fsrs_inject_cache', 'evaluated_sessions', 'library_badge_count'],
@@ -80,6 +81,7 @@ const AS_KEYS_BY_KIND: Record<BackupItemKind, string[] | null> = {
   clip_segments: null,
   imported_packs: null,
   tts_cache: null,
+  cloud_synced: null, // not actually backed up — see BACKUP_ITEMS / cloudOnly flag
 };
 
 /** DB table groups by kind (for documentation; the actual pack is whole-DB). */
@@ -94,6 +96,7 @@ const DB_TABLE_GROUPS: Record<BackupItemKind, string[] | null> = {
   cloud_drive: ['app_config[baiduPan*]', 'app_config[defaultProvider]'],
   scene_providers: ['scene_provider_selection'],
   downloaded_videos: ['downloaded_scene_source', 'official_scene_sync_record'],
+  scene_caches: ['oss_video_catalog', 'video_scene_info'],
   settings: null,
   staged_scenarios: null,
   evaluator_state: null,
@@ -102,6 +105,7 @@ const DB_TABLE_GROUPS: Record<BackupItemKind, string[] | null> = {
   clip_segments: null,
   imported_packs: null,
   tts_cache: null,
+  cloud_synced: null,
 };
 
 const FILE_KIND_TO_DIR: Partial<Record<BackupItemKind, string>> = {
@@ -245,7 +249,9 @@ async function writeManifest(
   stagingDir: string,
   opts: ExportOptions,
 ): Promise<void> {
-  const items: BackupItem[] = opts.inventory.filter((it) => opts.selected.has(it.kind));
+  const items: BackupItem[] = opts.inventory.filter(
+    (it) => opts.selected.has(it.kind) && !it.cloudOnly,
+  );
   const manifest: BackupManifest = {
     version: BACKUP_VERSION,
     createdAt: new Date().toISOString(),

@@ -1,35 +1,36 @@
 from __future__ import annotations
 
-import base64
 import json
 import math
 import os
 import re
-import shutil
-import struct
 import subprocess
-import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
-import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 
 from tabs.runtime_support import load_json_config, resolve_executable, resolve_ffmpeg_dir, save_json_config
 
-# File ASR (submit + query) — the actual "subtitle generation interface"
-# Volcengine publishes as 视频字幕生成. The audio is referenced by `audio.url`
-# (the API silently drops base64 tasks on this account, so we must use a URL).
-# We upload the local wav to the user's OSS bucket (under a temp prefix),
-# generate a 1h signed URL, and hand that to the file ASR service.
-# Doc: https://www.volcengine.com/docs/6561/109885
-VOLC_FILE_ASR_SUBMIT_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
-VOLC_FILE_ASR_QUERY_URL = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
-VOLC_FILE_ASR_RESOURCE = "volc.bigasr.auc"
-ASR_OSS_TEMP_PREFIX = "app/asr-tmp/"
-ASR_OSS_SIGNED_URL_EXPIRES = 3600  # 1 hour — generous for the longest file
+# File ASR (submit + query) — Volcengine 视频字幕生成接口
+# 跟 rn-app/lib/volcengine/file-asr.ts::transcribeWavFileDirect 接口和参数完全一致
+# Doc: https://www.volcengine.com/docs/6561/80909
+#
+# 流程:
+#   1) POST /api/v1/vc/submit  (audio body, Content-Type: audio/wav)
+#      URL params: appid, language, caption_type=speech, use_itn=True, use_punc=True,
+#                  max_lines=1, words_per_line=15/55
+#      Header:     Authorization: Bearer; <token>
+#   2) GET /api/v1/vc/query?appid=&id=&blocking=1&language=
+#      Header:     Authorization: Bearer; <token>
+#   返回 {id, code, message, duration?, utterances?}
+#
+# 不接说话人识别 (不传 with_speaker_info),走 caption_type=speech (use_punc 才生效),
+# 不调 enable_itn/use_ddc/use_punc 的豆包大模型开关(走接口默认行为)。
+VOLC_VC_SUBMIT_URL = "https://openspeech.bytedance.com/api/v1/vc/submit"
+VOLC_VC_QUERY_URL = "https://openspeech.bytedance.com/api/v1/vc/query"
 
 ASR_SAMPLE_RATE = 16000
 ASR_CHANNELS = 1
@@ -123,41 +124,6 @@ def _safe_stem(stem: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', stem).strip().strip('.') or 'audio'
 
 
-def _read_info_source_url(info_path: Path | None) -> str:
-    if not info_path or not info_path.exists():
-        return ""
-    try:
-        data = json.loads(info_path.read_text("utf-8"))
-    except Exception:
-        return ""
-    for key in ("webpage_url", "original_url", "url"):
-        value = str(data.get(key) or "").strip()
-        if value.startswith(("http://", "https://")):
-            return value
-    return ""
-
-
-def download_best_audio_with_ytdlp(source_url: str, output_dir: Path, stem: str, on_progress: Callable[[str], None] | None = None) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    before = {p.resolve() for p in output_dir.glob(f'{_safe_stem(stem)}.asr-audio.*')}
-    output_template = str(output_dir / f'{_safe_stem(stem)}.asr-audio.%(ext)s')
-    cmd = [
-        _yt_dlp_executable(),
-        "-f", "ba",
-        "--no-playlist",
-        "-o", output_template,
-        source_url,
-    ]
-    _run_command(cmd, cwd=output_dir, on_progress=on_progress)
-    candidates = [p for p in output_dir.glob(f'{_safe_stem(stem)}.asr-audio.*') if p.resolve() not in before]
-    if not candidates:
-        candidates = list(output_dir.glob(f'{_safe_stem(stem)}.asr-audio.*'))
-    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() != ".part"]
-    if not candidates:
-        raise RuntimeError("yt-dlp 未生成音频文件")
-    return max(candidates, key=lambda p: p.stat().st_mtime)
-
-
 def convert_media_to_asr_wav(input_path: Path, output_path: Path, ffmpeg_dir: str = "", on_progress: Callable[[str], None] | None = None) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -203,84 +169,21 @@ def extract_wav_chunk(wav_path: Path, output_path: Path, start_ms: int, end_ms: 
     return output_path
 
 
-# ---------------------------------------------------------------------------
-# OSS 上传 + 签名 URL（用于把 wav 提交到 file ASR）
-# ---------------------------------------------------------------------------
-
-def _load_oss_config_for_asr() -> dict[str, str]:
-    cfg = load_json_config().get('oss', {}) or {}
-    return {
-        'endpoint': str(cfg.get('endpoint') or '').strip(),
-        'bucket': str(cfg.get('bucket') or '').strip(),
-        'access_key_id': str(cfg.get('access_key_id') or '').strip(),
-        'access_key_secret': str(cfg.get('access_key_secret') or '').strip(),
-    }
-
-
-def _open_oss_bucket(oss_cfg: dict[str, str]):
-    if not oss_cfg['endpoint'] or not oss_cfg['bucket'] or not oss_cfg['access_key_id'] or not oss_cfg['access_key_secret']:
-        raise RuntimeError('OSS 未配置，请在「AI API 配置」中填写 endpoint / bucket / access_key。')
-    import oss2  # local import; only needed when ASR URL path is used
-    auth = oss2.Auth(oss_cfg['access_key_id'], oss_cfg['access_key_secret'])
-    return oss2.Bucket(auth, oss_cfg['endpoint'], oss_cfg['bucket'])
-
-
-def _upload_wav_to_oss_for_asr(wav_path: Path, oss_cfg: dict[str, str], on_progress: Callable[[str], None] | None = None) -> tuple[str, str]:
-    """上传 wav 到 OSS app/asr-tmp/，返回 (oss_key, signed_url)。
-    上传完毕后调用方负责删 OSS 文件。"""
-    import oss2
-    bucket = _open_oss_bucket(oss_cfg)
-    oss_key = f"{ASR_OSS_TEMP_PREFIX}{uuid.uuid4().hex}.wav"
-    if on_progress:
-        on_progress(f'上传 ASR 音频到 OSS: {oss_key}')
-    bucket.put_object_from_file(oss_key, str(wav_path))
-    signed_url = bucket.sign_url('GET', oss_key, ASR_OSS_SIGNED_URL_EXPIRES)
-    return oss_key, signed_url
-
-
-def _delete_from_oss(oss_key: str, oss_cfg: dict[str, str]) -> None:
-    try:
-        import oss2
-        bucket = _open_oss_bucket(oss_cfg)
-        bucket.delete_object(oss_key)
-    except Exception:
-        pass  # cleanup best-effort
-
-
-def _http_post_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int = 30) -> tuple[dict[str, str], dict[str, Any]]:
-    body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    merged = {'Content-Type': 'application/json; charset=utf-8', **headers}
-    req = urllib.request.Request(url, data=body, headers=merged, method='POST')
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        resp_headers = {k: v for k, v in resp.headers.items()}
-        raw = resp.read().decode('utf-8', errors='replace')
-        try:
-            resp_body = json.loads(raw) if raw else {}
-        except Exception:
-            resp_body = {'_raw': raw}
-    return resp_headers, resp_body
-
-
 def transcribe_wav_file_direct(wav_path: Path, cfg: dict[str, str], language: str = 'en-US') -> dict[str, Any]:
-    """Transcribe a local WAV file via Volcengine file ASR (submit + query, audio.url).
+    """Transcribe a local WAV file via Volcengine 视频字幕生成接口 (submit + query blocking).
 
-    这是火山"视频字幕生成"接口的真实形态：HTTP submit 把任务扔给服务端，
-    服务端从公网 URL 拉音频、做完识别、再用 query 拉结果。base64 内联方式在
-    这个账号上被静默丢弃（submit 20000000 + query 45000001 + 无任务），所以
-    必须走 URL 路径。
+    接口和参数跟 rn-app/lib/volcengine/file-asr.ts::transcribeWavFileDirect 完全一致:
+      - 鉴权: Authorization: Bearer; <token>  (注意 Bearer 后面是分号)
+      - submit: POST /api/v1/vc/submit  (audio body, Content-Type: audio/wav)
+        URL params: appid, language, caption_type=speech, use_itn=True, use_punc=True,
+                    max_lines=1, words_per_line=15/55
+      - query:  GET  /api/v1/vc/query?appid=&id=&blocking=1&language=
+      - 不传 with_speaker_info (False), 不传 use_ddc (False)
+      - 响应 status: 走 body.code (0 = 成功)
 
-    流程:
-      1) 上传 wav 到用户的 OSS 临时 prefix（独立于业务 prefix，不污染）
-      2) 生成 1h 签名 URL
-      3) submit 提交任务（audio.url = 签名 URL）
-      4) 轮询 query 直到 20000000
-      5) 删 OSS 临时文件
-      6) 返回 {text, utterances, raw}
+    不接说话人识别（user 不要），不需要切 30s 分片（文件接口吃整段音频）。
 
-    不接说话人识别（user 不要 enable_speaker_info / ssd_version），
-    也不需要切 30s 分片（文件接口吃整段音频）。
-
-    Doc: https://www.volcengine.com/docs/6561/109885
+    Doc: https://www.volcengine.com/docs/6561/80909
     """
     app_id = str(cfg.get("app_id") or "").strip()
     access_token = str(cfg.get("access_token") or "").strip()
@@ -291,96 +194,124 @@ def transcribe_wav_file_direct(wav_path: Path, cfg: dict[str, str], language: st
     if wav_path.stat().st_size <= 44:
         raise RuntimeError(f"wav 文件过小: {wav_path} ({wav_path.stat().st_size} bytes)")
 
-    oss_cfg = _load_oss_config_for_asr()
-    if not oss_cfg['endpoint']:
-        raise RuntimeError('ASR 走 URL 模式需要在「AI API 配置」中配置 OSS (endpoint/bucket/ak/sk)。')
-
     task_id = str(uuid.uuid4())
     duration_seconds = get_wav_duration_ms(wav_path) / 1000.0
-    print(f"  [ASR] taskId={task_id} wav={wav_path.name} ({duration_seconds:.1f}s)")
+    print(f"  [ASR] taskId={task_id} wav={wav_path.name} ({duration_seconds:.1f}s) language={language}")
 
-    oss_key: str | None = None
+    auth_header = f'Bearer; {access_token}'  # 注意: Bearer 后面是分号, 跟文档一致
+
+    # ── 1) submit (POST audio body) ────────────────────────────────
+    submit_params = {
+        'appid': app_id,
+        'language': language,                                # 'en-US' / 'zh-CN'
+        'caption_type': 'speech',                             # 只识别说话, use_punc 仅此模式生效
+        'use_itn': 'True',                                    # 数字归一化
+        'use_punc': 'True',                                   # 加标点
+        'max_lines': '1',                                     # 不分屏
+        'words_per_line': '15' if language == 'zh-CN' else '55',
+        # 2026-08-15 加上说话人识别: 卡通/多人对话场景需要按说话人切段,
+        # 之前不传导致 (Peppa) / (narrator) 多人混在同一个 utterance.
+        # 说话人变化时的后处理切段暂不做,先让 ASR 返回带 speaker 字段的
+        # utterances,看真实返回结构再决定切段策略.
+        'with_speaker_info': 'True',
+        # 不传 use_ddc (默认 False) — 字幕场景不需要口水词/重复词特殊处理
+    }
+    submit_url = f"{VOLC_VC_SUBMIT_URL}?" + urllib.parse.urlencode(submit_params)
+    wav_bytes = wav_path.read_bytes()
+    print(f"  [ASR] submit start wav={len(wav_bytes)} bytes url={submit_url[:120]}...")
+    # 2026-08-15 调试: 打印完整 submit params, 确认 with_speaker_info 是否生效
+    print(f"  [ASR] submit params: {submit_params}")
+
+    submit_req = urllib.request.Request(
+        submit_url,
+        data=wav_bytes,
+        headers={
+            'Authorization': auth_header,
+            'Content-Type': 'audio/wav',
+            'Content-Length': str(len(wav_bytes)),
+        },
+        method='POST',
+    )
+    with urllib.request.urlopen(submit_req, timeout=60) as resp:
+        submit_raw = resp.read().decode('utf-8', errors='replace')
     try:
-        oss_key, signed_url = _upload_wav_to_oss_for_asr(wav_path, oss_cfg)
+        submit_body = json.loads(submit_raw) if submit_raw else {}
+    except Exception:
+        submit_body = {'_raw': submit_raw}
+    submit_code = submit_body.get('code')
+    if submit_code != 0:
+        raise RuntimeError(f"ASR submit 失败: code={submit_code} message={submit_body.get('message')} body={submit_body}")
+    job_id = submit_body.get('id')
+    if not job_id:
+        raise RuntimeError(f"ASR submit 成功但没返回 id: {submit_body}")
+    print(f"  [ASR] submit response code={submit_code} jobId={job_id}")
 
-        submit_headers = {
-            'X-Api-App-Key': app_id,
-            'X-Api-Access-Key': access_token,
-            'X-Api-Resource-Id': VOLC_FILE_ASR_RESOURCE,
-            'X-Api-Request-Id': task_id,
-            'X-Api-Sequence': '-1',
-        }
-        submit_body = {
-            'user': {'uid': 'videoinfo-gengui'},
-            'audio': {
-                'url': signed_url,
-                'format': 'wav',
-                'codec': 'raw',
-                'rate': ASR_SAMPLE_RATE,
-                'bits': 16,
-                'channel': ASR_CHANNELS,
-            },
-            'request': {
-                'model_name': 'bigmodel',
-                'model_version': '400',
-                'enable_itn': True,
-                'enable_punc': True,
-                'enable_ddc': True,
-                'show_utterances': True,
-                'language': 'en-US',  # 强制英语 — 避免笑声被识别成中文"哈"
-                # 不接识别角色：不要 enable_speaker_info / ssd_version
-            },
-        }
-        resp_headers, _resp_body = _http_post_json(VOLC_FILE_ASR_SUBMIT_URL, submit_body, submit_headers, timeout=60)
-        submit_status = resp_headers.get('X-Api-Status-Code', '') or resp_headers.get('x-api-status-code', '')
-        x_tt_logid = resp_headers.get('X-Tt-Logid', '') or resp_headers.get('x-tt-logid', '')
-        if submit_status != '20000000':
-            raise RuntimeError(f"ASR submit 失败: status={submit_status} body={_resp_body}")
+    # ── 2) query 阻塞 (GET blocking=1, 5min 上限) ────────────────
+    query_params = {
+        'appid': app_id,
+        'id': job_id,
+        'blocking': '1',      # 阻塞,服务端处理完一次返回
+        'language': language,
+    }
+    query_url = f"{VOLC_VC_QUERY_URL}?" + urllib.parse.urlencode(query_params)
+    print(f"  [ASR] query start (blocking) jobId={job_id} url={query_url[:120]}...")
 
-        # 轮询 query（10min 上限，避免卡死 GUI 线程）
-        query_headers = {
-            'X-Api-App-Key': app_id,
-            'X-Api-Access-Key': access_token,
-            'X-Api-Resource-Id': VOLC_FILE_ASR_RESOURCE,
-            'X-Api-Request-Id': task_id,
-        }
-        if x_tt_logid:
-            query_headers['X-Tt-Logid'] = x_tt_logid
+    query_req = urllib.request.Request(
+        query_url,
+        headers={'Authorization': auth_header},
+        method='GET',
+    )
+    with urllib.request.urlopen(query_req, timeout=300) as resp:
+        query_raw = resp.read().decode('utf-8', errors='replace')
+    try:
+        query_body = json.loads(query_raw) if query_raw else {}
+    except Exception:
+        query_body = {'_raw': query_raw}
+    query_code = query_body.get('code')
+    if query_code != 0:
+        raise RuntimeError(f"ASR query 失败: code={query_code} message={query_body.get('message')} body={query_body}")
 
-        deadline = time.monotonic() + 600.0
-        poll_interval = 3.0
-        final_body: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            time.sleep(poll_interval)
-            q_headers, q_body = _http_post_json(VOLC_FILE_ASR_QUERY_URL, {}, query_headers, timeout=30)
-            q_status = q_headers.get('X-Api-Status-Code', '') or q_headers.get('x-api-status-code', '')
-            if q_status == '20000000':
-                final_body = q_body if isinstance(q_body, dict) else {}
-                break
-            if q_status in ('20000001', '20000002'):
-                # 排队中 / 处理中
-                poll_interval = min(poll_interval + 1.0, 8.0)
+    utterances = query_body.get('utterances') if isinstance(query_body.get('utterances'), list) else []
+    text = ' '.join(
+        str(u.get('text') or '').strip() for u in utterances if str(u.get('text') or '').strip()
+    ).strip()
+    print(f"  [ASR] query response code={query_code} duration={query_body.get('duration')}s utteranceCount={len(utterances)}")
+    # 2026-08-15 调试: 打印前几个 utterance 的 keys / speaker / word 数量,
+    # 验证 with_speaker_info=True 是否真的让 ASR 返回说话人信息.
+    # 关注: speaker 字段在 utterance 上? 还是在每个 word 上? 值是什么类型?
+    if utterances:
+        print(f"  [ASR] utterance[0] keys: {sorted(utterances[0].keys()) if isinstance(utterances[0], dict) else 'NOT_DICT'}")
+        for idx, u in enumerate(utterances[:5]):
+            if not isinstance(u, dict):
                 continue
-            raise RuntimeError(f"ASR query 失败: status={q_status} body={q_body}")
-        else:
-            raise RuntimeError('ASR 任务超时（>10min）')
-
-        result = final_body.get('result') if isinstance(final_body.get('result'), dict) else {}
-        text = str(result.get('text') or '').strip()
-        utterances = result.get('utterances') if isinstance(result.get('utterances'), list) else []
-        return {
-            'text': text,
-            'utterances': utterances,
-            'raw': {
-                '_submit_status': submit_status,
-                '_final_status': '20000000',
-                'task_id': task_id,
-                'duration_s': duration_seconds,
-            },
-        }
-    finally:
-        if oss_key:
-            _delete_from_oss(oss_key, oss_cfg)
+            words = u.get('words') if isinstance(u.get('words'), list) else []
+            word_keys = sorted(words[0].keys()) if words and isinstance(words[0], dict) else 'NO_WORDS'
+            sample_words = [(w.get('text', ''), w.get('speaker', '?')) for w in words[:3] if isinstance(w, dict)]
+            print(f"  [ASR] utterance[{idx}]: speaker={u.get('speaker', 'NO_SPEAKER_FIELD')!r} "
+                  f"text={str(u.get('text') or '')[:60]!r} wordCount={len(words)} wordKeys={word_keys} sample={sample_words}")
+        # 统计: 共多少个不同 speaker
+        speaker_set = set()
+        for u in utterances:
+            if isinstance(u, dict):
+                if 'speaker' in u:
+                    speaker_set.add(u.get('speaker'))
+                words = u.get('words') if isinstance(u.get('words'), list) else []
+                for w in words:
+                    if isinstance(w, dict) and 'speaker' in w:
+                        speaker_set.add(w.get('speaker'))
+        print(f"  [ASR] speaker set: {sorted(speaker_set, key=str)}")
+    return {
+        'text': text,
+        'utterances': utterances,
+        'raw': {
+            'submit_code': submit_code,
+            'query_code': query_code,
+            'task_id': task_id,
+            'job_id': job_id,
+            'duration_s': query_body.get('duration') or duration_seconds,
+            'language': language,
+        },
+    }
 
 
 def _to_finite_number(value: Any) -> float | None:
@@ -578,6 +509,10 @@ def _split_long_event(event: dict[str, Any], max_duration_ms: int = 5000, gap_th
 def build_json3_from_asr_result(result: dict[str, Any], time_offset_ms: int = 0, chunk_duration_ms: int | None = None) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     untimed_cursor_ms = 0
+    # 2026-08-15 调试: 说话人识别 trace — 看 utterance.speaker 字段实际值,
+    # 为下一步"speaker 变化时强制切段"提供决策依据.
+    speaker_field_present = 0
+    speaker_values: list = []
     for utterance in result.get('utterances') or []:
         if not isinstance(utterance, dict):
             continue
@@ -625,7 +560,22 @@ def build_json3_from_asr_result(result: dict[str, Any], time_offset_ms: int = 0,
         if segs:
             segs = _strip_cjk_segs(segs)
         if segs:
-            events.append({'tStartMs': start_ms, 'dDurationMs': duration_ms, 'segs': segs})
+            # 2026-08-15 说话人识别: 把 ASR 返回的 speaker 字段保留到 event 上
+            # (debug 元数据, 不影响下游 consumer). 后续要按 speaker 切段时,
+            # 看这个字段值变化即可.
+            speaker = utterance.get('speaker')
+            event: dict[str, Any] = {'tStartMs': start_ms, 'dDurationMs': duration_ms, 'segs': segs}
+            if speaker is not None:
+                event['speaker'] = speaker
+                speaker_field_present += 1
+                speaker_values.append(speaker)
+            events.append(event)
+    # 2026-08-15 调试: 打印 ASR 返回的 speaker 字段统计 + 切分前 event 数量
+    # 用于验证 with_speaker_info=True 是否真的生效, 以及决定下一步是否
+    # 在 speaker 变化时强制切段 (解决"多人在一个 utterance"问题).
+    print(f"  [ASR→json3] utterance loop done: events={len(events)} "
+          f"speakerFieldCount={speaker_field_present}/{len(result.get('utterances') or [])} "
+          f"uniqueSpeakers={sorted(set(speaker_values), key=str)}")
     # 后处理：超长事件拆段（拆点：句末标点 或 段间空隙 >= 1200ms）
     split_events: list[dict[str, Any]] = []
     for ev in events:
@@ -721,12 +671,17 @@ def generate_asr_json3_from_wav(wav_path: Path, output_path: Path, cfg: dict[str
         on_progress(f'警告：ASR 第一条字幕从 {first_start_ms / 1000:.1f}s 开始，前面可能未识别到有效语音')
     output_path.write_text(json.dumps(json3, ensure_ascii=False, indent=2), 'utf-8')
     # raw 也保留一份，方便后续 debug / 切换 ASR provider
+    # 2026-08-15: 把完整 utterances 数组也保存到 raw 文件. 之前只存了 text + metadata,
+    # debug 时看不到 ASR 实际返回的 utterance 结构 (比如 speaker 字段在 utterance 上
+    # 还是 word 上、说话人是否真的不同). 现在存完整数组, 切换 ASR provider / 改
+    # 后处理时不用再调一次 ASR 也能看真实数据.
     raw_output_path_for_json3(output_path).write_text(
         json.dumps({
-            'provider': 'volc_file_asr_url',
+            'provider': 'volc_vc_submit_query',
             'task_id': (result.get('raw') or {}).get('task_id'),
             'text': text,
             'utteranceCount': len(utterances),
+            'utterances': utterances,  # 2026-08-15 新增: 保存完整 utterances
             'raw': result.get('raw'),
         }, ensure_ascii=False, indent=2),
         'utf-8',
@@ -754,9 +709,8 @@ def generate_asr_subtitle_for_record(
         if on_progress:
             on_progress(f'复用 ASR raw 结果重建字幕: {raw_path.name}')
         return generate_asr_json3_from_raw_file(raw_path, output_path)
-    source_url = _read_info_source_url(info_path)
     safe_stem = _safe_stem(stem)
-    source_audio_path = target_dir / f'{safe_stem}.asr-audio.source'
+    source_audio_path = video_path
     wav_path = target_dir / f'{safe_stem}.asr.wav'
     if (not wav_path.exists() or wav_path.stat().st_size <= 44) and video_path:
         inline_wav_path = video_path.with_name(f'{video_path.name}.asr.wav')
@@ -768,14 +722,8 @@ def generate_asr_subtitle_for_record(
     elif video_path and video_path.exists():
         if on_progress:
             on_progress('使用本地视频抽取 ASR 音频…')
-        source_audio_path = video_path
-    elif source_url:
-        if on_progress:
-            on_progress('未找到本地视频，使用 yt-dlp 下载最佳音频…')
-        downloaded = download_best_audio_with_ytdlp(source_url, target_dir, stem, on_progress)
-        source_audio_path = downloaded
     else:
-        raise RuntimeError('没有可用于 ASR 的来源：缺少 info URL 和本地视频文件')
+        raise RuntimeError('没有可用于 ASR 的来源：缺少本地视频文件')
     if not wav_path.exists() or wav_path.stat().st_size <= 44:
         if on_progress:
             on_progress('转换为 16kHz 单声道 PCM WAV…')
