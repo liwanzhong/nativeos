@@ -100,6 +100,15 @@ export function isAiCardsCacheStale(latestFetchedAt: number | null, now: number 
  * strictly serial under load, so the loop's `await`s don't guarantee
  * statement order in the underlying native code).
  *
+ * 2026-08-17: the table's PRIMARY KEY is now (series_id, id) — the
+ * upstream Supabase `official_video_ai_practice` table has 35
+ * duplicate `id` values across different series, so an `id`-only PK
+ * (v6) was silently overwriting earlier series' rows on REPLACE.
+ * With the composite key, `INSERT OR REPLACE` is correct: REPLACE
+ * only kicks in if the *same* (series_id, id) appears twice in the
+ * batch (defensive), and cross-series duplicates coexist as distinct
+ * rows.
+ *
  * Pass an empty array to wipe the cache (used by invalidate).
  */
 export async function replaceAiCardsCache(rows: SupabaseAiPracticeRow[]): Promise<void> {
@@ -108,14 +117,6 @@ export async function replaceAiCardsCache(rows: SupabaseAiPracticeRow[]): Promis
   await db.execAsync('BEGIN');
   try {
     await db.runAsync('DELETE FROM official_ai_practice_card_cache');
-    // 2026-08-17: use INSERT OR REPLACE because the upstream
-    // `official_video_ai_practice` table has duplicate `id` values
-    // across different series (e.g. `sprout-01__ai__1` appears in 3
-    // different series because the desktop admin only encodes
-    // episode/episode_index into the id, not the series). The
-    // duplicate ids are different rows, so REPLACE keeps the latest
-    // version — but more importantly it sidesteps the
-    // `UNIQUE constraint failed` from straight `INSERT`.
     for (const row of rows) {
       if (!row.id || !row.series_id || !row.episode_id) continue;
       await db.runAsync(

@@ -501,25 +501,45 @@ export default function VideosHome() {
         </View>
       ) : null}
 
-      {/* ── Add menu (inline, no title, no cancel — backdrop
-            tap dismisses) ─────────────────────────────────── */}
+      {/* ── Add menu (title + large card rows + cancel, mirrors
+            AiPracticeHome's choice sheet so the two "join" UIs
+            feel like siblings) ────────────────────────────── */}
       {sheetMode === 'addMenu' ? (
         <Modal visible transparent animationType="slide" onRequestClose={() => setSheetMode('closed')}>
           <View style={styles.sheetOverlay}>
             <Pressable style={StyleSheet.absoluteFill} onPress={() => setSheetMode('closed')} />
-            <View style={styles.addMenuSheet}>
+            <View style={styles.choiceSheet}>
               <View style={styles.customSheetHandle} />
-              <Pressable style={styles.addMenuRow} onPress={handleAddFromLibrary}>
-                <View style={styles.addMenuRowIcon}><Compass size={20} color={colors.primary} /></View>
-                <Text style={styles.addMenuRowTitle}>从推荐资源库添加</Text>
+              <Text style={styles.choiceSheetTitle}>选择加入方式</Text>
+              <Pressable style={styles.choiceItem} onPress={handleAddFromLibrary}>
+                <View style={[styles.choiceItemIcon, styles.choiceItemIconLibrary]}>
+                  <Compass size={20} color="#1E40AF" />
+                </View>
+                <View style={styles.choiceItemBody}>
+                  <Text style={styles.choiceItemTitle}>从推荐资源库添加</Text>
+                  <Text style={styles.choiceItemDesc}>从官方合集里挑一个,自动订阅更新</Text>
+                </View>
               </Pressable>
-              <Pressable style={styles.addMenuRow} onPress={handleOpenImport}>
-                <View style={styles.addMenuRowIcon}><Upload size={20} color={colors.primary} /></View>
-                <Text style={styles.addMenuRowTitle}>导入本地/网盘视频</Text>
+              <Pressable style={styles.choiceItem} onPress={handleOpenImport}>
+                <View style={[styles.choiceItemIcon, styles.choiceItemIconImport]}>
+                  <Upload size={20} color="#7C3AED" />
+                </View>
+                <View style={styles.choiceItemBody}>
+                  <Text style={styles.choiceItemTitle}>导入本地/网盘视频</Text>
+                  <Text style={styles.choiceItemDesc}>从手机或百度网盘导入已有视频</Text>
+                </View>
               </Pressable>
-              <Pressable style={styles.addMenuRow} onPress={handleOpenCreateCollection}>
-                <View style={styles.addMenuRowIcon}><Sparkles size={20} color={colors.primary} /></View>
-                <Text style={styles.addMenuRowTitle}>创建新合集</Text>
+              <Pressable style={styles.choiceItem} onPress={handleOpenCreateCollection}>
+                <View style={[styles.choiceItemIcon, styles.choiceItemIconCreate]}>
+                  <Sparkles size={20} color="#0E7490" />
+                </View>
+                <View style={styles.choiceItemBody}>
+                  <Text style={styles.choiceItemTitle}>创建新合集</Text>
+                  <Text style={styles.choiceItemDesc}>起个名字,创建后再往里面加视频</Text>
+                </View>
+              </Pressable>
+              <Pressable style={styles.choiceCancel} onPress={() => setSheetMode('closed')}>
+                <Text style={styles.choiceCancelText}>取消</Text>
               </Pressable>
             </View>
           </View>
@@ -937,6 +957,78 @@ const styles = StyleSheet.create({
   },
   addMenuRowIcon: { width: 28, alignItems: 'center', justifyContent: 'center' },
   addMenuRowTitle: { fontSize: fontSize.base, color: colors.text.primary, fontWeight: fontWeight.medium },
+  // ── Choice sheet (mirrors AiPracticeHome's "选择加入方式" modal)
+  // 2026-08-17: title + large card rows + bottom cancel button.
+  // Used by the video tab's "+" menu. Cards use full background
+  // (vs the old bare Pressable rows) so it matches the AI 陪练
+  // choice sheet and reads as a single visual family.
+  choiceSheet: {
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: Math.max(28, spacing.xl),
+    gap: spacing.sm,
+  },
+  choiceSheetTitle: {
+    fontSize: fontSize.lg,
+    fontWeight: fontWeight.bold,
+    color: colors.text.primary,
+    marginTop: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  choiceItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+    borderRadius: borderRadius.lg,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  choiceItemIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: borderRadius.full,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  choiceItemIconLibrary: {
+    backgroundColor: '#DBEAFE',
+  },
+  choiceItemIconImport: {
+    backgroundColor: 'rgba(124,58,237,0.12)',
+  },
+  choiceItemIconCreate: {
+    backgroundColor: 'rgba(14,116,144,0.12)',
+  },
+  choiceItemBody: {
+    flex: 1,
+  },
+  choiceItemTitle: {
+    fontSize: fontSize.base,
+    fontWeight: fontWeight.semibold,
+    color: colors.text.primary,
+  },
+  choiceItemDesc: {
+    fontSize: fontSize.xs,
+    color: colors.text.secondary,
+    marginTop: 2,
+    lineHeight: 16,
+  },
+  choiceCancel: {
+    alignItems: 'center',
+    paddingVertical: 12,
+    marginTop: spacing.xs,
+  },
+  choiceCancelText: {
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+    fontWeight: fontWeight.medium,
+  },
   // Create-collection sheet — slightly taller content (input + 2
   // buttons), no fixed height.
   createSheet: {

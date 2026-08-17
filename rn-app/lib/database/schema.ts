@@ -12,6 +12,14 @@
  *       ai_practice_user_meta) — P1 of the migration plan
  *   v5: +2 tables for OSS manifest + per-scene info.json SQLite cache
  *       (with ETag/Last-Modified for conditional GET)
+ *   v6: +1 table for the Supabase official_video_ai_practice cache
+ *   v7: composite PRIMARY KEY (series_id, id) on
+ *       official_ai_practice_card_cache — upstream Supabase has 35
+ *       duplicate `id` values across different series (the desktop
+ *       admin only encodes episode into the id, not series), and
+ *       `id`-only PK was causing cross-series INSERT OR REPLACE to
+ *       silently overwrite the earlier series' rows. The composite
+ *       key keeps each (series, id) pair as a distinct row.
  *
  * Native-only. The web platform has no real SQLite (see
  * expo-sqlite-mock.ts); the migration code runs unconditionally and is
@@ -22,7 +30,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'nativeos.db';
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 // Bump SCHEMA_VERSION + add a `migrateToV{N+1}` step to evolve the schema.
 
 let _db: any = null;
@@ -43,6 +51,7 @@ export async function initDatabase(): Promise<any> {
     await migrateToV4(db);
     await migrateToV5(db);
     await migrateToV6(db);
+    await migrateToV7(db);
     _db = db;
     return db;
   })();
@@ -250,13 +259,21 @@ async function createTables(db: any) {
     -- N-times-per-page round-trips with 1 batch fetch + local lookup.
     -- Single source of truth for the recommend page; refreshed in bulk
     -- when the cache expires or is invalidated.
+    --
+    -- 2026-08-17 (v7): composite PRIMARY KEY (series_id, id). The
+    -- upstream Supabase table has duplicate id values across
+    -- different series (desktop admin encodes episode into the id,
+    -- not series). With id-only PK, INSERT OR REPLACE would silently
+    -- overwrite the earlier series row. Composite key keeps each
+    -- (series, id) pair as a distinct row.
     CREATE TABLE IF NOT EXISTS official_ai_practice_card_cache (
-      id TEXT PRIMARY KEY,                 -- supabase row.id (UUID)
+      id TEXT NOT NULL,                    -- supabase row.id (may dup across series)
       series_id TEXT NOT NULL,
       episode_id TEXT NOT NULL,
       card_index INTEGER NOT NULL,
       card_json TEXT NOT NULL,             -- full SupabaseAiPracticeRow JSON
-      fetched_at INTEGER NOT NULL
+      fetched_at INTEGER NOT NULL,
+      PRIMARY KEY (series_id, id)
     );
     CREATE INDEX IF NOT EXISTS idx_oai_cache_series
       ON official_ai_practice_card_cache(series_id);
@@ -454,6 +471,70 @@ export async function migrateToV6(db: any): Promise<void> {
   await createFTSIndexes(db);
 
   await db.execAsync('PRAGMA user_version = 6');
+}
+
+/**
+ * v7: Recreate `official_ai_practice_card_cache` with a composite
+ * PRIMARY KEY (series_id, id). The upstream Supabase table has
+ * duplicate `id` values across different series (35 of them, e.g.
+ * `sprout-01__ai__1` appears in bfd3a/4fd09/d20f), and the v6
+ * `id`-only PRIMARY KEY was causing `INSERT OR REPLACE` to silently
+ * overwrite the earlier series' rows for each shared id. The user
+ * picked `bfd3afea6bd2` and saw an empty recommend page because all
+ * 35 of its rows had been overwritten by the later series' writes.
+ *
+ * The old v6 cache is dropped unconditionally — it cannot be migrated
+ * losslessly without knowing which series' version of each duplicate
+ * id was the "right" one, and a fresh refetch from Supabase is
+ * cheap. Next page load will see `MAX(fetched_at) = NULL`, mark the
+ * cache stale, and trigger a single batched refresh.
+ */
+export async function migrateToV7(db: any): Promise<void> {
+  const versionRow: any = await db.getFirstAsync('PRAGMA user_version');
+  const currentVersion = typeof versionRow?.user_version === 'number' ? versionRow?.user_version : 0;
+  if (currentVersion >= 7) return;
+
+  // v6's table had a single-column PRIMARY KEY (id). Detect it by
+  // checking that the table exists and its PK isn't already composite.
+  let needRecreate = false;
+  const tableRow: any = await db.getFirstAsync(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='official_ai_practice_card_cache'",
+  );
+  if (tableRow) {
+    const pkRows: any[] = await db.getAllAsync(
+      "PRAGMA index_list('official_ai_practice_card_cache')",
+    );
+    // Look for a unique index whose key columns include both series_id
+    // and id (i.e. the table_info shows them as PRIMARY KEY together).
+    const cols: any[] = await db.getAllAsync(
+      "PRAGMA table_info('official_ai_practice_card_cache')",
+    );
+    const pkCols = cols.filter((c: any) => c.pk > 0).map((c: any) => c.name).sort();
+    const want = ['id', 'series_id'];
+    if (pkCols.length !== 2 || pkCols.join(',') !== want.join(',')) {
+      needRecreate = true;
+    }
+    // (pkRows is unused; left here in case we want to inspect indexes.)
+    void pkRows;
+  } else {
+    // Fresh DB at v7 — createTables will create the v7 shape.
+    needRecreate = false;
+  }
+
+  if (needRecreate) {
+    try {
+      await db.execAsync('DROP TABLE IF EXISTS official_ai_practice_card_cache');
+      console.log('[schema] migrateToV7 dropped corrupt official_ai_practice_card_cache (id-only PK)');
+    } catch (e) {
+      console.warn('[schema] migrateToV7 drop failed:', e);
+    }
+  }
+
+  // createTables is idempotent and uses the v7 composite-PK shape.
+  await createTables(db);
+  await createFTSIndexes(db);
+
+  await db.execAsync('PRAGMA user_version = 7');
 }
 
 async function safeRemoveAsyncKey(key: string): Promise<void> {

@@ -31,11 +31,13 @@ import {
   loadPublishedSeriesFromSupabase,
   loadMyPickedSeriesFromSupabase,
   loadSeriesEpisodesFromSupabase,
+  loadSeriesByIdFromSupabase,
   resolveSeriesCoverUrl,
   type SupabaseSeriesRow,
   type SupabaseEpisodeRow,
   type PickedSeriesDetail,
 } from './video-series-supabase';
+import { loadLocalPickedIds } from './user-picked-series';
 import { getOfficialVideoSeriesById } from './video-series';
 import {
   listUserCollections,
@@ -298,15 +300,17 @@ export async function listMyCollections(forceRefresh: boolean = false): Promise<
     return cached;
   }
 
-  const [pickedResult, userColsResult, metaList] = await Promise.allSettled([
+  const [pickedResult, userColsResult, metaList, localPickedResult] = await Promise.allSettled([
     loadMyPickedSeriesFromSupabase(forceRefresh),
     listUserCollections(),
     listVideoUserMeta().catch(() => [] as VideoUserMetaRecord[]),
+    loadLocalPickedIds(),
   ]);
 
   const picked = pickedResult.status === 'fulfilled' ? pickedResult.value : [];
   const userCols = userColsResult.status === 'fulfilled' ? userColsResult.value : [];
   const meta = metaList.status === 'fulfilled' ? metaList.value : [];
+  const localPickedIds = localPickedResult.status === 'fulfilled' ? localPickedResult.value : new Set<string>();
 
   const metaMap = Object.fromEntries(meta.map((m) => [m.sceneId, m]));
 
@@ -335,6 +339,36 @@ export async function listMyCollections(forceRefresh: boolean = false): Promise<
         ...userVideosAll.filter((e) => e.collectionId && orphanCollectionIds.has(e.collectionId)),
       ].length,
     });
+  }
+
+  // ── Merge local picked (signed-out fallback) into the picked list ──
+  // 2026-08-17: 未登录时 user-picked-series.ts::pickSeries 把 seriesId
+  // 存到 AsyncStorage, 这里从 local 拿 seriesId 拉 series detail 合成
+  // PickedSeriesDetail 跟 remote row 一样处理. 已 picked 的 seriesId 跳过
+  // 避免重复.
+  const remoteSeriesIds = new Set<string>(picked.map((p) => p.row.series_id));
+  const localOnlyIds: string[] = Array.from(localPickedIds).filter((id: string) => !remoteSeriesIds.has(id));
+  if (localOnlyIds.length > 0) {
+    const localRows = await Promise.all(localOnlyIds.map((id: string) => loadSeriesByIdFromSupabase(id)));
+    const nowIso = new Date().toISOString();
+    let added = 0;
+    for (const s of localRows) {
+      if (!s) continue;
+      // 合成 PickedSeriesDetail (row 全填 placeholder, series 是真 detail)
+      picked.push({
+        row: {
+          id: 0,  // placeholder; never used outside DB
+          user_id: 'local',
+          series_id: s.id,
+          picked_at: nowIso,
+          last_practiced_at: null,
+          is_pinned: false,
+        },
+        series: s,
+      });
+      added += 1;
+    }
+    logColTrace('local picked merged', { added, skipped: localOnlyIds.length - added });
   }
 
   // ── Official: enrich each subscribed row with episode count ──
