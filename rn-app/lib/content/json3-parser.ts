@@ -108,6 +108,12 @@ function toTimedWordTokens(speechEvents: SpeechEventEntry[]): TimedWordToken[] {
     }
   });
 
+  // json3 events 偶尔出现首个 event tStartMs 异常偏大的情况（例如 OSS 上某些视频
+  // cc-seg-0 tStartMs=40000 但实际是片头），导致 timedTokens 不是单调递增，
+  // finalizeExternalSegment 里的 break-early 逻辑会提前终止查找，seg-1~15 全部
+  // 返回 null，字幕从 40 秒后才开始显示。这里对 tokens 按 startMs 排序，让二分
+  // 查找的单调假设始终成立。
+  tokens.sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
   return tokens;
 }
 

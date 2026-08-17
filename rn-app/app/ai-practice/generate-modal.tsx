@@ -45,6 +45,8 @@ import {
   addAiTopicToHome,
   type AiPracticeHomeOrigin,
 } from '../../lib/ai/ai-practice-user-meta';
+import { consumeAndNotify, isByokEnabled } from '../../lib/quota';
+import { quotaDialog } from '../../components/quota/QuotaBlockedDialog';
 
 type Status = 'generating' | 'done' | 'error';
 
@@ -68,6 +70,27 @@ const STATUS_TEXT: Record<Status, string> = {
   done: '生成完成',
   error: '生成失败',
 };
+
+/**
+ * Pre-flight quota gate for the LLM call. Returns true when the call
+ * is allowed (Pro / BYOK / still within daily cap). When the cap is
+ * already hit we surface the standard "额度用完啦" dialog and return
+ * false so the caller can bail cleanly.
+ *
+ * We charge `count` units up front (one per card requested). If the
+ * stream returns fewer cards the overage is fine — the user paid for
+ * the generation work, not a per-card deliverable.
+ */
+async function ensureAiRoundQuota(count: number): Promise<boolean> {
+  const byokOn = await isByokEnabled();
+  if (byokOn) return true;
+  const verdict = await consumeAndNotify('ai_rounds', Math.max(1, count));
+  if (!verdict.allowed) {
+    quotaDialog.show({ field: verdict.field, tier: verdict.tier, used: verdict.used, hard: verdict.hard });
+    return false;
+  }
+  return true;
+}
 
 export function GenerateModal({
   visible,
@@ -104,6 +127,15 @@ export function GenerateModal({
     setSelectedIds(new Set());
 
     (async () => {
+      // Quota gate. If the user is over the daily cap, surface the
+      // standard dialog and bail to the 'error' state so the modal
+      // doesn't sit forever on a spinner.
+      const allowed = await ensureAiRoundQuota(count);
+      if (!allowed) {
+        if (invocationIdRef.current !== myId) return;
+        setStatus('error');
+        return;
+      }
       try {
         await generateDailyScenariosStream(
           {
@@ -159,6 +191,15 @@ export function GenerateModal({
     setCards([]);
     setSelectedIds(new Set());
     (async () => {
+      // Quota: retry is a fresh LLM call — charge again. If the
+      // user is over the cap, the dialog is shown and we exit to
+      // the error state instead of looping.
+      const allowed = await ensureAiRoundQuota(count);
+      if (!allowed) {
+        if (invocationIdRef.current !== myId) return;
+        setStatus('error');
+        return;
+      }
       try {
         await generateDailyScenariosStream(
           { userLevel: userLevel as any, interests, count },

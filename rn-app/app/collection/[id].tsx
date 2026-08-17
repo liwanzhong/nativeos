@@ -93,7 +93,9 @@ import {
   generateUserVideoAiPracticeCards,
   loadGeneratedUserVideoAiPracticeCards,
   subscribeUserVideoAiPracticeState,
+  QuotaBlockedError,
 } from '../../lib/content/user-video-ai-practice';
+import { quotaDialog } from '../../components/quota/QuotaBlockedDialog';
 import {
   downloadImportedCloudVideo,
   getCachedDownloadEntrySnapshot,
@@ -641,7 +643,20 @@ export default function CollectionDetailPage() {
       }
       router.push('/(tabs)/feed');
     } catch (err) {
-      Alert.alert('AI 话题生成失败', err instanceof Error ? err.message : String(err));
+      // 2026-08-17: quota gate inside `generateUserVideoAiPracticeCards`
+      // throws a typed QuotaBlockedError when the daily ai_rounds
+      // cap is already hit. Surface the standard dialog (matches the
+      // rest of the app) instead of the generic "生成失败" alert.
+      if (err instanceof QuotaBlockedError) {
+        quotaDialog.show({
+          field: err.verdict.field,
+          tier: err.verdict.tier,
+          used: err.verdict.used,
+          hard: err.verdict.hard,
+        });
+      } else {
+        Alert.alert('AI 话题生成失败', err instanceof Error ? err.message : String(err));
+      }
     } finally {
       teardown();
       // Final reload to settle the row state (the subscriber

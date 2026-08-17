@@ -38,6 +38,21 @@ import {
   updateUserVideoEntryFields,
   type UserVideoEntry,
 } from './user-videos';
+import { consumeAndNotify, isByokEnabled, type ConsumeResult } from '../quota';
+
+/**
+ * Thrown by `generateUserVideoAiPracticeCards` when the daily
+ * `ai_rounds` quota is already exhausted. Carries the verdict so
+ * the caller can hand it straight to `quotaDialog.show(...)`.
+ */
+export class QuotaBlockedError extends Error {
+  verdict: ConsumeResult;
+  constructor(verdict: ConsumeResult) {
+    super(`ai_rounds quota exhausted (${verdict.used}/${verdict.hard})`);
+    this.name = 'QuotaBlockedError';
+    this.verdict = verdict;
+  }
+}
 
 const USER_VIDEOS_ROOT_DIR = `${userVideosRootDir()}`;
 const USER_VIDEOS_AI_PRACTICE_DIR = `${USER_VIDEOS_ROOT_DIR}/ai-practice`;
@@ -471,6 +486,20 @@ export async function generateUserVideoAiPracticeCards(
 ): Promise<ScenarioCard[]> {
   const existing = generationPromiseStore.get(entryId);
   if (existing) return existing;
+
+  // 2026-08-17: Pro gate. One generation = one ai_rounds charge (the
+  // work is a single LLM call, regardless of how many cards come
+  // back). BYOK users skip the NativeOS counter. Idempotency note:
+  // the in-flight check above means a re-tap during an in-flight
+  // generation returns the cached promise WITHOUT re-charging —
+  // exactly what we want.
+  const byokOn = await isByokEnabled();
+  if (!byokOn) {
+    const verdict = await consumeAndNotify('ai_rounds');
+    if (!verdict.allowed) {
+      throw new QuotaBlockedError(verdict);
+    }
+  }
 
   const entry = await getUserVideoEntryById(entryId);
   if (!entry) throw new Error('视频记录不存在');

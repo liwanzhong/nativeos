@@ -67,6 +67,8 @@ import {
   type SceneOption,
 } from '../../lib/ai/scene-options-generator';
 import { GenerateModal } from './generate-modal';
+import { consumeAndNotify, isByokEnabled } from '../../lib/quota';
+import { quotaDialog } from '../../components/quota/QuotaBlockedDialog';
 
 const COUNT_OPTIONS: ReadonlyArray<number> = [3, 5, 8];
 const DEFAULT_COUNT = 5;
@@ -194,6 +196,25 @@ export default function AiPracticeAddCustomGuidePage() {
     loadedRef.current.add(pendingIndex);
 
     (async () => {
+      // 2026-08-17: Pro gate. Each turn in the multi-step guide is
+      // one LLM call; charge 1 ai_round per turn. BYOK users skip
+      // the NativeOS counter. If the cap is already hit, surface
+      // the standard dialog and mark the turn as "no AI options"
+      // (empty array) so the user can self-write for this turn.
+      const byokOn = await isByokEnabled();
+      if (!byokOn) {
+        const verdict = await consumeAndNotify('ai_rounds');
+        if (!verdict.allowed) {
+          quotaDialog.show({ field: verdict.field, tier: verdict.tier, used: verdict.used, hard: verdict.hard });
+          setTurns((prev) => {
+            if (prev[pendingIndex]?.kind !== turn.kind) return prev;
+            const next = [...prev];
+            next[pendingIndex] = { ...next[pendingIndex], options: [] };
+            return next;
+          });
+          return;
+        }
+      }
       try {
         const options = await generateSceneOptions({
           turn: turn.kind as OptionsTurn,

@@ -759,6 +759,16 @@ export default function ImmersiveScenarioScreen() {
 
   // ── Hint sheet ────────────────────────────────────────────────────────────────
   const handleHint = async () => {
+    // 2026-08-17: Pro gate. Hints are an LLM call that competes
+    // with the user's ai_rounds daily cap. BYOK users bypass.
+    const byokOn = await isByokEnabled();
+    if (!byokOn) {
+      const verdict = await consumeAndNotify('ai_rounds');
+      if (!verdict.allowed) {
+        quotaDialog.show({ field: verdict.field, tier: verdict.tier, used: verdict.used, hard: verdict.hard });
+        return;
+      }
+    }
     setShowHintSheet(true);
     setIsHintLoading(true);
     const history: ChatTurn[] = messagesRef.current.filter(m => m.role !== 'system').map(m => ({ role: m.role as 'npc' | 'user', text: m.text }));
@@ -946,10 +956,22 @@ export default function ImmersiveScenarioScreen() {
   const toggleTranslation = async (msgId: number) => {
     const msg = messagesRef.current.find(m => m.id === msgId);
     if (!msg) return;
-    if (msg.translation) {
+    if (msg.translation && msg.translation !== '翻译中…' && msg.translation !== '翻译失败') {
       // Translation already cached — just toggle visibility, no API call needed
       setMessages(prev => prev.map(m => m.id === msgId ? { ...m, showTranslation: !m.showTranslation } : m));
     } else {
+      // 2026-08-17: Pro gate. The first translate call per message
+      // is an LLM call that costs 1 ai_round. BYOK users bypass.
+      // Subsequent toggles just flip `showTranslation` (no charge)
+      // because the cached translation is reused.
+      const byokOn = await isByokEnabled();
+      if (!byokOn) {
+        const verdict = await consumeAndNotify('ai_rounds');
+        if (!verdict.allowed) {
+          quotaDialog.show({ field: verdict.field, tier: verdict.tier, used: verdict.used, hard: verdict.hard });
+          return;
+        }
+      }
       // No cached translation — fetch it once then show
       setMessages(prev => prev.map(m => m.id === msgId ? { ...m, showTranslation: true, translation: '翻译中…' } : m));
       try {

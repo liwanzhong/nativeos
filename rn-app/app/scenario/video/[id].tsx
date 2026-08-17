@@ -12,6 +12,8 @@ import { extractVideoClip, deleteClipSegment } from '../../../lib/media/ffmpeg-c
 import { selectScenario, type ScenarioCard } from '../../../lib/ai/scenario-generator';
 import { buildAiPracticeTopicSnapshot, markAiPracticeTopicUsed } from '../../../lib/ai/ai-practice-user-meta';
 import { startVolcASR, type ASRHandle } from '../../../lib/volcengine/asr';
+import { consumeAndNotify, isByokEnabled } from '../../../lib/quota';
+import { quotaDialog } from '../../../components/quota/QuotaBlockedDialog';
 import { diffShadowing, type ShadowingDiffResult } from '../../../lib/shadowing/diff';
 import { DictionaryLookupSheet } from '../../../components/dictionary/DictionaryLookupSheet';
 import { ShadowingPanel } from '../../../components/video/ShadowingPanel';
@@ -26,6 +28,7 @@ import {
   getUserVideoAiPracticeState,
   loadGeneratedUserVideoAiPracticeCards,
   subscribeUserVideoAiPracticeState,
+  QuotaBlockedError,
 } from '../../../lib/content/user-video-ai-practice';
 import { getVideoUserMeta, markVideoScenePracticed } from '../../../lib/content/video-user-meta';
 import {
@@ -1526,9 +1529,26 @@ function VideoLearningPlayer({
       setVideoAiGenerationStatus('completed');
       setVideoAiGenerationError(null);
     } catch (error) {
-      setVideoAiGenerationStatus('failed');
-      setVideoAiGenerationError(error instanceof Error ? error.message : 'AI陪练生成失败');
-      Alert.alert('生成失败', error instanceof Error ? error.message : 'AI陪练生成失败，请稍后重试');
+      // 2026-08-17: quota gate inside `generateUserVideoAiPracticeCards`
+      // throws a typed QuotaBlockedError when the daily ai_rounds
+      // cap is already hit. Surface the standard dialog (matches
+      // the rest of the app) instead of the generic "生成失败"
+      // alert. The status flags stay cleared so a future
+      // regeneration tap can re-enter the happy path.
+      if (error instanceof QuotaBlockedError) {
+        quotaDialog.show({
+          field: error.verdict.field,
+          tier: error.verdict.tier,
+          used: error.verdict.used,
+          hard: error.verdict.hard,
+        });
+        setVideoAiGenerationStatus('idle');
+        setVideoAiGenerationError(null);
+      } else {
+        setVideoAiGenerationStatus('failed');
+        setVideoAiGenerationError(error instanceof Error ? error.message : 'AI陪练生成失败');
+        Alert.alert('生成失败', error instanceof Error ? error.message : 'AI陪练生成失败，请稍后重试');
+      }
     } finally {
       setIsGeneratingVideoAiPractice(false);
     }
@@ -1984,8 +2004,19 @@ function VideoLearningPlayer({
     player.play();
   }, [isVideoReady, player, resolvedPlayerSource, shadowingEndSeconds, shadowingStartSeconds, updateNativePositionSeconds]);
 
-  const handleShadowingPressIn = useCallback(() => {
+  const handleShadowingPressIn = useCallback(async () => {
     if (isShadowingRecording || isShadowingProcessing || !shadowingSegment?.text) return;
+    // Quota: charge 1 ASR unit before opening the mic (mirrors the
+    // immersive-page shadowing flow). BYOK users bypass the NativeOS
+    // counter — they're paying for tokens directly.
+    const byokOn = await isByokEnabled();
+    if (!byokOn) {
+      const verdict = await consumeAndNotify('asr');
+      if (!verdict.allowed) {
+        quotaDialog.show({ field: verdict.field, tier: verdict.tier, used: verdict.used, hard: verdict.hard });
+        return;
+      }
+    }
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
     pausePlayerSafely(player);
     shadowingReplayRangeRef.current = null;

@@ -242,7 +242,7 @@ async function dirSizeBytes(path: string): Promise<number> {
       path,
       exists: info.exists,
       isDirectory: info.isDirectory,
-      size: info.size,
+      size: info.exists ? info.size : 0,
     });
     if (!info.exists) return 0;
   } catch (e) {
