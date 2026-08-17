@@ -163,13 +163,32 @@ async function copyDirRecursive(src: string, dest: string): Promise<number> {
   // returns bytes copied
   let bytes = 0;
   const info = await getInfoAsync(src);
+  console.log('[export.copyDirRecursive] probe', {
+    src,
+    exists: info.exists,
+    isDirectory: info.isDirectory,
+  });
   if (!info.exists) return 0;
   if (!info.isDirectory) {
     await copyAsync({ from: src, to: dest });
     return typeof info.size === 'number' ? info.size : 0;
   }
   await makeDirectoryAsync(dest, { intermediates: true });
-  const entries = await readDirectoryAsync(src);
+  let entries: string[] = [];
+  try {
+    entries = await readDirectoryAsync(src);
+    console.log('[export.copyDirRecursive] readDirectoryAsync', {
+      src,
+      entriesCount: entries.length,
+      sample: entries.slice(0, 5),
+    });
+  } catch (e) {
+    console.log('[export.copyDirRecursive] readDirectoryAsync threw', {
+      src,
+      msg: e instanceof Error ? e.message : String(e),
+    });
+    return 0;
+  }
   for (const name of entries) {
     const childSrc = `${src}/${name}`;
     const childDest = `${dest}/${name}`;
@@ -333,6 +352,24 @@ export async function runExport(
   await ensureBackupDirs();
   await resetStaging();
   const stagingDir = BACKUP_DIRS.staging;
+
+  // 2026-08-17: one-time probe of filesystem layout to debug the
+  // user-videos-size-zero bug. Remove once we've shipped the fix.
+  console.log('[export.runExport] documentDirectory =', JSON.stringify(documentDirectory));
+  console.log('[export.runExport] FILE_KIND_TO_DIR =', FILE_KIND_TO_DIR);
+  console.log('[export.runExport] selected file kinds =', (Object.keys(FILE_KIND_TO_DIR) as BackupItemKind[]).filter(
+    (k) => opts.selected.has(k) && FILE_KIND_TO_DIR[k],
+  ));
+  for (const [kind, dirName] of Object.entries(FILE_KIND_TO_DIR)) {
+    if (!opts.selected.has(kind as BackupItemKind)) continue;
+    const srcDir = `${documentDirectory ?? ''}${dirName}`;
+    try {
+      const info = await getInfoAsync(srcDir);
+      console.log('[export.runExport] srcDir probe', { kind, srcDir, exists: info.exists, isDirectory: info.isDirectory });
+    } catch (e) {
+      console.log('[export.runExport] srcDir probe threw', { kind, srcDir, msg: e instanceof Error ? e.message : String(e) });
+    }
+  }
 
   let bytesProcessed = 0;
   let zipPath = '';

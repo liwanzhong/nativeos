@@ -33,6 +33,7 @@ import {
   Database,
   RotateCcw,
   Share2,
+  MessageSquareWarning,
 } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Constants from 'expo-constants';
@@ -537,6 +538,22 @@ export default function SettingsScreen() {
           </View>
 
           <View style={styles.list}>
+            <Pressable
+              style={[styles.row, styles.rowBorder]}
+              onPress={() => router.push('/settings/feedback')}
+            >
+              <View style={[styles.iconBox, { backgroundColor: colors.warningLight }]}>
+                <MessageSquareWarning size={20} color={colors.warning} />
+              </View>
+              <View style={styles.rowText}>
+                <Text style={styles.rowTitle}>反馈问题</Text>
+                <Text style={styles.rowDesc}>
+                  遇到 bug 或异常？生成一个包含日志和设备信息的文本文件，可发到飞书
+                </Text>
+              </View>
+              <ChevronRight size={18} color={colors.text.tertiary} />
+            </Pressable>
+
             <View style={styles.row}>
               <View style={[styles.iconBox, { backgroundColor: colors.surfaceSecondary }]}>
                 <Info size={20} color={colors.text.secondary} />

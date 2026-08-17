@@ -237,8 +237,19 @@ async function dirSizeBytes(path: string): Promise<number> {
   let total = 0;
   try {
     const info = await getInfoAsync(path);
+    // 2026-08-17: temporary debug log for the user-videos size=0 bug
+    console.log('[inventory.dirSizeBytes] probe', {
+      path,
+      exists: info.exists,
+      isDirectory: info.isDirectory,
+      size: info.size,
+    });
     if (!info.exists) return 0;
-  } catch {
+  } catch (e) {
+    console.log('[inventory.dirSizeBytes] getInfoAsync threw', {
+      path,
+      msg: e instanceof Error ? e.message : String(e),
+    });
     return 0;
   }
   const stack: string[] = [path];
@@ -247,7 +258,16 @@ async function dirSizeBytes(path: string): Promise<number> {
     let entries: string[] = [];
     try {
       entries = await readDirectoryAsync(cur);
-    } catch {
+      console.log('[inventory.dirSizeBytes] readDirectoryAsync', {
+        cur,
+        entriesCount: entries.length,
+        sample: entries.slice(0, 5),
+      });
+    } catch (e) {
+      console.log('[inventory.dirSizeBytes] readDirectoryAsync threw', {
+        cur,
+        msg: e instanceof Error ? e.message : String(e),
+      });
       continue;
     }
     for (const name of entries) {
@@ -266,6 +286,7 @@ async function dirSizeBytes(path: string): Promise<number> {
       }
     }
   }
+  console.log('[inventory.dirSizeBytes] done', { path, total });
   return total;
 }
 

@@ -20,6 +20,12 @@ import { prewarmDictionaryDb } from '../lib/dictionary/db';
 import { AuthProvider } from '../lib/auth';
 import { QuotaBlockedDialog } from '../components/quota/QuotaBlockedDialog';
 import { installQuotaBackgroundSync } from '../lib/quota';
+import { installLogStore } from '../lib/diagnostics/logStore';
+
+// Install the in-memory console ring buffer as early as possible so
+// even init-phase errors (DB migration, notifications, app update
+// check) end up in the feedback bundle. Idempotent.
+installLogStore();
 
 const queryClient = new QueryClient();
 
@@ -211,6 +217,7 @@ export default function RootLayout() {
                 <Stack.Screen name="login" options={{ presentation: 'modal' }} />
                 <Stack.Screen name="profile-edit" options={{ presentation: 'modal' }} />
                 <Stack.Screen name="settings" options={{ presentation: 'modal' }} />
+                <Stack.Screen name="settings/feedback" options={{ presentation: 'modal' }} />
                 <Stack.Screen name="membership" options={{ presentation: 'modal' }} />
                 <Stack.Screen name="redeem" options={{ presentation: 'modal' }} />
                 <Stack.Screen name="byok" options={{ presentation: 'modal' }} />
