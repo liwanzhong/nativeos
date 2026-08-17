@@ -40,6 +40,47 @@ import { deleteUserVideoEntry, setUserVideoCollection, triggerCloudVideoSubtitle
 import { encodeUserCollectionId, listUserCollections } from '../../../lib/content/user-collections';
 import { invalidateCollectionsCache } from '../../../lib/content/collections';
 
+/**
+ * 把 text 字符串按 words 数组的 word 在 text 中的位置切成 spans.
+ * 每个 word 独立一个 <Text> span (可独立高亮), word 之间的标点/空格是普通 <Text> span.
+ *
+ * 例: text="Well, I didn't know how to tell you before, but— We got the house—enjoy!"
+ *     words=[{text:"well"}, {text:" I"}, {text:" didn't"}, ...]
+ *     → [{text:"Well, ", word:null}, {text:"well", word:words[0]}, {text:" ", word:null},
+ *        {text:"I", word:words[1]}, {text:" didn't", word:words[2]}, ...]
+ *
+ * 大小写不敏感找位置: json3 拍平的 word 跟 LLM 修过的大小写可能不一致 ("well" vs "Well").
+ * word 可能带前置/后置空格 (buildWordsFromTokens 会加), 需要 trim 后再 indexOf.
+ */
+function buildHighlightSpans(text: string, words: WordTiming[]): Array<{ text: string; word: WordTiming | null }> {
+  if (!words || words.length === 0) {
+    return [{ text, word: null }];
+  }
+  const lowerText = text.toLowerCase();
+  const spans: Array<{ text: string; word: WordTiming | null }> = [];
+  let cursor = 0;
+  for (const w of words) {
+    const wordText = (w.text || '').trim();
+    if (!wordText) continue;
+    const lowerWord = wordText.toLowerCase();
+    const startInText = lowerText.indexOf(lowerWord, cursor);
+    if (startInText < 0) {
+      // json3 word 在 text 里找不到 — 跳过 (例: LLM 删词/合并词)
+      continue;
+    }
+    const endInText = startInText + wordText.length;
+    if (startInText > cursor) {
+      spans.push({ text: text.slice(cursor, startInText), word: null });
+    }
+    spans.push({ text: text.slice(startInText, endInText), word: w });
+    cursor = endInText;
+  }
+  if (cursor < text.length) {
+    spans.push({ text: text.slice(cursor), word: null });
+  }
+  return spans.length > 0 ? spans : [{ text, word: null }];
+}
+
 function WordHighlightText({
   words,
   text,
@@ -61,23 +102,27 @@ function WordHighlightText({
   onWordPress?: (word: WordTiming, segmentText: string, segmentId?: string) => void;
   segmentId?: string;
 }) {
-  if (!words || words.length <= 1) {
+  // 2026-08-17 trace: text 是 segmented 整段 (LLM 修过标点), words 是 json3 拍平 word 数组.
+  // 渲染用 text 字符串, 按 words 时间定位当前 word → 高亮对应 span.
+  const spans = words && words.length > 1 ? buildHighlightSpans(text, words) : null;
+  if (!spans) {
     return (
       <Text numberOfLines={numberOfLines} style={[styles.segmentText, isActive && styles.segmentTextActive, textStyle]}>{text}</Text>
     );
   }
   return (
     <Text numberOfLines={numberOfLines} style={[styles.segmentText, isActive && styles.segmentTextActive, textStyle]}>
-      {words.map((w, i) => {
-        const highlighted = isActive && positionMs >= w.startMs && positionMs < w.endMs;
+      {spans.map((span, i) => {
+        const isActiveWord = isActive && span.word != null
+          && positionMs >= span.word.startMs && positionMs < span.word.endMs;
         return (
           <Text
             key={i}
-            style={highlighted ? [styles.wordHighlight, highlightStyle] : undefined}
-            onPress={onWordPress ? (e) => { e.stopPropagation?.(); onWordPress(w, text, segmentId); } : undefined}
+            style={isActiveWord ? [styles.wordHighlight, highlightStyle] : undefined}
+            onPress={span.word && onWordPress ? (e) => { e.stopPropagation?.(); onWordPress(span.word!, text, segmentId); } : undefined}
             suppressHighlighting
           >
-            {w.text}
+            {span.text}
           </Text>
         );
       })}

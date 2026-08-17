@@ -290,25 +290,60 @@ function finalizeExternalSegment(
   timedTokens: TimedWordToken[],
   index: number,
 ): VideoSceneSegment | null {
-  const startToken = typeof segment.startToken === 'number' ? segment.startToken : -1;
-  const endToken = typeof segment.endToken === 'number' ? segment.endToken : -1;
-  if (startToken < 0 || endToken < startToken || endToken >= timedTokens.length) {
+  // 2026-08-17 改: segment.startToken/endToken 一直算的是 ASR event 索引 (subtitle-segmenter.ts
+  // 那边用 u.index-1), 但这里 timedTokens 是拍平后的 word 数组, 索引含义对不上. 直接拿 token 切片
+  // 会落到错位的 word 上, 渲染就出现 "that's not" 这种错乱. 改成按 segment.startMs/endMs 二分
+  // timedTokens, 完全忽略 startToken/endToken.
+  const startMs = typeof segment.startMs === 'number' ? segment.startMs : -1;
+  const endMs = typeof segment.endMs === 'number' ? segment.endMs : -1;
+  if (startMs < 0 || endMs <= startMs) {
     return null;
   }
 
-  const tokenSlice = timedTokens.slice(startToken, endToken + 1);
+  // 二分: 找 endMs > startMs 的第一个 word, 再找 startMs < endMs 的最后一个 word.
+  let wordStartIdx = -1;
+  let wordEndIdx = -1;
+  for (let i = 0; i < timedTokens.length; i += 1) {
+    const tok = timedTokens[i];
+    if (wordStartIdx === -1 && tok.endMs > startMs) {
+      wordStartIdx = i;
+    }
+    if (tok.startMs < endMs) {
+      wordEndIdx = i;
+    } else {
+      // 后续 token 的 startMs 单调递增 (json3-parser 行为), 提早 break.
+      break;
+    }
+  }
+  if (wordStartIdx === -1 || wordEndIdx === -1 || wordEndIdx < wordStartIdx) {
+    return null;
+  }
+
+  const tokenSlice = timedTokens.slice(wordStartIdx, wordEndIdx + 1);
   if (tokenSlice.length === 0) return null;
   const words = buildWordsFromTokens(tokenSlice);
   if (words.length === 0) return null;
 
+  // 文本以 segmented.json 自带的整段为准 (LLM 修过标点/大写, 跟 json3 单词拼接不一致)
   const text = typeof segment.text === 'string' && segment.text.trim().length > 0
     ? segment.text.trim()
     : words.map((word) => word.text).join('').trim();
 
+  // 2026-08-17 trace: 用 [startMs, endMs] 切 timedTokens 范围, 验证 words 切片对不对
+  console.log('[json3-parser] finalizeExternalSegment', {
+    id: segment.id,
+    segStartMs: startMs,
+    segEndMs: endMs,
+    segText: text.slice(0, 60),
+    wordCount: words.length,
+    firstWord: words[0]?.text,
+    lastWord: words[words.length - 1]?.text,
+  });
+
   return {
     id: typeof segment.id === 'string' && segment.id.trim().length > 0 ? segment.id.trim() : `cc-seg-${index}`,
-    startMs: typeof segment.startMs === 'number' ? segment.startMs : words[0].startMs,
-    endMs: typeof segment.endMs === 'number' ? segment.endMs : words[words.length - 1].endMs,
+    startMs,
+    endMs,
     speaker: 'narration',
     text,
     textZh: '',

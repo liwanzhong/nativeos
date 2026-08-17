@@ -19,6 +19,7 @@ import { resolveCloudReferencedVideoSource } from './cloud-video-playback';
 import {
   getUserVideoEntryById,
   listUserVideos,
+  getSubtitleSegmentedTargetUri,
   type UserVideoEntry,
 } from './user-videos';
 import {
@@ -943,23 +944,64 @@ async function buildUserVideoSceneDetail(entry: UserVideoEntry): Promise<VideoSc
 
   if (entry.subtitleUri) {
     try {
-      // 2026-08-15: 显示侧只用 *.json3 切分, 不传 englishSegments.
-      // 原因: 单词高亮需要 json3 的 word-level timing (每个 seg.tOffsetMs),
-      // segmented.json 只是 sentence-level 引用 (startToken/endToken 回查 json3).
-      // 如果 token 索引算错 / 跨段不连续, 回查就会拿到错的 words, 单词高亮直接废.
-      // 安全做法: 显示侧用 json3 直接切分 (groupTokensByEvent + 标点),
-      // 单词高亮永远用 json3 word timing. segmented.json 只给翻译侧用 (句子级 + 标点修过).
-      const [subtitleJson, subtitleZhJson] = await Promise.all([
+      // 2026-08-17 改回传 englishSegments: 跟桌面端 / 官方视频流程一致 —
+      // 显示切分 = segmented 切分 = 翻译切分, 编号对齐, 中文跟得上.
+      // 单词高亮跟 segmented 解耦, 独立从 json3 event + segs 按时间匹配.
+      const segmentedUri = getSubtitleSegmentedTargetUri(entry.id);
+      const [subtitleJson, subtitleZhJson, englishSegments] = await Promise.all([
         readImportedVideoPackJson<Record<string, unknown>>(entry.subtitleUri),
         entry.subtitleZhUri
           ? readImportedVideoPackJson<SubtitleTranslations>(entry.subtitleZhUri).catch(() => null)
           : Promise.resolve(null),
+        // 2026-08-17 trace: 读 segmented.json, 失败时回退 groupTokensByEvent (会跟 zh 编号错位)
+        readImportedVideoPackJson<EnglishSegmentedSubtitles>(segmentedUri)
+          .then((v) => {
+            console.log('[UserVideoSceneDetail] segmented.json loaded', {
+              id: entry.id,
+              segmentCount: v?.segments?.length ?? 0,
+              hasText: v?.segments?.[0]?.text?.slice(0, 40) ?? null,
+            });
+            return v;
+          })
+          .catch((e) => {
+            console.warn('[UserVideoSceneDetail] segmented.json MISSING/BROKEN, fallback to groupTokensByEvent', {
+              id: entry.id,
+              segmentedUri,
+              error: String(e),
+            });
+            return null;
+          }),
       ]);
       if (subtitleJson) {
-        segments = sanitizeUserVideoSegments(
-          parseJson3Subtitles(subtitleJson, subtitleZhJson ?? undefined),
-          summary.durationSeconds,
-        );
+        const useSegmented = englishSegments != null && Array.isArray(englishSegments.segments) && englishSegments.segments.length > 0;
+        const rawSegments = useSegmented
+          ? parseJson3Subtitles(subtitleJson, subtitleZhJson ?? undefined, englishSegments!)
+          : parseJson3Subtitles(subtitleJson, subtitleZhJson ?? undefined);
+        // 2026-08-17 trace: 切分结果 + 中文命中率 (sample 前 3 + 后 1)
+        const sample = rawSegments.slice(0, 3).map((s) => ({
+          id: s.id,
+          text: s.text?.slice(0, 30),
+          textZh: s.textZh?.slice(0, 30) ?? '(MISSING)',
+          wordsCount: s.words?.length ?? 0,
+        }));
+        const lastSeg = rawSegments[rawSegments.length - 1];
+        const lastSample = lastSeg ? {
+          id: lastSeg.id,
+          text: lastSeg.text?.slice(0, 30),
+          textZh: lastSeg.textZh?.slice(0, 30) ?? '(MISSING)',
+          wordsCount: lastSeg.words?.length ?? 0,
+        } : null;
+        const missCount = rawSegments.filter((s) => !s.textZh).length;
+        console.log('[UserVideoSceneDetail] subtitle parsed', {
+          id: entry.id,
+          path: useSegmented ? 'segmented' : 'groupTokensByEvent (fallback)',
+          segCount: rawSegments.length,
+          zhHit: rawSegments.length - missCount,
+          zhMiss: missCount,
+          sample,
+          lastSample,
+        });
+        segments = sanitizeUserVideoSegments(rawSegments, summary.durationSeconds);
       }
     } catch {
       segments = [];
