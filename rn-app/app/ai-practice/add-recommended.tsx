@@ -102,7 +102,13 @@ export default function AiPracticeAddRecommendedPage() {
     setIsLoading(true);
     try {
       const pickedIds = await listMyPickedSeriesIds();
-      const groups = await listVideoAiTopicGroups(userLevel, false, pickedIds);
+      // 2026-08-17: 未登录 / 没挑合集 → 传 null 给 listVideoAiTopicGroups 让它显示
+      // 所有 official scenes 的推荐话题 (legacy fallback). 登录且 pickedIds 非空 → 只看挑的.
+      // 区分: null = "显示全部 official", 空 Set = "登录但没挑 → 空", 非空 Set = "只看挑的"
+      const effectivePickedIds = pickedIds.size > 0 ? pickedIds : null;
+      console.log('[AiPracticeAddRecommended] picked series', { count: pickedIds.size, ids: Array.from(pickedIds), effective: effectivePickedIds == null ? 'all-official' : 'picked-only' });
+      const groups = await listVideoAiTopicGroups(userLevel, false, effectivePickedIds);
+      console.log('[AiPracticeAddRecommended] groups loaded', { count: groups.length, sample: groups.slice(0, 2).map(g => ({ sceneId: g.sceneId, sceneTitle: g.sceneTitle, topicCount: g.topicCount })) });
       setVideoGroups(groups);
     } catch (error) {
       console.warn('[AiPracticeAddRecommended] load failed', error);

@@ -22,7 +22,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'nativeos.db';
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 // Bump SCHEMA_VERSION + add a `migrateToV{N+1}` step to evolve the schema.
 
 let _db: any = null;
@@ -42,6 +42,7 @@ export async function initDatabase(): Promise<any> {
     await migrateToV3(db);
     await migrateToV4(db);
     await migrateToV5(db);
+    await migrateToV6(db);
     _db = db;
     return db;
   })();
@@ -243,6 +244,26 @@ async function createTables(db: any) {
     );
     CREATE INDEX IF NOT EXISTS idx_vsi_fetched
       ON video_scene_info(fetched_at DESC);
+
+    -- ── v6: 官方预生成 AI practice cards 缓存 ────────────────────────
+    -- Cache for Supabase official_video_ai_practice rows. Replaces
+    -- N-times-per-page round-trips with 1 batch fetch + local lookup.
+    -- Single source of truth for the recommend page; refreshed in bulk
+    -- when the cache expires or is invalidated.
+    CREATE TABLE IF NOT EXISTS official_ai_practice_card_cache (
+      id TEXT PRIMARY KEY,                 -- supabase row.id (UUID)
+      series_id TEXT NOT NULL,
+      episode_id TEXT NOT NULL,
+      card_index INTEGER NOT NULL,
+      card_json TEXT NOT NULL,             -- full SupabaseAiPracticeRow JSON
+      fetched_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_oai_cache_series
+      ON official_ai_practice_card_cache(series_id);
+    CREATE INDEX IF NOT EXISTS idx_oai_cache_episode
+      ON official_ai_practice_card_cache(episode_id);
+    CREATE INDEX IF NOT EXISTS idx_oai_cache_fetched
+      ON official_ai_practice_card_cache(fetched_at DESC);
   `);
 }
 
@@ -282,6 +303,7 @@ export async function resetDatabase(): Promise<void> {
   const db = await getDatabase();
 
   await db.execAsync(`
+    DROP TABLE IF EXISTS official_ai_practice_card_cache;
     DROP TABLE IF EXISTS video_ai_practice_state;
     DROP TABLE IF EXISTS video_ai_practice_card;
     DROP TABLE IF EXISTS chat_turns;
@@ -416,6 +438,22 @@ export async function migrateToV5(db: any): Promise<void> {
   await createFTSIndexes(db);
 
   await db.execAsync('PRAGMA user_version = 5');
+}
+
+/**
+ * v6: Add `official_ai_practice_card_cache` table — the local cache
+ * for the Supabase `official_video_ai_practice` rows. The recommend
+ * page reads from this table instead of issuing N round-trips.
+ */
+export async function migrateToV6(db: any): Promise<void> {
+  const versionRow: any = await db.getFirstAsync('PRAGMA user_version');
+  const currentVersion = typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
+  if (currentVersion >= 6) return;
+
+  await createTables(db);
+  await createFTSIndexes(db);
+
+  await db.execAsync('PRAGMA user_version = 6');
 }
 
 async function safeRemoveAsyncKey(key: string): Promise<void> {

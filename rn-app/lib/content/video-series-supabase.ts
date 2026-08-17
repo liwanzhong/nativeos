@@ -402,6 +402,39 @@ export async function listAiPracticeCardsFromSupabase(
   }
 }
 
+/**
+ * Bulk-fetch every published AI practice card, ordered by
+ * `(series_id, episode_id, card_index)`. Used by the local SQLite
+ * cache to refresh `official_ai_practice_card_cache` in one round-trip
+ * instead of N (one per episode). Returns `[]` on any error so the
+ * caller can keep serving stale cache.
+ */
+export async function listAllPublishedAiPracticeCardsFromSupabase(): Promise<SupabaseAiPracticeRow[]> {
+  try {
+    const { data, error } = await supabase
+      .from('official_video_ai_practice')
+      .select(
+        'id, series_id, episode_id, card_index, icon, category, level, title, description, description_zh, npc_emoji, npc_name, npc_status, npc_system_prompt, opening_line, opening_line_zh, environmental_cue, environmental_cue_en, user_initiates, task_contract, is_published',
+      )
+      .eq('is_published', true)
+      .order('series_id', { ascending: true })
+      .order('episode_id', { ascending: true })
+      .order('card_index', { ascending: true });
+    if (error) {
+      warnSupabaseTrace('listAllPublishedAiPracticeCardsFromSupabase failed', {
+        error: error.message,
+      });
+      return [];
+    }
+    return (data ?? []) as SupabaseAiPracticeRow[];
+  } catch (err) {
+    warnSupabaseTrace('listAllPublishedAiPracticeCardsFromSupabase threw', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+}
+
 // ── OSS series manifest (heavy file list still on OSS) ─────────────
 
 export interface RawSeriesManifest {

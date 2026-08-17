@@ -1,8 +1,20 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { ScenarioCard } from './scenario-generator';
+import { deriveTaskContract } from './conversation-runtime';
 import { getFeaturedVideoScenes, type VideoSceneDetail } from '../content/video-scenes';
 import { listOfficialScenesFromSupabase } from '../content/video-series-supabase-views';
+import {
+  listAiPracticeCardsFromSupabase,
+  listAllPublishedAiPracticeCardsFromSupabase,
+  type SupabaseAiPracticeRow,
+} from '../content/video-series-supabase';
 import { loadGeneratedVideoAiPracticeCards } from '../content/video-ai-practice';
+import {
+  getLatestAiCardsFetchedAt,
+  isAiCardsCacheStale,
+  loadCachedAiCardsBySeriesIds,
+  replaceAiCardsCache,
+} from '../database/official-ai-practice-cache';
 import {
   buildAiPracticeTopicSnapshot,
   buildAiPracticeTopicId,
@@ -122,16 +134,142 @@ export function buildRecommendedAiTopicItems(cards: ScenarioCard[], userLevel: s
   });
 }
 
+// 2026-08-17 改: 推荐话题入口之前每次进 page 都 N 次 round-trip, 加 SQLite 持久化缓存.
+// 三层 fallback: scene.aiPracticeCards (内存) → 本地 SQLite cache (持久化) → app-generated SQLite.
+// 缓存 TTL 24h, 过期或空时触发 listAllPublishedAiPracticeCardsFromSupabase 1 次批量拉 → 写盘.
+let _aiCardsRefreshPromise: Promise<void> | null = null;
+
+async function ensureAiCardsCacheFresh(): Promise<void> {
+  // 单飞: 同一时刻多个 caller 只允许 1 个 supabase 拉取
+  if (_aiCardsRefreshPromise) return _aiCardsRefreshPromise;
+  _aiCardsRefreshPromise = (async () => {
+    const latest = await getLatestAiCardsFetchedAt();
+    if (!isAiCardsCacheStale(latest)) {
+      console.log('[AiPracticeHub] ai cards cache fresh', {
+        latestFetchedAt: latest,
+        ageMs: latest == null ? null : Date.now() - latest,
+      });
+      return;
+    }
+    console.log('[AiPracticeHub] ai cards cache stale, refreshing', { latestFetchedAt: latest });
+    const rows = await listAllPublishedAiPracticeCardsFromSupabase();
+    if (rows.length === 0) {
+      console.warn('[AiPracticeHub] ai cards refresh returned 0 rows, keeping existing cache');
+      return;
+    }
+    await replaceAiCardsCache(rows);
+    console.log('[AiPracticeHub] ai cards cache replaced', { count: rows.length });
+  })().finally(() => {
+    _aiCardsRefreshPromise = null;
+  });
+  return _aiCardsRefreshPromise;
+}
+
 async function loadSceneAiCards(scene: VideoSceneDetail): Promise<ScenarioCard[]> {
   const builtInCards = filterValidAiCards(scene.aiPracticeCards);
   if (builtInCards.length > 0) {
     return builtInCards;
   }
-  return filterValidAiCards(await loadGeneratedVideoAiPracticeCards(scene.id));
+  if (typeof scene.groupId === 'string' && scene.groupId.length > 0) {
+    // 触发 (必要时) 批量拉取 + 写盘, 单飞
+    await ensureAiCardsCacheFresh();
+    const bySeries = await loadCachedAiCardsBySeriesIds([scene.groupId]);
+    const rows = bySeries.get(scene.groupId)?.filter((r) => r.episode_id === scene.id) ?? [];
+    if (rows.length > 0) {
+      const cards = filterValidAiCards(
+        rows.map((row, index) => mapSupabaseRowToScenarioCard(row, index, scene)),
+      );
+      if (cards.length > 0) {
+        console.log('[AiPracticeHub] loadSceneAiCards', { sceneId: scene.id, source: 'localCache', count: cards.length });
+        return cards;
+      }
+    }
+  }
+  const generated = filterValidAiCards(await loadGeneratedVideoAiPracticeCards(scene.id));
+  console.log('[AiPracticeHub] loadSceneAiCards', { sceneId: scene.id, source: 'generatedSqlite', count: generated.length });
+  return generated;
+}
+
+// 保留旧函数供 single-episode 兜底 (e.g. video detail 屏已经在用 loadSupabaseAiPracticeCards).
+async function loadSceneAiCardsFromSupabase(
+  seriesId: string,
+  episodeId: string,
+  scene: VideoSceneDetail,
+): Promise<ScenarioCard[]> {
+  const rows = await listAiPracticeCardsFromSupabase(seriesId, episodeId);
+  if (rows.length === 0) return [];
+  return rows
+    .map((row, index) => mapSupabaseRowToScenarioCard(row, index, scene))
+    .filter((card) => Boolean(card.title));
+}
+
+function mapSupabaseRowToScenarioCard(
+  row: SupabaseAiPracticeRow,
+  index: number,
+  scene: VideoSceneDetail,
+): ScenarioCard {
+  const userInitiates = row.user_initiates === true;
+  const openingLine = userInitiates ? undefined : (row.opening_line ?? undefined);
+  const environmentalCue = userInitiates ? (row.environmental_cue ?? undefined) : undefined;
+  const environmentalCueEn = userInitiates ? (row.environmental_cue_en ?? undefined) : undefined;
+  const title = row.title || `视频延展 ${index + 1}`;
+  const desc = row.description || `Continue the same topic after watching this video.`;
+  const fallbackCategory = scene.card?.category || '综合';
+  const fallbackLevel = scene.card?.level || 'B1';
+  return {
+    id: row.id || `${scene.id}__ai__${index + 1}`,
+    sourceType: 'ai_scenario',
+    icon: row.icon || '💬',
+    category: row.category || fallbackCategory,
+    level: row.level || fallbackLevel,
+    title,
+    desc,
+    descZh: row.description_zh ?? undefined,
+    npcEmoji: row.npc_emoji ?? undefined,
+    npcName: row.npc_name ?? undefined,
+    npcStatus: row.npc_status ?? undefined,
+    openingLine,
+    openingLineZh: userInitiates ? undefined : (row.opening_line_zh ?? undefined),
+    environmentalCue,
+    environmentalCueEn,
+    npcSystemPrompt: row.npc_system_prompt ?? undefined,
+    taskContract: deriveTaskContract(
+      {
+        title,
+        desc,
+        category: row.category || fallbackCategory,
+        npcName: row.npc_name ?? undefined,
+        npcStatus: row.npc_status ?? undefined,
+        npcSystemPrompt: row.npc_system_prompt ?? undefined,
+        openingLine,
+        environmentalCue,
+        environmentalCueEn,
+      },
+      (row.task_contract as Record<string, unknown> | null) ?? undefined,
+    ),
+    userInitiates,
+  };
 }
 
 function mapSceneSourceType(scene: VideoSceneDetail): AiPracticeTopicSourceType {
   return scene.contentOrigin === 'imported' ? 'imported_video' : 'official_video';
+}
+
+// 2026-08-17: 同步从 in-memory cache 读 cards (不走 async SQL). 调用方
+// listVideoAiTopicGroups 已经在前面 batch load 一次了.
+function readCardsForScene(
+  scene: VideoSceneDetail,
+  cacheBySeries: Map<string, SupabaseAiPracticeRow[]>,
+): ScenarioCard[] {
+  const builtIn = filterValidAiCards(scene.aiPracticeCards);
+  if (builtIn.length > 0) return builtIn;
+  const groupId = scene.groupId;
+  if (typeof groupId !== 'string' || groupId.length === 0) return [];
+  const rows = cacheBySeries.get(groupId)?.filter((r) => r.episode_id === scene.id) ?? [];
+  if (rows.length === 0) return [];
+  return filterValidAiCards(
+    rows.map((row, index) => mapSupabaseRowToScenarioCard(row, index, scene)),
+  );
 }
 
 function buildVideoTopicItem(scene: VideoSceneDetail, card: ScenarioCard, userLevel: string): VideoAiTopicItem {
@@ -166,6 +304,7 @@ export async function listVideoAiTopicGroups(
   forceRefresh: boolean = false,
   pickedSeriesIds: Set<string> | null = null,
 ): Promise<VideoAiTopicGroup[]> {
+  console.log('[AiPracticeHub] listVideoAiTopicGroups start', { userLevel, pickedCount: pickedSeriesIds?.size ?? 'null' });
   // Supabase first: same shape as the legacy OSS path (`getFeaturedVideoScenes`
   // returns the same `VideoSceneDetail[]` fields the rest of this
   // function reads — `id`, `contentOrigin`, `groupId`, `card.title`,
@@ -174,8 +313,10 @@ export async function listVideoAiTopicGroups(
   // migrated, or the per-series detail path is mid-migration for a
   // brand-new series).
   let scenes = await listOfficialScenesFromSupabase(forceRefresh);
+  console.log('[AiPracticeHub] official scenes from supabase', { count: scenes.length });
   if (scenes.length === 0) {
     scenes = await getFeaturedVideoScenes(forceRefresh);
+    console.log('[AiPracticeHub] fell back to OSS featured scenes', { count: scenes.length });
   }
 
   // After the videos-tab redesign ("我的跟练" entry), the AI practice
@@ -196,8 +337,20 @@ export async function listVideoAiTopicGroups(
         return pickedSeriesIds.has(scene.groupId as string);
       });
 
-  const groups: Array<VideoAiTopicGroup | null> = await Promise.all(filteredScenes.map(async (scene) => {
-    const cards = await loadSceneAiCards(scene);
+  // 2026-08-17 优化: 把 cards 的 SQLite 读从 N 次降到 1 次. 先 batch 读所有挑中 series 的
+  // 缓存, 再 in-memory filter. 缓存空/过期时由 ensureAiCardsCacheFresh 触发 1 次 supabase 拉.
+  await ensureAiCardsCacheFresh();
+  const cacheBySeries = await loadCachedAiCardsBySeriesIds(
+    Array.from(new Set(
+      filteredScenes
+        .map((s) => s.groupId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0),
+    )),
+  );
+  console.log('[AiPracticeHub] ai cards cache loaded', { seriesCount: cacheBySeries.size });
+
+  const groups: Array<VideoAiTopicGroup | null> = filteredScenes.map((scene) => {
+    const cards = readCardsForScene(scene, cacheBySeries);
     if (cards.length === 0) {
       return null;
     }
@@ -219,10 +372,11 @@ export async function listVideoAiTopicGroups(
       previewTopic: topics[0],
       topics,
     } satisfies VideoAiTopicGroup;
-  }));
+  });
   return groups
     .filter((item): item is VideoAiTopicGroup => Boolean(item))
     .sort((a, b) => b.previewTopic.fitScore - a.previewTopic.fitScore);
+    // (intentionally no console here; per-group loadSceneAiCards log already shows counts)
 }
 
 export function isTimestampInHistoryFilter(timestamp: number | undefined, filter: AiPracticeHistoryTimeFilter) {
