@@ -88,3 +88,35 @@ def load_oss_config() -> dict[str, str]:
 def save_oss_config(cfg: dict[str, str]) -> None:
     """把 oss 段写回 config.json。"""
     save_json_config({'oss': cfg})
+
+
+def load_proxy_config() -> dict[str, Any]:
+    """读 config.json 里的 proxy 段。
+
+    形如 ``{"enabled": True, "url": "http://127.0.0.1:7897"}``。
+    字段缺失时按"关闭"处理, 不会抛错。
+    """
+    data = load_json_config()
+    return data.get('proxy', {}) or {}
+
+
+def save_proxy_config(cfg: dict[str, Any]) -> None:
+    """把 proxy 段写回 config.json。"""
+    save_json_config({'proxy': cfg})
+
+
+def get_proxy_env(cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    """根据配置返回要注入到 subprocess env 的代理环境变量。
+
+    关闭或 URL 为空时返回空 dict, 不动调用方 env。
+    """
+    if cfg is None:
+        cfg = load_proxy_config()
+    if not cfg.get('enabled'):
+        return {}
+    url = (cfg.get('url') or '').strip()
+    if not url:
+        return {}
+    # 同时设 HTTP_PROXY / HTTPS_PROXY, 跟 yt-dlp / requests / urllib3 的预期一致
+    # 不动 NO_PROXY, 让用户已有配置继续生效
+    return {'HTTP_PROXY': url, 'HTTPS_PROXY': url}

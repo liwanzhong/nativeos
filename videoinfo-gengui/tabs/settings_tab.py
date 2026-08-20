@@ -19,6 +19,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -38,7 +40,13 @@ from services.supabase_client import HealthCheckResult, SupabaseAdmin
 from tabs.ai_client import load_ai_config, save_ai_config
 from tabs.asr_client import load_asr_config, save_asr_config
 from tabs.baidu_pan_settings import BaiduPanSettingsWidget
-from tabs.runtime_support import load_json_config, resolve_ffmpeg_dir, save_json_config
+from tabs.runtime_support import (
+    load_json_config,
+    load_proxy_config,
+    resolve_ffmpeg_dir,
+    save_json_config,
+    save_proxy_config,
+)
 
 
 def _mask_key(key: str) -> str:
@@ -107,6 +115,7 @@ class SettingsTab(QWidget):
         video_layout.addWidget(self._build_ffmpeg_group())
         video_layout.addStretch(1)
         self._sub_tabs.addTab(video_page, '视频处理')
+        self._sub_tabs.addTab(self._build_network_page(), '网络代理')
         self._sub_tabs.addTab(self._build_ai_page(), 'AI 大模型')
         self._sub_tabs.addTab(self._build_asr_page(), 'ASR')
         self._sub_tabs.addTab(self._build_oss_page(), 'OSS')
@@ -157,6 +166,163 @@ class SettingsTab(QWidget):
         self._refresh_ffmpeg_status()
 
         return box
+
+    # ── 网络代理 (仅 YouTube 下载用, 不影响 ASR / AI / OSS / Supabase) ──
+
+    def _build_network_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.addWidget(self._build_proxy_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_proxy_group(self) -> QGroupBox:
+        box = QGroupBox('YouTube 下载代理（仅下载 tab 使用, 不影响 ASR / AI / OSS / Supabase 等其他网络请求）')
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+
+        self._proxy_enabled_checkbox = QCheckBox('启用代理（影响所有下载 tab 启动的 yt-dlp 子进程）')
+        form.addRow('', self._proxy_enabled_checkbox)
+
+        self._proxy_url_input = QLineEdit()
+        self._proxy_url_input.setPlaceholderText('http://127.0.0.1:7897  (HTTP 代理, 不是 SOCKS)')
+        form.addRow('代理 URL:', self._proxy_url_input)
+
+        self._proxy_status_label = QLabel('—')
+        self._proxy_status_label.setWordWrap(True)
+        form.addRow('当前状态:', self._proxy_status_label)
+
+        # 按钮行
+        button_row = QHBoxLayout()
+        detect_btn = QPushButton('自动检测系统代理')
+        detect_btn.clicked.connect(self._auto_detect_proxy)
+        test_btn = QPushButton('测试代理')
+        test_btn.clicked.connect(self._test_proxy)
+        save_btn = QPushButton('保存')
+        save_btn.clicked.connect(self._save_proxy_settings)
+        clear_btn = QPushButton('关闭代理')
+        clear_btn.clicked.connect(self._clear_proxy)
+        button_row.addWidget(detect_btn)
+        button_row.addWidget(test_btn)
+        button_row.addWidget(save_btn)
+        button_row.addWidget(clear_btn)
+        button_row.addStretch(1)
+        form.addRow('', button_row)
+
+        # 失焦自动保存 / 切换立刻保存
+        self._proxy_url_input.editingFinished.connect(self._save_proxy_settings)
+        self._proxy_enabled_checkbox.stateChanged.connect(self._save_proxy_settings)
+
+        # 加载现有配置
+        cfg = load_proxy_config()
+        self._proxy_enabled_checkbox.setChecked(bool(cfg.get('enabled', False)))
+        self._proxy_url_input.setText(cfg.get('url', ''))
+        self._refresh_proxy_status()
+
+        return box
+
+    def _current_proxy_dict(self) -> dict[str, Any]:
+        return {
+            'enabled': self._proxy_enabled_checkbox.isChecked(),
+            'url': self._proxy_url_input.text().strip(),
+        }
+
+    def _save_proxy_settings(self) -> None:
+        save_proxy_config(self._current_proxy_dict())
+        self._refresh_proxy_status()
+
+    def _refresh_proxy_status(self) -> None:
+        cfg = self._current_proxy_dict()
+        if not cfg['enabled']:
+            self._proxy_status_label.setText('✗ 代理已关闭 — 下载 YouTube 会卡 YouTube 连接超时')
+        elif not cfg['url']:
+            self._proxy_status_label.setText('⚠ 已勾选但 URL 为空 — 实际不会启用')
+        else:
+            self._proxy_status_label.setText(f'✓ 已启用: {cfg["url"]}  (仅影响下载 tab 的 yt-dlp 子进程)')
+
+    def _clear_proxy(self) -> None:
+        self._proxy_enabled_checkbox.setChecked(False)
+        self._save_proxy_settings()
+        QMessageBox.information(self, '已关闭', '代理已关闭。下次启动 yt-dlp 时不会注入代理环境变量。')
+
+    def _auto_detect_proxy(self) -> None:
+        """从 Windows 注册表 Internet Settings 读 ProxyServer。
+
+        这是浏览器(Chrome / Edge / IE)使用的系统代理, 跟当前用户用的代理软件对齐。
+        """
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r'Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+            ) as key:
+                try:
+                    proxy_raw, _ = winreg.QueryValueEx(key, 'ProxyServer')
+                except FileNotFoundError:
+                    proxy_raw = ''
+        except Exception as exc:
+            self._proxy_status_label.setText(f'✗ 读取注册表失败: {exc}')
+            return
+
+        proxy_raw = (proxy_raw or '').strip()
+        if not proxy_raw:
+            self._proxy_status_label.setText('⚠ 系统注册表里没设代理 — 请手动填写 URL')
+            QMessageBox.information(
+                self,
+                '未找到',
+                'Windows 系统注册表里没设代理(可能用的是 TUN 模式 / 浏览器插件)。\n'
+                '请手动填写代理 URL, 例如 http://127.0.0.1:7897。',
+            )
+            return
+
+        # ProxyServer 形如 "127.0.0.1:7897" 或 "http=127.0.0.1:7897;https=..."
+        # 我们只关心 HTTP, 简化处理: 取第一个 host:port
+        url = proxy_raw
+        if '://' not in url:
+            url = f'http://{url}'
+        self._proxy_url_input.setText(url)
+        self._proxy_enabled_checkbox.setChecked(True)
+        self._save_proxy_settings()
+        self._proxy_status_label.setText(f'✓ 已自动填入并启用: {url}  (来源: 系统注册表)')
+
+    def _test_proxy(self) -> None:
+        cfg = self._current_proxy_dict()
+        if not cfg.get('enabled') or not cfg.get('url'):
+            QMessageBox.warning(self, '未配置', '请先勾选"启用代理"并填写代理 URL, 再测试。')
+            return
+        # 同步测一次, 最多 12s。 用 curl.exe, Windows 自带。
+        self._proxy_status_label.setText(f'正在测试 {cfg["url"]} ...')
+        QApplication.processEvents()
+        try:
+            import subprocess
+            result = subprocess.run(
+                [
+                    'curl.exe', '-x', cfg['url'],
+                    '-I', '-s', '-o', 'NUL',
+                    '-w', '%{http_code}',
+                    '--max-time', '10',
+                    'https://www.youtube.com',
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            code = (result.stdout or '').strip()
+            if result.returncode == 0 and code.startswith(('2', '3')):
+                self._proxy_status_label.setText(
+                    f'✓ 代理可用, 访问 YouTube 返回 HTTP {code}  (curl exit={result.returncode})'
+                )
+            else:
+                self._proxy_status_label.setText(
+                    f'✗ 代理异常: HTTP {code!r}, curl exit={result.returncode}  stderr={result.stderr.strip()[:120]}'
+                )
+        except subprocess.TimeoutExpired:
+            self._proxy_status_label.setText('✗ 代理测试超时 (10s 内未连通 YouTube)')
+        except FileNotFoundError:
+            self._proxy_status_label.setText('✗ 找不到 curl.exe, 没法测试 (Win10 1803+ 自带, 老的 Windows 不行)')
+        except Exception as exc:
+            self._proxy_status_label.setText(f'✗ 测试失败: {exc}')
 
     def _build_ai_page(self) -> QWidget:
         page = QWidget()

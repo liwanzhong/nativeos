@@ -1,148 +1,148 @@
 {
-  "expo": {
-    "name": "NativeOS",
-    "slug": "nativeos",
-    "version": "1.0.41",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "dark",
-    "scheme": "nativeos",
-    "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#000000"
-    },
-    "assetBundlePatterns": [
-      "**/*"
-    ],
-    "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.nativeos.app",
-      "infoPlist": {
-        "LSSupportsOpeningDocumentsInPlace": true,
-        "NSPhotoLibraryUsageDescription": "NativeOS 需要访问相册以上传头像。",
-        "NSCameraUsageDescription": "NativeOS 需要使用相机以拍摄头像。",
-        "CFBundleDocumentTypes": [
-          {
-            "CFBundleTypeName": "DeckMind Video Package",
-            "LSHandlerRank": "Owner",
-            "CFBundleTypeExtensions": [
-              "deckpack"
-            ],
-            "LSItemContentTypes": [
-              "public.data",
-              "public.zip-archive"
-            ]
-          }
-        ]
-      }
-    },
-    "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "gradleProperties": {
-        "org.gradle.java.home": "D:/Java/jdk-17.0.17+10"
-      },
-      "versionCode": 142,
-      "permissions": [
-        "REQUEST_INSTALL_PACKAGES",
-        "READ_MEDIA_IMAGES",
-        "READ_EXTERNAL_STORAGE"
-      ],
-      "package": "com.nativeos.app",
-      "intentFilters": [
-        {
-          "action": "VIEW",
-          "category": [
-            "BROWSABLE",
-            "DEFAULT"
-          ],
-          "data": [
-            {
-              "scheme": "file",
-              "pathPattern": ".*\\.deckpack"
-            },
-            {
-              "scheme": "content",
-              "pathPattern": ".*\\.deckpack"
-            },
-            {
-              "mimeType": "application/octet-stream"
-            },
-            {
-              "mimeType": "application/zip"
-            },
-            {
-              "mimeType": "application/x-zip-compressed"
-            }
-          ]
-        },
-        {
-          "action": "SEND",
-          "category": [
-            "DEFAULT"
-          ],
-          "data": [
-            {
-              "mimeType": "application/octet-stream"
-            },
-            {
-              "mimeType": "application/zip"
-            },
-            {
-              "mimeType": "application/x-zip-compressed"
-            }
-          ]
-        }
-      ]
-    },
-    "web": {
-      "favicon": "./assets/favicon.png",
-      "bundler": "metro"
-    },
-    "plugins": [
-      "./plugins/withLive2DFix",
-      "expo-router",
-      "expo-document-picker",
-      [
-        "expo-image-picker",
-        {
-          "photosPermission": "NativeOS 需要访问相册以上传头像。",
-          "cameraPermission": "NativeOS 需要使用相机以拍摄头像。"
-        }
-      ],
-      [
-        "expo-av",
-        {
-          "microphonePermission": "Allow NativeOS to access your microphone for pronunciation practice."
-        }
-      ],
-      "expo-sqlite",
-      "expo-audio",
-      [
-        "expo-video",
-        {
-          "supportsBackgroundPlayback": true
-        }
-      ],
-      [
-        "expo-sharing",
-        {
-          "android": {
-            "enabled": true,
-            "singleShareMimeTypes": [
-              "*/*"
-            ]
-          }
-        }
-      ],
-      "expo-font"
-    ],
-    "experiments": {
-      "typedRoutes": false
-    }
-  }
+    "expo":  {
+                 "name":  "NativeOS",
+                 "slug":  "nativeos",
+                 "version":  "1.0.42",
+                 "orientation":  "portrait",
+                 "icon":  "./assets/icon.png",
+                 "userInterfaceStyle":  "dark",
+                 "scheme":  "nativeos",
+                 "splash":  {
+                                "image":  "./assets/splash-icon.png",
+                                "resizeMode":  "contain",
+                                "backgroundColor":  "#000000"
+                            },
+                 "assetBundlePatterns":  [
+                                             "**/*"
+                                         ],
+                 "ios":  {
+                             "supportsTablet":  true,
+                             "bundleIdentifier":  "com.nativeos.app",
+                             "infoPlist":  {
+                                               "LSSupportsOpeningDocumentsInPlace":  true,
+                                               "NSPhotoLibraryUsageDescription":  "NativeOS 需要访问相册以上传头像。",
+                                               "NSCameraUsageDescription":  "NativeOS 需要使用相机以拍摄头像。",
+                                               "CFBundleDocumentTypes":  [
+                                                                             {
+                                                                                 "CFBundleTypeName":  "DeckMind Video Package",
+                                                                                 "LSHandlerRank":  "Owner",
+                                                                                 "CFBundleTypeExtensions":  [
+                                                                                                                "deckpack"
+                                                                                                            ],
+                                                                                 "LSItemContentTypes":  [
+                                                                                                            "public.data",
+                                                                                                            "public.zip-archive"
+                                                                                                        ]
+                                                                             }
+                                                                         ]
+                                           }
+                         },
+                 "android":  {
+                                 "adaptiveIcon":  {
+                                                      "foregroundImage":  "./assets/android-icon-foreground.png",
+                                                      "backgroundImage":  "./assets/android-icon-background.png",
+                                                      "monochromeImage":  "./assets/android-icon-monochrome.png"
+                                                  },
+                                 "gradleProperties":  {
+                                                          "org.gradle.java.home":  "D:/Java/jdk-17.0.17+10"
+                                                      },
+                                 "versionCode":  143,
+                                 "permissions":  [
+                                                     "REQUEST_INSTALL_PACKAGES",
+                                                     "READ_MEDIA_IMAGES",
+                                                     "READ_EXTERNAL_STORAGE"
+                                                 ],
+                                 "package":  "com.nativeos.app",
+                                 "intentFilters":  [
+                                                       {
+                                                           "action":  "VIEW",
+                                                           "category":  [
+                                                                            "BROWSABLE",
+                                                                            "DEFAULT"
+                                                                        ],
+                                                           "data":  [
+                                                                        {
+                                                                            "scheme":  "file",
+                                                                            "pathPattern":  ".*\\.deckpack"
+                                                                        },
+                                                                        {
+                                                                            "scheme":  "content",
+                                                                            "pathPattern":  ".*\\.deckpack"
+                                                                        },
+                                                                        {
+                                                                            "mimeType":  "application/octet-stream"
+                                                                        },
+                                                                        {
+                                                                            "mimeType":  "application/zip"
+                                                                        },
+                                                                        {
+                                                                            "mimeType":  "application/x-zip-compressed"
+                                                                        }
+                                                                    ]
+                                                       },
+                                                       {
+                                                           "action":  "SEND",
+                                                           "category":  [
+                                                                            "DEFAULT"
+                                                                        ],
+                                                           "data":  [
+                                                                        {
+                                                                            "mimeType":  "application/octet-stream"
+                                                                        },
+                                                                        {
+                                                                            "mimeType":  "application/zip"
+                                                                        },
+                                                                        {
+                                                                            "mimeType":  "application/x-zip-compressed"
+                                                                        }
+                                                                    ]
+                                                       }
+                                                   ]
+                             },
+                 "web":  {
+                             "favicon":  "./assets/favicon.png",
+                             "bundler":  "metro"
+                         },
+                 "plugins":  [
+                                 "./plugins/withLive2DFix",
+                                 "expo-router",
+                                 "expo-document-picker",
+                                 [
+                                     "expo-image-picker",
+                                     {
+                                         "photosPermission":  "NativeOS 需要访问相册以上传头像。",
+                                         "cameraPermission":  "NativeOS 需要使用相机以拍摄头像。"
+                                     }
+                                 ],
+                                 [
+                                     "expo-av",
+                                     {
+                                         "microphonePermission":  "Allow NativeOS to access your microphone for pronunciation practice."
+                                     }
+                                 ],
+                                 "expo-sqlite",
+                                 "expo-audio",
+                                 [
+                                     "expo-video",
+                                     {
+                                         "supportsBackgroundPlayback":  true
+                                     }
+                                 ],
+                                 [
+                                     "expo-sharing",
+                                     {
+                                         "android":  {
+                                                         "enabled":  true,
+                                                         "singleShareMimeTypes":  [
+                                                                                      "*/*"
+                                                                                  ]
+                                                     }
+                                     }
+                                 ],
+                                 "expo-font"
+                             ],
+                 "experiments":  {
+                                     "typedRoutes":  false
+                                 }
+             }
 }

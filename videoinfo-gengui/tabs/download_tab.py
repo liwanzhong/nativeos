@@ -26,11 +26,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from tabs.runtime_support import get_config_path, load_json_config, resolve_executable, resolve_ffmpeg_dir, save_json_config
+from tabs.runtime_support import get_config_path, get_proxy_env, load_json_config, load_proxy_config, resolve_executable, resolve_ffmpeg_dir, save_json_config
 
 DOWNLOAD_TYPES = [
     ('单个视频', 'single', '粘贴单个 YouTube 视频 URL，例: https://www.youtube.com/watch?v=xxx'),
@@ -41,7 +42,8 @@ DOWNLOAD_TYPES = [
 # ---- 高级选项 (用户可配置的 yt-dlp 参数) ----
 
 DEFAULT_DOWNLOAD_OPTIONS: dict[str, Any] = {
-    'video_format': 'h264_mp4',
+    'video_format': 'h264_720p',
+    'max_duration_minutes': 0,  # 0 = 不限制; >0 = 跳过超过 N 分钟的视频 (防 10+ 小时超长视频)
     'write_subs': True,
     'sub_langs': 'en',
     'sub_format': 'json3',
@@ -52,12 +54,22 @@ DEFAULT_DOWNLOAD_OPTIONS: dict[str, Any] = {
     'split_chapters': False,
 }
 
+# 学英语场景下, 画质要求不高, 文件大小 / 兼容性优先。
+# 4 个旧选项 (h264_mp4 / best / h265_av1 / original) 合并为 4 个新选项。
 VIDEO_FORMAT_OPTIONS = [
-    ('H.264 MP4 (兼容，默认)', 'h264_mp4'),
-    ('最佳画质 (按 yt-dlp 默认排序)', 'best'),
-    ('H.265/AV1 (体积小，MP4)', 'h265_av1'),
-    ('原始格式 (不转封装)', 'original'),
+    ('H.264 MP4 ≤720p (推荐, 学英语, 体积小)', 'h264_720p'),
+    ('H.264 MP4 ≤1080p (平板/TV 投屏, 更清晰)', 'h264_1080p'),
+    ('H.264 MP4 (原始分辨率, 最高画质)', 'h264_original'),
+    ('H.265/AV1 (体积最小, 2018+ 设备)', 'h265_av1'),
 ]
+
+# 老 config 里的 video_format 值 -> 新值的映射。
+# 加载时迁移, 不持久化老值, 避免 UI 下拉框空白。
+_LEGACY_VIDEO_FORMAT_MAP = {
+    'h264_mp4': 'h264_720p',
+    'best': 'h264_720p',
+    'original': 'h264_720p',
+}
 
 SUB_FORMAT_OPTIONS = [
     ('json3 (推荐)', 'json3'),
@@ -86,16 +98,33 @@ def build_yt_dlp_args(options: dict[str, Any]) -> list[str]:
     """
     args: list[str] = []
 
-    fmt = str(options.get('video_format', 'h264_mp4'))
-    if fmt == 'h264_mp4':
+    fmt = str(options.get('video_format', 'h264_720p'))
+    # 兜底: 任何未知值(老 config / 误传)都走 720p, 避免下到几 GB 的 4K webm
+    if fmt == 'h264_720p':
+        # 学英语默认: 720p H.264, 兼容性最好, 20 分钟 ≈ 80-120MB
+        args += ['-S', 'res:720,vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4']
+    elif fmt == 'h264_1080p':
+        # 平板 / TV 投屏, 1080p H.264, 20 分钟 ≈ 200-300MB
+        args += ['-S', 'res:1080,vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4']
+    elif fmt == 'h264_original':
+        # 原始分辨率: 限 H.264 编码 + MP4 容器, 不限 res
+        # 1080p 视频 → 200-300MB; 4K 视频 (YouTube 4K 通常是 VP9/AV1, 不是 H.264) → 实际仍选 1080p H.264
+        # 这样比 "best" 模式 (4K VP9 webm 几百 MB) 小很多, 又比 1080p 上限模式可能更清晰
         args += ['-S', 'vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4']
     elif fmt == 'h265_av1':
-        args += ['-S', 'vcodec:av1,ext:mp4:m4a', '--merge-output-format', 'mp4']
-    elif fmt == 'best':
-        pass  # 让 yt-dlp 按默认排序
-    elif fmt == 'original':
-        # 不加 -S 也不加 --merge-output-format，保留源格式
-        pass
+        # 体积最小: 限 1080p, 优先 AV1 编码, 20 分钟 ≈ 40-80MB
+        # 2018+ 设备 / Android 9+ / iOS 16+ 都支持 AV1 软解
+        args += ['-S', 'res:1080,vcodec:av1,ext:mp4:m4a', '--merge-output-format', 'mp4']
+    else:
+        # 兜底: 未知 video_format 值走 720p, 跟 DEFAULT 保持一致
+        args += ['-S', 'res:720,vcodec:h264,ext:mp4:m4a', '--merge-output-format', 'mp4']
+
+    # 跳过超长视频 (防 10+ 小时视频下到几 GB)
+    # 0 = 不限制, >0 = 跳过超过 N 分钟的视频
+    # 用 yt-dlp --match-filter (单个视频和播放列表都生效)
+    max_dur_min = int(options.get('max_duration_minutes', 0) or 0)
+    if max_dur_min > 0:
+        args += ['--match-filter', f'duration <= {max_dur_min * 60}']
 
     if bool(options.get('write_subs', True)):
         args += ['--write-subs', '--write-auto-subs']
@@ -679,10 +708,27 @@ class DownloadWorker(QThread):
         self.log_line.emit(f'[执行] {" ".join(cmd)}')
         self.log_line.emit(f'[目录] {self.download_dir}')
 
+        # 代理: 仅本次 yt-dlp 子进程注入, 不影响主进程和其他模块 (ASR/AI/OSS 不走代理)
+        proxy_cfg = load_proxy_config()
+        proxy_env = get_proxy_env(proxy_cfg)
+        if proxy_env:
+            self.log_line.emit(
+                f'[代理] 已为本次 yt-dlp 子进程注入代理: {proxy_env["HTTP_PROXY"]}'
+            )
+        elif proxy_cfg.get('enabled'):
+            self.log_line.emit('[代理] 代理已勾选但 URL 为空, 不会生效')
+        else:
+            self.log_line.emit('[代理] 代理未启用, yt-dlp 直连 YouTube (国内可能 timeout)')
+
+        # 注意: env 只用于这次 Popen, 不污染 os.environ
+        subprocess_env = os.environ.copy()
+        subprocess_env.update(proxy_env)
+
         try:
             self.process = subprocess.Popen(
                 cmd,
                 cwd=self.download_dir,
+                env=subprocess_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1259,6 +1305,19 @@ class DownloadTab(QWidget):
         self.split_chapters_checkbox = QCheckBox('按章节切分为独立视频（用 yt-dlp 原生 --split-chapters，章节子目录结构: chapters/<n> - <title>/）')
         adv_layout.addRow(self.split_chapters_checkbox)
 
+        # 跳过超长视频 (防 10+ 小时巨长视频占满硬盘)
+        # 0 = 不限制, >0 = 跳过超过 N 分钟的视频
+        self.max_duration_spin = QSpinBox()
+        self.max_duration_spin.setRange(0, 99999)
+        self.max_duration_spin.setSuffix(' 分钟 (0=不限制)')
+        self.max_duration_spin.setValue(DEFAULT_DOWNLOAD_OPTIONS['max_duration_minutes'])
+        self.max_duration_spin.setToolTip(
+            '播放列表里超过这个时长的视频会被自动跳过, 避免下到几 GB 的超长内容。\n'
+            '例如 60 = 跳过超过 1 小时的视频, 180 = 跳过超过 3 小时的。0 = 全部下。\n'
+            '走 yt-dlp --match-filter, 列表里的短视频不受影响。'
+        )
+        adv_layout.addRow('跳过超长视频', self.max_duration_spin)
+
         layout.addWidget(self.advanced_group)
 
         # 所有控件就位后再加载配置 (高级选项需要 format_combo 等)
@@ -1331,6 +1390,9 @@ class DownloadTab(QWidget):
 
         # 高级选项
         video_format = data.get('download_video_format', DEFAULT_DOWNLOAD_OPTIONS['video_format'])
+        # 老 config 值迁移 (h264_mp4 / best / original -> h264_720p)
+        if video_format in _LEGACY_VIDEO_FORMAT_MAP:
+            video_format = _LEGACY_VIDEO_FORMAT_MAP[video_format]
         for index in range(self.format_combo.count()):
             if self.format_combo.itemData(index) == video_format:
                 self.format_combo.setCurrentIndex(index)
@@ -1351,6 +1413,7 @@ class DownloadTab(QWidget):
                 break
         self.sponsorblock_categories_input.setText(str(data.get('download_sponsorblock_categories', DEFAULT_DOWNLOAD_OPTIONS['sponsorblock_categories'])))
         self.split_chapters_checkbox.setChecked(bool(data.get('download_split_chapters', DEFAULT_DOWNLOAD_OPTIONS['split_chapters'])))
+        self.max_duration_spin.setValue(int(data.get('download_max_duration_minutes', DEFAULT_DOWNLOAD_OPTIONS['max_duration_minutes'])))
 
     def _save_config(self, **updates: str) -> None:
         save_json_config(updates)
@@ -1359,6 +1422,7 @@ class DownloadTab(QWidget):
         """从 UI 读取当前高级选项。"""
         return {
             'video_format': str(self.format_combo.currentData() or DEFAULT_DOWNLOAD_OPTIONS['video_format']),
+            'max_duration_minutes': int(self.max_duration_spin.value()),
             'write_subs': self.write_subs_checkbox.isChecked(),
             'sub_langs': self.sub_langs_input.text().strip() or DEFAULT_DOWNLOAD_OPTIONS['sub_langs'],
             'sub_format': str(self.sub_format_combo.currentData() or DEFAULT_DOWNLOAD_OPTIONS['sub_format']),
@@ -1374,6 +1438,7 @@ class DownloadTab(QWidget):
         """转成 config.json 友好的字符串键值对。"""
         return {
             'download_video_format': str(options['video_format']),
+            'download_max_duration_minutes': str(int(options.get('max_duration_minutes', 0))),
             'download_write_subs': str(bool(options['write_subs'])),
             'download_sub_langs': str(options['sub_langs']),
             'download_sub_format': str(options['sub_format']),

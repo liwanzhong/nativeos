@@ -92,7 +92,10 @@ function Assert-ApkHasNoMp4 {
 }
 
 # ── Auto-increment patch version ──────────────────────────
-$appJson     = Get-Content $AppJsonPath -Raw | ConvertFrom-Json
+# Force UTF-8 (no BOM) for reading to avoid GBK misinterpretation on Chinese Windows.
+$utf8NoBomEncoding = New-Object System.Text.UTF8Encoding($false)
+$appJsonRaw  = [System.IO.File]::ReadAllText($AppJsonPath, $utf8NoBomEncoding)
+$appJson     = $appJsonRaw | ConvertFrom-Json
 $oldVersion  = $appJson.expo.version
 $oldVersionCode = [int]$appJson.expo.android.versionCode
 $parts       = $oldVersion -split '\.'  # e.g. "1.0.0" -> ["1","0","0"]
@@ -101,7 +104,9 @@ $newVersion  = "$($parts[0]).$($parts[1]).$newPatch"
 $newVersionCode = $oldVersionCode + 1
 $appJson.expo.version = $newVersion
 $appJson.expo.android.versionCode = $newVersionCode
-$appJson | ConvertTo-Json -Depth 10 | Set-Content $AppJsonPath -Encoding UTF8
+# Write back with UTF-8 No BOM to keep Chinese characters intact
+$newAppJsonContent = $appJson | ConvertTo-Json -Depth 10
+Write-Utf8NoBomFile -TargetPath $AppJsonPath -Content $newAppJsonContent
 Write-Host "  Version: $oldVersion  →  $newVersion" -ForegroundColor Cyan
 Write-Host "  VersionCode: $oldVersionCode  →  $newVersionCode" -ForegroundColor Cyan
 
