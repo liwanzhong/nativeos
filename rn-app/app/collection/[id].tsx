@@ -106,6 +106,8 @@ import {
   invalidateOfficialSceneBindingStatusCache,
 } from '../../lib/content/cloud-binding-summary';
 import { getConfiguredCloudProviders } from '../../lib/database/cloud-bindings';
+import { getVideoStats, type VideoStats } from '../../lib/stats';
+import { formatVideoRowStats } from '../../lib/stats/format';
 import {
   addAiTopicToHome,
   buildAiPracticeTopicSnapshot,
@@ -1095,6 +1097,8 @@ function VideoRow({
             </Text>
           ) : null}
         </View>
+        {/* ⭐ Stats 行:看 Xm · 听 Ym · 跟读 Z,无数据时显示"还没有数据" */}
+        <VideoRowStats videoId={video.id} />
         {(originChip || bindingChip || cacheChip || subtitleChip || aiTopicChip) ? (
           <View style={styles.videoChipRow}>
             {originChip}
@@ -1215,6 +1219,43 @@ function buildSubtitleChip(
       <Text style={[styles.subtitlePillText, styles.subtitlePillTextError]}>字幕失败</Text>
     </View>
   );
+}
+
+/**
+ * 视频行的 stats 展示组件
+ *
+ * - 异步从本地 stats 拉该视频的累计数据
+ * - 三段全 0 时显示"还没有数据"(灰字斜体)
+ * - 任一非 0 时显示"看 Xm · 听 Ym · 跟读 Z"
+ * - 用 useEffect + 取消标志防止 unmount 后 setState 警告
+ */
+function VideoRowStats({ videoId }: { videoId: string }) {
+  const [stats, setStats] = useState<VideoStats | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve(getVideoStats(videoId)).then((s) => {
+      if (cancelled) return;
+      setStats(s);
+      setLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [videoId]);
+
+  if (!loaded) {
+    // 还在加载 — 暂时不显示,避免布局抖动
+    return null;
+  }
+
+  const text = stats ? formatVideoRowStats(stats) : null;
+  if (!text) {
+    // ⭐ 没数据:始终显示"还没有数据",让用户知道这一行有 stats 槽位
+    return <Text style={styles.videoStatsEmpty}>还没有数据</Text>;
+  }
+  return <Text style={styles.videoStatsText}>{text}</Text>;
 }
 
 /**
@@ -1627,6 +1668,18 @@ const styles = StyleSheet.create({
   videoMetaText: {
     fontSize: 12,
     color: colors.text.secondary,
+  },
+  // ⭐ Stats 行样式:11px 灰字,扁平一行
+  videoStatsText: {
+    fontSize: 11,
+    color: colors.text.secondary,
+    marginTop: 2,
+  },
+  videoStatsEmpty: {
+    fontSize: 11,
+    color: '#a8a8a0',
+    marginTop: 2,
+    fontStyle: 'italic',
   },
 
   // ── Status chip row (origin / cache / subtitle / AI topic) ──

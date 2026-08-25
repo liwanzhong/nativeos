@@ -44,6 +44,7 @@ import {
   type VideoAiTopicItem,
 } from '../../lib/ai/ai-practice-hub';
 import { listMyPickedSeriesIds } from '../../lib/content/user-picked-series';
+import { loadCachedAiCardsSeriesIds } from '../../lib/database/official-ai-practice-cache';
 
 type FitFilter = AiPracticeFitBand | 'A1' | 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 
@@ -107,13 +108,25 @@ export default function AiPracticeAddRecommendedPage() {
     setIsLoading(true);
     try {
       const pickedIds = await listMyPickedSeriesIds();
-      // 2026-08-17: 未登录 / 没挑合集 → 传 null 给 listVideoAiTopicGroups 让它显示
-      // 所有 official scenes 的推荐话题 (legacy fallback). 登录且 pickedIds 非空 → 只看挑的.
-      // 区分: null = "显示全部 official", 空 Set = "登录但没挑 → 空", 非空 Set = "只看挑的"
-      const effectivePickedIds = pickedIds.size > 0 ? pickedIds : null;
-      console.log('[AiPracticeAddRecommended] picked series', { count: pickedIds.size, ids: Array.from(pickedIds), effective: effectivePickedIds == null ? 'all-official' : 'picked-only' });
+      // 2026-08-25: 强制用 cache 里有 cards 数据的全集当 default picked.
+      // 原因: official_video_ai_practice 表里目前只 published 了 4 个 series 的 cards,
+      // 拿全部 414 scenes 过滤会让 410 scene 拿不到 cards → 全部空. 用 cache 全集保证
+      // 登录 / 未登录 / 退出登录但本地残留 picked 都能正常加载. 真正"看我挑的"功能
+      // 需要等 supabase 表里补齐 9 series 的 cards 之后再说.
+      const cachedSeriesIds = await loadCachedAiCardsSeriesIds();
+      const effectivePickedIds = cachedSeriesIds.size > 0 ? cachedSeriesIds : null;
+      console.log('[AiPracticeAddRecommended] loadRecommended', {
+        pickedIdsSize: pickedIds.size,
+        cachedSeriesSize: cachedSeriesIds.size,
+        effectivePicked: effectivePickedIds == null ? 'all-official' : `cached(${effectivePickedIds.size})`,
+        userLevel,
+      });
       const groups = await listVideoAiTopicGroups(userLevel, false, effectivePickedIds);
-      console.log('[AiPracticeAddRecommended] groups loaded', { count: groups.length, sample: groups.slice(0, 2).map(g => ({ sceneId: g.sceneId, sceneTitle: g.sceneTitle, topicCount: g.topicCount })) });
+      console.log('[AiPracticeAddRecommended] groups loaded', {
+        count: groups.length,
+        effectivePicked: effectivePickedIds == null ? 'all-official' : `cached(${effectivePickedIds.size})`,
+        sample: groups.slice(0, 2).map(g => ({ sceneId: g.sceneId, sceneTitle: g.sceneTitle, topicCount: g.topicCount })),
+      });
       setVideoGroups(groups);
       // Reset pagination when data changes
       setDisplayedCount(20);

@@ -4,7 +4,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import Constants from 'expo-constants';
 import { useAuth } from '../../lib/auth';
 import { supabase } from '../../lib/supabase';
-import { BrainCircuit, Flag, ChevronRight, X, Check, Volume2, Trash2, Cloud, Link2, MessageCircleMore, Settings as SettingsIcon, Crown, Sparkles, KeyRound } from 'lucide-react-native';
+import { BrainCircuit, Flag, ChevronRight, X, Check, Volume2, Trash2, Cloud, Link2, MessageCircleMore, Settings as SettingsIcon, Crown, Sparkles, KeyRound, BarChart3 } from 'lucide-react-native';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../constants/theme';
 import { sectionStyles } from '../../constants/sectionStyles';
 import { AndroidAppUpdateModal } from '../../components/android-app-update-modal';
@@ -718,6 +718,20 @@ const ProfileScreen = () => {
 
         {/* ─── Settings List ─── */}
         <View style={styles.settingsList}>
+          {/* ⭐ Stats 统计入口 — 第一个,跟"设置"同款样式 */}
+          <Pressable
+            style={[styles.settingsItem, styles.settingsItemBorder]}
+            onPress={() => router.push('/stats')}
+          >
+            <View style={[styles.settingsIconBox, { backgroundColor: 'rgba(47,111,94,0.10)' }]}>
+              <BarChart3 size={20} color="#2f6f5e" />
+            </View>
+            <View style={styles.settingsText}>
+              <Text style={styles.settingsTitle}>统计</Text>
+              <Text style={styles.settingsDesc}>你最近看了多少、听了多少、跟读了多少</Text>
+            </View>
+            <ChevronRight size={18} color={colors.text.tertiary} />
+          </Pressable>
           <Pressable
             style={[styles.settingsItem, styles.settingsItemBorder]}
             onPress={() => router.push('/settings')}

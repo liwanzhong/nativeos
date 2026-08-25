@@ -21,6 +21,7 @@ import { AuthProvider } from '../lib/auth';
 import { QuotaBlockedDialog } from '../components/quota/QuotaBlockedDialog';
 import { installQuotaBackgroundSync } from '../lib/quota';
 import { installLogStore } from '../lib/diagnostics/logStore';
+import { installStatsSync, installAppStateFlushListener } from '../lib/stats';
 
 // Install the in-memory console ring buffer as early as possible so
 // even init-phase errors (DB migration, notifications, app update
@@ -81,12 +82,15 @@ export default function RootLayout() {
     
     initializeApp();
     installQuotaBackgroundSync();
+    // ⭐ Stats 数据同步:启动时拉一次云端,AppState 切后台时 flush+push
+    installStatsSync();
+    const removeFlushListener = installAppStateFlushListener();
 
-    // Cleanup
     return () => {
       if (responseListener.current) {
         responseListener.current.remove();
       }
+      removeFlushListener();
     };
   }, []);
 

@@ -13,6 +13,7 @@ import {
   getLatestAiCardsFetchedAt,
   isAiCardsCacheStale,
   loadCachedAiCardsBySeriesIds,
+  loadCachedAiCardsSeriesIds,
   replaceAiCardsCache,
 } from '../database/official-ai-practice-cache';
 import {
@@ -152,9 +153,17 @@ async function ensureAiCardsCacheFresh(): Promise<void> {
       return;
     }
     console.log('[AiPracticeHub] ai cards cache stale, refreshing', { latestFetchedAt: latest });
-    const rows = await listAllPublishedAiPracticeCardsFromSupabase();
+    // 2026-08-25: retry once if first fetch returns 0 rows (网络抖动 / supabase
+    // 端临时 schema 问题都不该把 cache 冻死). 已确认 RLS 允许 anon 读
+    // published,0 rows 一定是临时问题.
+    let rows = await listAllPublishedAiPracticeCardsFromSupabase();
     if (rows.length === 0) {
-      console.warn('[AiPracticeHub] ai cards refresh returned 0 rows, keeping existing cache');
+      console.warn('[AiPracticeHub] ai cards refresh returned 0 rows, retrying in 1.5s');
+      await new Promise<void>((r) => setTimeout(r, 1500));
+      rows = await listAllPublishedAiPracticeCardsFromSupabase();
+    }
+    if (rows.length === 0) {
+      console.warn('[AiPracticeHub] ai cards refresh returned 0 rows after retry, keeping existing cache');
       return;
     }
     await replaceAiCardsCache(rows);
@@ -330,12 +339,35 @@ export async function listVideoAiTopicGroups(
   const isOfficial = (scene: VideoSceneDetail) =>
     scene.contentOrigin !== 'imported' && typeof scene.groupId === 'string' && scene.groupId.length > 0;
 
-  const filteredScenes = pickedSeriesIds === null
+  // 2026-08-25: 未登录 / 没挑合集 (pickedSeriesIds === null) 场景下, 直接返回
+  // 全部 official scenes 会让 filteredScenes 包含 414 个 scene, 但 cards cache
+  // 经常只覆盖 4 个 series (supabase 表里就只 published 了 4 series 的 cards).
+  // 为了让未登录态下也能加载, 这里降级: 拿 cache 里所有有 cards 的 series id
+  // 当默认 picked, 保证 "看到的 scene 都有 cards". 登录态下用户已挑则不受影响.
+  let effectivePickedIds = pickedSeriesIds;
+  if (pickedSeriesIds === null) {
+    // 先确保 cache fresh (但不阻塞 — 用 await, 反正下游 loadCachedAiCardsBySeriesIds 也要)
+    await ensureAiCardsCacheFresh();
+    const cachedSeries = await loadCachedAiCardsSeriesIds();
+    if (cachedSeries.size > 0) {
+      effectivePickedIds = cachedSeries;
+      console.log('[AiPracticeHub] null picked → fallback to cached series', { count: cachedSeries.size });
+    }
+  }
+
+  const filteredScenes = effectivePickedIds === null
     ? scenes
     : scenes.filter((scene) => {
         if (!isOfficial(scene)) return false;
-        return pickedSeriesIds.has(scene.groupId as string);
+        return (effectivePickedIds as Set<string>).has(scene.groupId as string);
       });
+  console.log('[AiPracticeHub] filteredScenes', {
+    totalScenes: scenes.length,
+    filteredCount: filteredScenes.length,
+    pickedSeriesIdsSize: effectivePickedIds?.size ?? 'null',
+    isNullPicked: pickedSeriesIds === null,
+    isFallbackToCache: pickedSeriesIds === null && effectivePickedIds !== null,
+  });
 
   // 2026-08-17 优化: 把 cards 的 SQLite 读从 N 次降到 1 次. 先 batch 读所有挑中 series 的
   // 缓存, 再 in-memory filter. 缓存空/过期时由 ensureAiCardsCacheFresh 触发 1 次 supabase 拉.
@@ -354,6 +386,14 @@ export async function listVideoAiTopicGroups(
     if (cards.length === 0) {
       return null;
     }
+    // 调试: 打印每个 scene 的 cards 数, 定位为什么 groups 是 0
+    console.log('[AiPracticeHub] scene cards', {
+      sceneId: scene.id,
+      sceneTitle: scene.card.title,
+      groupId: scene.groupId,
+      cardCount: cards.length,
+      cacheHit: cards.length > 0 && scene.aiPracticeCards.length === 0,
+    });
     const topics = cards.map((card) => buildVideoTopicItem(scene, card, userLevel))
       .sort((a, b) => b.fitScore - a.fitScore);
     if (topics.length === 0) {
@@ -373,8 +413,14 @@ export async function listVideoAiTopicGroups(
       topics,
     } satisfies VideoAiTopicGroup;
   });
-  return groups
-    .filter((item): item is VideoAiTopicGroup => Boolean(item))
+  const validGroups = groups.filter((item): item is VideoAiTopicGroup => Boolean(item));
+  console.log('[AiPracticeHub] groups final', {
+    filteredScenesCount: filteredScenes.length,
+    rawGroupsCount: groups.length,
+    nullGroupsCount: groups.length - validGroups.length,
+    validGroupsCount: validGroups.length,
+  });
+  return validGroups
     .sort((a, b) => b.previewTopic.fitScore - a.previewTopic.fitScore);
     // (intentionally no console here; per-group loadSceneAiCards log already shows counts)
 }

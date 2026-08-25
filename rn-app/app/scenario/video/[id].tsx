@@ -1,9 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Alert, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ScrollView, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem } from 'react-native';
+import { Alert, AppState, type AppStateStatus, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ScrollView, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem } from 'react-native';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import * as Haptics from 'expo-haptics';
-import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RefreshCw, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical } from 'lucide-react-native';
+import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RefreshCw, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical, BarChart3 } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../../constants/theme';
 import { getVideoSceneById, getVideoSceneSummaryById, invalidateVideoSceneCaches, type VideoSceneDetail, type VideoSceneSegment, type WordTiming } from '../../../lib/content/video-scenes';
@@ -38,6 +38,8 @@ import {
   getDueCardCountByVideo,
 } from '../../../lib/database';
 import { prewarmDictionaryDb } from '../../../lib/dictionary/db';
+import { recordPlayback, recordShadowing, getVideoStats, readInMemoryVideoStats, forceFlush, type VideoStats } from '../../../lib/stats';
+import { formatLong } from '../../../lib/stats/format';
 import { lookupWord as queryDictionaryWord } from '../../../lib/dictionary/query';
 import { deleteUserVideoEntry, setUserVideoCollection, triggerCloudVideoSubtitleGeneration, triggerUserVideoSubtitleGeneration } from '../../../lib/content/user-videos';
 import { encodeUserCollectionId, listUserCollections } from '../../../lib/content/user-collections';
@@ -506,6 +508,71 @@ function VideoLearningPlayer({
   const [isVideoReady, setIsVideoReady] = useState(false);
   const [hasStartedPlaybackOnce, setHasStartedPlaybackOnce] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+
+  // ── Stats 数据探针状态 ─────────────────────────────
+  // 视频级累计数据,扁平展示在视频信息区域
+  const [videoStats, setVideoStats] = useState<VideoStats | null>(null);
+  // ⭐ Stats toast 显示状态
+  const [statsToastVisible, setStatsToastVisible] = useState(false);
+  // 上次累加时的 currentTime(ms),用于计算本次 tick 的 delta
+  const lastPositionMsRef = useRef<number>(0);
+  // 当前 AppState(在 timeUpdate 触发瞬间读这个 ref,避免闭包陷阱)
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  // 跟读按下时间戳,onPressOut 时算 duration 决定是否计入
+  const shadowingPressInAtRef = useRef<number>(0);
+  // ⭐ Stats toast 定时器 ref(3 秒自动关闭)
+  const statsToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ⭐ 显示 stats toast:显示 + 3 秒后自动关闭(Android 上用 ToastAndroid 弹系统 toast)
+  const handleShowStatsToast = useCallback(() => {
+    // ⭐ 关键:用 inMemory 同步值,不用 React state
+    // React state 可能滞后于 inMemory 累加(乐观更新只更新 state 一次)
+    const inMem = readInMemoryVideoStats(scene.id);
+    const stats = inMem ?? videoStats ?? {
+      videoId: scene.id,
+      foregroundMs: 0,
+      backgroundMs: 0,
+      shadowingCount: 0,
+      updatedAt: Date.now(),
+    };
+    const text = `看视频 ${formatLong(stats.foregroundMs)} · 听音频 ${formatLong(stats.backgroundMs)} · 跟读 ${stats.shadowingCount} 次`;
+    if (Platform.OS === 'android') {
+      // Android:用系统 Toast(轻量,无障碍好,不会遮挡内容)
+      ToastAndroid.show(text, ToastAndroid.LONG);
+    } else {
+      // iOS / Web:用 in-app 简易 toast(Modal + 3 秒自动关)
+      setStatsToastVisible(true);
+      if (statsToastTimerRef.current) {
+        clearTimeout(statsToastTimerRef.current);
+      }
+      statsToastTimerRef.current = setTimeout(() => {
+        setStatsToastVisible(false);
+        statsToastTimerRef.current = null;
+      }, 3000);
+    }
+  }, [videoStats, scene.id]);
+
+  // 加载初始 stats + 监听 AppState 变化
+  useEffect(() => {
+    let cancelled = false;
+    getVideoStats(scene.id).then((dbStats) => {
+      if (cancelled) return;
+      // ⭐ 关键:inMemory 永远比 DB 新(它是累加器),用它优先
+      const inMem = readInMemoryVideoStats(scene.id);
+      const merged: VideoStats | null = inMem ?? dbStats ?? null;
+      setVideoStats(merged);
+    });
+    const sub = AppState.addEventListener('change', (next) => {
+      appStateRef.current = next;
+    });
+    return () => {
+      cancelled = true;
+      sub.remove();
+      // ⭐ 卸载时立即 flush buffer,防止用户按返回退出时丢数据
+      void forceFlush();
+    };
+  }, [scene.id]);
+
   const [durationSeconds, setDurationSeconds] = useState(scene.durationSeconds);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [providerStates, setProviderStates] = useState(scene.availableCloudProviders || []);
@@ -1349,6 +1416,39 @@ function VideoLearningPlayer({
         }
       }
 
+      // ⭐ Stats 累加播放时长
+      // 正常 timeUpdate tick:delta 在 50-200ms 之间(原生 ~10Hz)
+      // seek 完成后第一次 tick:delta 可能很大(旧位置 → 新位置),被 2000 阈值拦截
+      // 用户暂停后恢复:lastPositionMsRef 已经被旧 tick 更新,delta 正常
+      if (player.playing) {
+        const currMs = Math.floor(nextCurrentTime * 1000);
+        const prevMs = lastPositionMsRef.current;
+        const delta = currMs - prevMs;
+        if (delta > 0 && delta < 2000) {
+          const isActive = appStateRef.current === 'active';
+          recordPlayback(scene.id, delta, isActive);
+          // ⭐ 关键:从 inMemory 同步读最新值作为 base,避免前 N 次 timeUpdate
+          // 累加到 default {0,0} 而忽略 inMemory 已累积的数据
+          setVideoStats((prev) => {
+            const inMem = readInMemoryVideoStats(scene.id);
+            const base: VideoStats = prev ?? inMem ?? {
+              videoId: scene.id,
+              foregroundMs: 0,
+              backgroundMs: 0,
+              shadowingCount: 0,
+              updatedAt: Date.now(),
+            };
+            return {
+              ...base,
+              foregroundMs: base.foregroundMs + (isActive ? delta : 0),
+              backgroundMs: base.backgroundMs + (isActive ? 0 : delta),
+              updatedAt: Date.now(),
+            };
+          });
+        }
+        lastPositionMsRef.current = currMs;
+      }
+
       const shadowingReplayRange = shadowingReplayRangeRef.current;
       const shadowingReplayEnd = shadowingReplayRange?.endSeconds ?? null;
       const effectiveEnd = shadowingReplayEnd ?? (repeatSentence ? (lockedRepeatRange?.endSeconds ?? activeEndSeconds) : effectiveClipEndSeconds);
@@ -2006,6 +2106,8 @@ function VideoLearningPlayer({
 
   const handleShadowingPressIn = useCallback(async () => {
     if (isShadowingRecording || isShadowingProcessing || !shadowingSegment?.text) return;
+    // ⭐ Stats:记录按下时间戳,onPressOut 算 duration 判定是否 ≥500ms
+    shadowingPressInAtRef.current = Date.now();
     // Quota: charge 1 ASR unit before opening the mic (mirrors the
     // immersive-page shadowing flow). BYOK users bypass the NativeOS
     // counter — they're paying for tokens directly.
@@ -2041,6 +2143,11 @@ function VideoLearningPlayer({
     const handle = shadowingAsrRef.current;
     shadowingAsrRef.current = null;
     if (!handle || !shadowingSegment?.text) return;
+
+    // ⭐ Stats:500ms 判定 — 误触不计次数,但 ASR/diff 仍走完
+    const shadowingDurationMs = Date.now() - shadowingPressInAtRef.current;
+    const shadowingCounts = shadowingDurationMs >= 500;
+
     setIsShadowingProcessing(true);
     const result = await handle.stop();
     const transcript = result.text.trim();
@@ -2053,6 +2160,22 @@ function VideoLearningPlayer({
     setShadowingDiffResult(diff);
     setIsShadowingProcessing(false);
     Haptics.notificationAsync(diff.pass ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Warning).catch(() => {});
+
+    // ⭐ Stats:累加跟读次数(不依赖 diff 结果,只看用户是否真的按了)
+    if (shadowingCounts) {
+      recordShadowing(scene.id);
+      setVideoStats((prev) => {
+        const inMem = readInMemoryVideoStats(scene.id);
+        const base: VideoStats = prev ?? inMem ?? {
+          videoId: scene.id,
+          foregroundMs: 0,
+          backgroundMs: 0,
+          shadowingCount: 0,
+          updatedAt: Date.now(),
+        };
+        return { ...base, shadowingCount: base.shadowingCount + 1, updatedAt: Date.now() };
+      });
+    }
   }, [isShadowingRecording, shadowingSegment?.text]);
 
   const revealFullscreenHud = useCallback(() => {
@@ -2764,6 +2887,15 @@ function VideoLearningPlayer({
           leftLabel={`${currentLabel} / ${durationLabel}`}
           rightAccessory={(
             <View style={styles.playerPanelAccessoryRow}>
+              {/* ⭐ Stats 按钮 — 在最大化按钮左边,点击弹 toast */}
+              <Pressable
+                style={styles.playerPanelIconBtn}
+                onPress={handleShowStatsToast}
+                hitSlop={6}
+                accessibilityLabel="查看统计"
+              >
+                <BarChart3 size={18} color="#475569" />
+              </Pressable>
               <Pressable style={styles.playerPanelIconBtn} onPress={handleToggleFullscreen}>
                 <Maximize size={18} color="#475569" />
               </Pressable>
@@ -2794,6 +2926,22 @@ function VideoLearningPlayer({
           </Pressable>
         </View>
       </View>
+
+      {/* ⭐ Stats toast (iOS / Web)— Android 用系统 ToastAndroid,这里只渲染 iOS/Web fallback */}
+      {statsToastVisible && Platform.OS !== 'android' ? (
+        <View style={styles.statsToastWrap} pointerEvents="none">
+          <View style={styles.statsToast}>
+            <Text style={styles.statsToastText}>
+              {(() => {
+                // ⭐ 用 inMemory 同步值,不用 React state(避免显示滞后)
+                const inMem = readInMemoryVideoStats(scene.id);
+                const s = inMem ?? videoStats ?? { foregroundMs: 0, backgroundMs: 0, shadowingCount: 0 };
+                return `看视频 ${formatLong(s.foregroundMs)} · 听音频 ${formatLong(s.backgroundMs)} · 跟读 ${s.shadowingCount} 次`;
+              })()}
+            </Text>
+          </View>
+        </View>
+      ) : null}
 
       {lookupWord ? (
         <DictionaryLookupSheet
@@ -4651,6 +4799,27 @@ const styles = StyleSheet.create({
     color: '#DC2626',
     fontSize: fontSize.xs,
     lineHeight: 18,
+  },
+  // ⭐ Stats toast 样式 (iOS / Web fallback,Android 用系统 ToastAndroid)
+  statsToastWrap: {
+    position: 'absolute',
+    bottom: 100, // 浮在控制面板上方,不被遮挡
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 1000,
+  },
+  statsToast: {
+    backgroundColor: 'rgba(20, 23, 30, 0.92)', // 接近黑的高对比度
+    borderRadius: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    maxWidth: '90%',
+  },
+  statsToastText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    lineHeight: 1.4,
   },
   subtitlePanelTabWrap: {
     marginBottom: spacing.xs,

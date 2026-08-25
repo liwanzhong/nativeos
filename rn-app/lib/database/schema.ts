@@ -20,6 +20,9 @@
  *       `id`-only PK was causing cross-series INSERT OR REPLACE to
  *       silently overwrite the earlier series' rows. The composite
  *       key keeps each (series, id) pair as a distinct row.
+ *   v8: +2 tables for video playback/shadowing stats (video_stats,
+ *       daily_stats). 本地优先,App 不登录也能用。Supabase 同步
+ *       是可选的,只补全本地没有的记录,绝不覆盖。
  *
  * Native-only. The web platform has no real SQLite (see
  * expo-sqlite-mock.ts); the migration code runs unconditionally and is
@@ -30,7 +33,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SQLite from 'expo-sqlite';
 
 const DB_NAME = 'nativeos.db';
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 // Bump SCHEMA_VERSION + add a `migrateToV{N+1}` step to evolve the schema.
 
 let _db: any = null;
@@ -52,6 +55,7 @@ export async function initDatabase(): Promise<any> {
     await migrateToV5(db);
     await migrateToV6(db);
     await migrateToV7(db);
+    await migrateToV8(db);
     _db = db;
     return db;
   })();
@@ -924,5 +928,40 @@ async function migrateAiPracticeUserMeta(db: any): Promise<void> {
     console.warn('[migrateToV4] ai_practice_user_meta migration failed:', e);
     try { await db.execAsync('ROLLBACK'); } catch { /* ignore */ }
   }
+}
+
+/**
+ * 2026-08-25: 视频跟读数据统计
+ *
+ * 本地优先,App 不登录也能用。Supabase 同步是可选的(只补全本地没有的
+ * 记录,绝不覆盖)。不存 user_id — 多账号切换时由 sync 层清表 + 拉取。
+ */
+export async function migrateToV8(db: any): Promise<void> {
+  const versionRow: any = await db.getFirstAsync('PRAGMA user_version');
+  const currentVersion = typeof versionRow?.user_version === 'number' ? versionRow.user_version : 0;
+  if (currentVersion >= 8) return;
+
+  await db.execAsync(`
+    -- 单视频累计:看视频 / 听音频 / 跟读次数
+    -- 单一 PRIMARY KEY (video_id):本地只有一个 user 的数据
+    CREATE TABLE IF NOT EXISTS video_stats (
+      video_id        TEXT PRIMARY KEY,
+      foreground_ms   INTEGER NOT NULL DEFAULT 0,
+      background_ms   INTEGER NOT NULL DEFAULT 0,
+      shadowing_count INTEGER NOT NULL DEFAULT 0,
+      updated_at      INTEGER NOT NULL
+    );
+
+    -- 日聚合:YYYY-MM-DD 主键
+    -- 跨午夜时 onPressOut 落到哪一天就归到哪一天
+    CREATE TABLE IF NOT EXISTS daily_stats (
+      date            TEXT PRIMARY KEY,
+      foreground_ms   INTEGER NOT NULL DEFAULT 0,
+      background_ms   INTEGER NOT NULL DEFAULT 0,
+      shadowing_count INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  await db.execAsync('PRAGMA user_version = 8');
 }
 

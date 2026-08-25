@@ -67,6 +67,20 @@ export async function loadCachedAiCardsBySeriesIds(
 }
 
 /**
+ * Return the set of `series_id` values that currently have at least one
+ * cached row. Used as a fallback for "未登录" / "没挑合集" callers:
+ * the recommend page can show topics from these series even when
+ * the user hasn't picked anything yet.
+ */
+export async function loadCachedAiCardsSeriesIds(): Promise<Set<string>> {
+  const db = await getDatabase();
+  const rows: any[] = await db.getAllAsync(
+    'SELECT DISTINCT series_id FROM official_ai_practice_card_cache',
+  );
+  return new Set(rows.map((r) => String(r.series_id)).filter((id) => id.length > 0));
+}
+
+/**
  * Used by the caller to decide whether to re-fetch from Supabase.
  * Returns the most recent `fetched_at` across all rows, or null when
  * the table is empty.
