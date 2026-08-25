@@ -584,7 +584,11 @@ function VideoLearningPlayer({
   const effectiveClipEndMs = scene.clipEndMs ?? Math.round(resolvedDurationSeconds * 1000);
   const effectiveClipEndSeconds = effectiveClipEndMs / 1000;
   const [subtitleMode, setSubtitleMode] = useState<'bilingual' | 'english'>('bilingual');
+  // 2026-08-25: 速率选择从 3 档循环 (1 → 0.85 → 0.7) 改成弹窗让用户直接挑常用倍率.
+  // 常用 0.5x-2x 共 7 档. 1x = 正常速度, <1x 慢放(精听), >1x 快放(扫读).
+  const RATE_OPTIONS = useMemo<ReadonlyArray<number>>(() => [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0], []);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [isRateSheetOpen, setIsRateSheetOpen] = useState(false);
   const [isBackgroundAudioEnabled, setIsBackgroundAudioEnabled] = useState(false);
   const [repeatSentence, setRepeatSentence] = useState(false);
   const [lockedRepeatRange, setLockedRepeatRange] = useState<{ startSeconds: number; endSeconds: number } | null>(null);
@@ -2046,8 +2050,26 @@ function VideoLearningPlayer({
   };
 
   const handleToggleRate = () => {
-    setPlaybackRate((prev) => (prev === 1 ? 0.85 : prev === 0.85 ? 0.7 : 1));
+    // 2026-08-25: fullscreen 用的是 native fullscreen Activity, 弹窗无法跟 video 方向
+    // 走 (RN Modal 始终按原页面 portrait 渲染). 所以全屏下回退成点选循环, 档位
+    // 跟弹窗的 RATE_OPTIONS 保持一致: 0.5 → 0.75 → 1 → 1.25 → 1.5 → 1.75 → 2 → 0.5
+    if (isFullscreen) {
+      setPlaybackRate((prev) => {
+        const idx = RATE_OPTIONS.indexOf(prev);
+        if (idx < 0) return RATE_OPTIONS[2]; // 找不到当前值, 回到 1x
+        return RATE_OPTIONS[(idx + 1) % RATE_OPTIONS.length];
+      });
+      return;
+    }
+    setIsRateSheetOpen(true);
   };
+  const handleSelectRate = useCallback((rate: number) => {
+    setPlaybackRate(rate);
+    setIsRateSheetOpen(false);
+  }, []);
+  const handleCloseRateSheet = useCallback(() => {
+    setIsRateSheetOpen(false);
+  }, []);
 
   const handleToggleBackgroundAudio = useCallback(() => {
     setIsBackgroundAudioEnabled((prev) => !prev);
@@ -3086,6 +3108,51 @@ function VideoLearningPlayer({
               contentContainerStyle={styles.videoAiPickerListContent}
               showsVerticalScrollIndicator={false}
             />
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={isRateSheetOpen}
+        animationType="slide"
+        transparent
+        statusBarTranslucent
+        onRequestClose={handleCloseRateSheet}
+      >
+        <View style={styles.sheetOverlay}>
+          <Pressable style={styles.videoAiPickerDismissLayer} onPress={handleCloseRateSheet} />
+          <View style={[styles.customSheet, styles.rateSheet]}>
+            <View style={styles.customSheetHandle} />
+            <View style={styles.customSheetHeader}>
+              <View style={styles.videoAiPickerHeaderInfo}>
+                <Text style={styles.customSheetTitle}>播放速度</Text>
+                <Text style={styles.rateSheetHint}>
+                  当前 {playbackRate.toFixed(2).replace(/\.?0+$/, '')}x
+                  {playbackRate === 1 ? '（正常）' : playbackRate < 1 ? '（慢放精听）' : '（快放扫读）'}
+                </Text>
+              </View>
+              <Pressable style={styles.videoAiPickerCloseBtn} onPress={handleCloseRateSheet}>
+                <X size={20} color="#64748B" />
+              </Pressable>
+            </View>
+            <View style={styles.rateSheetOptionsWrap}>
+              {RATE_OPTIONS.map((rate) => {
+                const active = Math.abs(rate - playbackRate) < 0.001;
+                const label = rate === 1 ? '1x' : `${rate}x`;
+                return (
+                  <Pressable
+                    key={`rate-option-${rate}`}
+                    style={[styles.rateSheetChip, active && styles.rateSheetChipActive]}
+                    onPress={() => handleSelectRate(rate)}
+                    hitSlop={4}
+                  >
+                    <Text style={[styles.rateSheetChipText, active && styles.rateSheetChipTextActive]}>
+                      {label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
           </View>
         </View>
       </Modal>
@@ -5497,6 +5564,49 @@ const styles = StyleSheet.create({
   emptySubtitleActionText: {
     color: '#FFFFFF',
     fontSize: fontSize.sm,
+    fontWeight: fontWeight.bold,
+  },
+
+  // 2026-08-25: 播放速度选择弹窗
+  rateSheet: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: Math.max(28, spacing.xl),
+    gap: spacing.md,
+  },
+  rateSheetHint: {
+    fontSize: fontSize.sm,
+    color: colors.text.secondary,
+    marginTop: 2,
+  },
+  rateSheetOptionsWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.sm,
+    paddingTop: spacing.xs,
+  },
+  rateSheetChip: {
+    minWidth: 64,
+    paddingVertical: 10,
+    paddingHorizontal: spacing.md,
+    borderRadius: borderRadius.full,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border.light,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  rateSheetChipActive: {
+    backgroundColor: colors.primary,
+    borderColor: colors.primary,
+  },
+  rateSheetChipText: {
+    fontSize: fontSize.base,
+    fontWeight: fontWeight.medium,
+    color: colors.text.primary,
+  },
+  rateSheetChipTextActive: {
+    color: '#FFFFFF',
     fontWeight: fontWeight.bold,
   },
 });
