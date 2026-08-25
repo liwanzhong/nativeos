@@ -2,7 +2,7 @@
     "expo":  {
                  "name":  "NativeOS",
                  "slug":  "nativeos",
-                 "version":  "1.0.43",
+                 "version":  "1.0.44",
                  "orientation":  "portrait",
                  "icon":  "./assets/icon.png",
                  "userInterfaceStyle":  "dark",
@@ -46,7 +46,7 @@
                                  "gradleProperties":  {
                                                           "org.gradle.java.home":  "D:/Java/jdk-17.0.17+10"
                                                       },
-                                 "versionCode":  144,
+                                 "versionCode":  145,
                                  "permissions":  [
                                                      "REQUEST_INSTALL_PACKAGES",
                                                      "READ_MEDIA_IMAGES",

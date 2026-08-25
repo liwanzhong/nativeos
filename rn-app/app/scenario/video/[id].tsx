@@ -721,10 +721,15 @@ function VideoLearningPlayer({
     videoPlayer.showNowPlayingNotification = isBackgroundAudioEnabled;
     videoPlayer.staysActiveInBackground = isBackgroundAudioEnabled;
     videoPlayer.timeUpdateEventInterval = Platform.OS === 'android' ? 0.25 : 0.12;
+    // 2026-08-25: expo-video Android native 默认 preservesPitch=false (跟 TS 文档说的
+    // @default true 不一致), 不设的话 0.5x/1.5x 会变调 (chipmunk effect). 这里
+    // 显式打开 pitch preservation, 这样变速只改 tempo, 音高不变.
+    videoPlayer.preservesPitch = true;
     videoPlayer.playbackRate = playbackRate;
   });
 
   useEffect(() => {
+    player.preservesPitch = true;
     player.playbackRate = playbackRate;
   }, [playbackRate, player]);
 
