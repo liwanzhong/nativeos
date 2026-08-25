@@ -34,7 +34,7 @@ const dailyBuffer = new Map<string, DailyStats>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let flushInFlight: Promise<void> | null = null;
 
-const FLUSH_INTERVAL_MS = 5000;
+const FLUSH_INTERVAL_MS = 1000;
 
 // 同步内存副本,用于"先读后写"的原子累加,避免 read-then-write 竞态
 const inMemoryVideo = new Map<string, VideoStats>();
@@ -230,21 +230,34 @@ export async function readVideoStats(videoId: string): Promise<VideoStats | null
 }
 
 export async function readAllVideoStats(): Promise<VideoStats[]> {
+  console.log('[stats/storage] readAllVideoStats START inMemoryVideoSize=', inMemoryVideo.size);
   try {
     const db = await getDatabase();
     const rows: any[] = await db.getAllAsync(
       'SELECT video_id, foreground_ms, background_ms, shadowing_count, updated_at FROM video_stats'
     );
-    return rows.map((row) => ({
-      videoId: row.video_id,
-      foregroundMs: Number(row.foreground_ms),
-      backgroundMs: Number(row.background_ms),
-      shadowingCount: Number(row.shadowing_count),
-      updatedAt: Number(row.updated_at),
-    }));
+    console.log('[stats/storage] readAllVideoStats DB rows', rows.length);
+    const map = new Map<string, VideoStats>();
+    for (const row of rows) {
+      map.set(row.video_id, {
+        videoId: row.video_id,
+        foregroundMs: Number(row.foreground_ms),
+        backgroundMs: Number(row.background_ms),
+        shadowingCount: Number(row.shadowing_count),
+        updatedAt: Number(row.updated_at),
+      });
+    }
+    // ⭐ inMemory 覆盖 DB(累加器最新;DB 是上次 flush 快照,可能滞后最多 FLUSH_INTERVAL_MS)
+    for (const [videoId, stats] of inMemoryVideo.entries()) {
+      map.set(videoId, stats);
+    }
+    const result = Array.from(map.values());
+    console.log('[stats/storage] readAllVideoStats RESULT count=', result.length, 'top:', result.slice(0, 3).map((r) => `${r.videoId.slice(0, 20)}=${r.foregroundMs}ms`));
+    return result;
   } catch (e) {
     console.warn('[stats/storage] readAllVideoStats failed:', e);
-    return [];
+    // 失败时直接返回 inMemory(总比空好)
+    return Array.from(inMemoryVideo.values());
   }
 }
 
@@ -252,6 +265,7 @@ export async function readDailyStats(
   startDate: string,
   endDate: string
 ): Promise<DailyStats[]> {
+  console.log('[stats/storage] readDailyStats START', { startDate, endDate, inMemoryDailySize: inMemoryDaily.size });
   try {
     const db = await getDatabase();
     // 1. 拉范围内已有的行
@@ -259,6 +273,7 @@ export async function readDailyStats(
       'SELECT date, foreground_ms, background_ms, shadowing_count FROM daily_stats WHERE date >= ? AND date <= ? ORDER BY date ASC',
       [startDate, endDate]
     );
+    console.log('[stats/storage] readDailyStats DB rows', rows.length, rows);
     const map = new Map<string, DailyStats>();
     for (const row of rows) {
       map.set(row.date, {
@@ -268,6 +283,15 @@ export async function readDailyStats(
         shadowingCount: Number(row.shadowing_count),
       });
     }
+    // ⭐ inMemory 覆盖 DB(累加器最新;DB 是上次 flush 快照,可能滞后最多 FLUSH_INTERVAL_MS)
+    const inMemEntries: string[] = [];
+    for (const [date, stats] of inMemoryDaily.entries()) {
+      if (date >= startDate && date <= endDate) {
+        map.set(date, stats);
+        inMemEntries.push(`${date}=${stats.foregroundMs}ms`);
+      }
+    }
+    console.log('[stats/storage] readDailyStats inMemory override', inMemEntries);
     // 2. 填充没数据的日期(柱状图 30 天不能有空洞)
     const dates: string[] = [];
     const start = new Date(startDate + 'T00:00:00');
@@ -278,7 +302,10 @@ export async function readDailyStats(
       const day = String(d.getDate()).padStart(2, '0');
       dates.push(`${y}-${m}-${day}`);
     }
-    return dates.map((date) => map.get(date) ?? { date, foregroundMs: 0, backgroundMs: 0, shadowingCount: 0 });
+    const result = dates.map((date) => map.get(date) ?? { date, foregroundMs: 0, backgroundMs: 0, shadowingCount: 0 });
+    const nonZero = result.filter((r) => r.foregroundMs + r.backgroundMs > 0);
+    console.log('[stats/storage] readDailyStats RESULT', { totalDays: result.length, nonZeroDays: nonZero.length, nonZero });
+    return result;
   } catch (e) {
     console.warn('[stats/storage] readDailyStats failed:', e);
     return [];
@@ -341,8 +368,23 @@ function scheduleFlush(): void {
 }
 
 export async function flush(): Promise<void> {
-  if (flushInFlight) return flushInFlight;
-  flushInFlight = doFlush().finally(() => {
+  // ⭐ 等当前 in-flight 完成(不抢),但**返回后**调用方拿到的值是这次
+  // 还没处理完的新 buffer 不会被这次涵盖 — 因为 in-flight 可能比
+  // 调用 flush 那一刻更新,但 doFlush 内部已经抓了当时的 snapshot。
+  if (flushInFlight) {
+    await flushInFlight;
+  }
+  flushInFlight = (async () => {
+    // ⭐ while 循环:doFlush 期间(clear 之后)新 recordPlayback 进 buffer 的
+    // 那些数据,要再跑一次 flush 才进 DB。否则 forceFlush 后 read 仍可能
+    // 读到 flush 前一刻的 snapshot,少 FLUSH_INTERVAL_MS 内的数据。
+    while (true) {
+      const videos = videoBuffer.size;
+      const dailies = dailyBuffer.size;
+      if (videos === 0 && dailies === 0) break;
+      await doFlush();
+    }
+  })().finally(() => {
     flushInFlight = null;
   });
   return flushInFlight;

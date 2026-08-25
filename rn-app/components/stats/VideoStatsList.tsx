@@ -14,22 +14,32 @@ import { ChevronRight } from 'lucide-react-native';
 import { colors, spacing, fontSize } from '../../constants/theme';
 import { getAllVideoStats, type VideoStats } from '../../lib/stats';
 import { formatShort, formatCount } from '../../lib/stats/format';
+import { loadEpisodeTitlesByIdsFromSupabase } from '../../lib/content/video-series-supabase';
 
 function VideoStatsListInner() {
   const router = useRouter();
   const [items, setItems] = useState<VideoStats[]>([]);
+  const [titles, setTitles] = useState<Map<string, string>>(new Map());
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    getAllVideoStats().then((all) => {
+    (async () => {
+      const all = await getAllVideoStats();
       if (cancelled) return;
       const sorted = [...all]
         .filter((s) => s.foregroundMs + s.backgroundMs + s.shadowingCount > 0)
         .sort((a, b) => b.foregroundMs + b.backgroundMs - (a.foregroundMs + a.backgroundMs));
       setItems(sorted);
-      setLoaded(true);
-    });
+      // 批量拉标题,一次 supabase .in() 查所有 videoId
+      try {
+        const titleMap = await loadEpisodeTitlesByIdsFromSupabase(sorted.map((s) => s.videoId));
+        if (!cancelled) setTitles(titleMap);
+      } catch (e) {
+        console.warn('[VideoStatsList] load titles failed:', e);
+      }
+      if (!cancelled) setLoaded(true);
+    })();
     return () => {
       cancelled = true;
     };
@@ -67,6 +77,7 @@ function VideoStatsListInner() {
           if (s.foregroundMs > 0) parts.push(`看 ${formatShort(s.foregroundMs)}`);
           if (s.backgroundMs > 0) parts.push(`听 ${formatShort(s.backgroundMs)}`);
           if (s.shadowingCount > 0) parts.push(`跟读 ${formatCount(s.shadowingCount)}`);
+          const displayTitle = titles.get(s.videoId) ?? s.videoId;
           return (
             <Pressable
               key={s.videoId}
@@ -75,7 +86,7 @@ function VideoStatsListInner() {
             >
               <View style={styles.rowBody}>
                 <Text style={styles.rowTitle} numberOfLines={1}>
-                  {s.videoId}
+                  {displayTitle}
                 </Text>
                 <Text style={styles.rowMeta} numberOfLines={1}>
                   {parts.join(' · ') || '—'}

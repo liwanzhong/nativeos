@@ -291,6 +291,41 @@ export async function loadSeriesByIdFromSupabase(
  *
  * Returns `null` if the row doesn't exist or any error occurs.
  */
+/**
+ * Batch-fetch titles for a list of episode ids. Used by the stats page
+ * to label `video_stats` rows by their human-readable title instead of
+ * the raw `episode.id` slug.
+ *
+ * Returns a Map<episodeId, title>; missing episodes just won't appear
+ * in the map (caller should fall back to showing the id).
+ */
+export async function loadEpisodeTitlesByIdsFromSupabase(
+  episodeIds: string[]
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const ids = Array.from(new Set(episodeIds.filter((id) => id && id.trim())));
+  if (ids.length === 0) return result;
+  try {
+    const { data, error } = await supabase
+      .from('official_video_episodes')
+      .select('id, title')
+      .in('id', ids)
+      .eq('is_published', true);
+    if (error) {
+      console.warn('[video-series] loadEpisodeTitlesByIds failed:', error.message);
+      return result;
+    }
+    for (const row of data ?? []) {
+      const id = (row as { id?: string }).id;
+      const title = (row as { title?: string }).title;
+      if (id && title) result.set(id, title);
+    }
+  } catch (e) {
+    console.warn('[video-series] loadEpisodeTitlesByIds threw:', e);
+  }
+  return result;
+}
+
 export async function loadEpisodeByIdFromSupabase(
   episodeId: string,
   seriesId?: string,

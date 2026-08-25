@@ -52,13 +52,21 @@ export function recordPlayback(
   if (deltaMs <= 0 || deltaMs > SEEK_THRESHOLD_MS) return;
 
   incrementVideoStats(videoId, deltaMs, isActive);
-  incrementDailyStats(todayLocalDate(), deltaMs, isActive);
+  const today = todayLocalDate();
+  const dailyAfter = incrementDailyStats(today, deltaMs, isActive);
+  console.log(
+    `[stats] recordPlayback videoId=${videoId.slice(0, 20)} deltaMs=${deltaMs} isActive=${isActive} daily[${today}] now=${dailyAfter.foregroundMs}ms`
+  );
 }
 
 export function recordShadowing(videoId: string): void {
   if (!videoId) return;
   incrementVideoShadowing(videoId);
-  incrementDailyShadowing(todayLocalDate());
+  const today = todayLocalDate();
+  const dailyAfter = incrementDailyShadowing(today);
+  console.log(
+    `[stats] recordShadowing videoId=${videoId.slice(0, 20)} daily[${today}] shadowingCount now=${dailyAfter.shadowingCount}`
+  );
 }
 
 // ── 查询 ────────────────────────────────────────────
@@ -91,7 +99,9 @@ export function readInMemoryVideoStats(videoId: string): VideoStats | null {
 // ── 强制 flush ─────────────────────────────────────
 
 export async function forceFlush(): Promise<void> {
-  return storageFlush();
+  console.log('[stats] forceFlush START');
+  await storageFlush();
+  console.log('[stats] forceFlush DONE');
 }
 
 // ── Supabase 同步(P1,可选) ────────────────────────
@@ -129,6 +139,7 @@ export type { VideoStats, DailyStats } from './storage';
  */
 export function installAppStateFlushListener(): () => void {
   const sub = AppState.addEventListener('change', (next: AppStateStatus) => {
+    console.log('[stats] AppState change ->', next);
     if (next !== 'active') {
       forceFlush()
         .then(() => pushOnFlush())

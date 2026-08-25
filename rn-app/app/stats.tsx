@@ -26,9 +26,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { ArrowLeft } from 'lucide-react-native';
 import { colors, spacing, fontSize } from '../constants/theme';
 import { useFocusEffect } from 'expo-router';
-import { forceFlush, getDailyStats } from '../lib/stats';
+import { forceFlush, getAllVideoStats, getDailyStats } from '../lib/stats';
 import { formatLong, formatCount } from '../lib/stats/format';
-import type { DailyStats } from '../lib/stats/storage';
+import type { DailyStats, VideoStats } from '../lib/stats/storage';
 import { Recent30DaysBarChart } from '../components/stats/Recent30DaysBarChart';
 import { SummaryCard } from '../components/stats/SummaryCard';
 import { VideoStatsList } from '../components/stats/VideoStatsList';
@@ -60,6 +60,7 @@ export default function StatsScreen() {
   const insets = useSafeAreaInsets();
 
   const [days, setDays] = useState<DailyStats[]>([]);
+  const [allVideos, setAllVideos] = useState<VideoStats[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   // 触发 VideoStatsList 重新拉数据
   const [videoListKey, setVideoListKey] = useState(0);
@@ -69,20 +70,31 @@ export default function StatsScreen() {
   const monthAgo = useMemo(() => daysAgoStr(29), []); // 包含今天共 30 天
 
   const load = useCallback(async () => {
+    console.log('[stats/page] load START today=', today, 'weekAgo=', weekAgo, 'monthAgo=', monthAgo);
     setRefreshing(true);
     try {
       // 先 flush buffer,确保拿到最新数据
       await forceFlush();
-      const rows = await getDailyStats(monthAgo, today);
-      console.log('[stats] load days.length:', rows.length, 'today:', today);
-      console.log('[stats] today row:', rows.find((d) => d.date === today));
-      console.log('[stats] non-zero days:', rows.filter((d) => d.foregroundMs + d.backgroundMs > 0).length);
+      const [rows, videos] = await Promise.all([
+        getDailyStats(monthAgo, today),
+        getAllVideoStats(),
+      ]);
+      const todayRow = rows.find((d) => d.date === today);
+      const last7 = rows.slice(-7);
+      const weekFg = last7.reduce((s, r) => s + r.foregroundMs, 0);
+      const weekBg = last7.reduce((s, r) => s + r.backgroundMs, 0);
+      const monthFg = rows.reduce((s, r) => s + r.foregroundMs, 0);
+      const monthBg = rows.reduce((s, r) => s + r.backgroundMs, 0);
+      console.log(
+        `[stats/page] load RESULT today={fg=${todayRow?.foregroundMs}ms bg=${todayRow?.backgroundMs}ms sh=${todayRow?.shadowingCount}} week={fg=${weekFg}ms bg=${weekBg}ms} month={fg=${monthFg}ms bg=${monthBg}ms}`
+      );
       setDays(rows);
+      setAllVideos(videos);
       setVideoListKey((k) => k + 1);
     } finally {
       setRefreshing(false);
     }
-  }, [monthAgo, today]);
+  }, [monthAgo, today, weekAgo]);
 
   useFocusEffect(
     useCallback(() => {
@@ -90,7 +102,7 @@ export default function StatsScreen() {
     }, [load])
   );
 
-  // 今日 / 本周聚合
+  // 今日 / 本周 聚合
   const todayRow = useMemo(
     () => days.find((d) => d.date === today) ?? { date: today, foregroundMs: 0, backgroundMs: 0, shadowingCount: 0 },
     [days, today]
