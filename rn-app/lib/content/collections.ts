@@ -38,7 +38,6 @@ import {
   type PickedSeriesDetail,
 } from './video-series-supabase';
 import { loadLocalPickedIds } from './user-picked-series';
-import { getOfficialVideoSeriesById } from './video-series';
 import {
   listUserCollections,
   getOrCreateDefaultCollection,
@@ -595,40 +594,41 @@ export async function getCollectionDetail(
 }
 
 async function getOfficialDetail(seriesId: string, forceRefresh: boolean): Promise<CollectionDetail | null> {
-  const series = await getOfficialVideoSeriesById(seriesId, forceRefresh);
-  if (!series) return null;
+  // Load ONLY this series + its episodes from Supabase (not all 9 series).
+  // Old path: getOfficialVideoSeriesById → getFeaturedVideoScenes → loads
+  // all 196 videos + 196 info.json from OSS. New path: direct Supabase query.
+  const [seriesRow, episodeRows, metaList] = await Promise.all([
+    loadSeriesByIdFromSupabase(seriesId),
+    loadSeriesEpisodesFromSupabase(seriesId),
+    listVideoUserMeta().catch(() => [] as VideoUserMetaRecord[]),
+  ]);
+  if (!seriesRow || episodeRows.length === 0) return null;
 
-  // `getOfficialVideoSeriesById` already merges the OSS manifest
-  // with the local `VideoSceneDetail` cache, so each episode here
-  // has the full metadata (duration, cover, etc.). We re-sort by
-  // episode index so the detail list matches the order the
-  // series presents in the library.
-  const sortedEpisodes = [...series.episodes].sort(
-    (a, b) => (a.episodeIndex ?? 0) - (b.episodeIndex ?? 0),
+  const metaMap = Object.fromEntries(metaList.map((item) => [item.sceneId, item]));
+
+  // Build lightweight episode summaries directly from Supabase rows
+  // (no OSS info.json needed — cover/duration/title all in DB).
+  const sortedEpisodes = [...episodeRows].sort(
+    (a, b) => (a.episode_index ?? 0) - (b.episode_index ?? 0),
   );
-  // Pull per-scene binding + cache state from SQLite in one go.
-  // Both queries are independent and small (<= 17 rows for the
-  // current series), so we batch them. Errors are swallowed —
-  // an unconfigured cloud drive just leaves the rows with no
-  // binding data and the row chips fall back to the default
-  // "未绑定 / 远端" copy.
+
   const sceneIdsForBinding = sortedEpisodes
-    .map((ep) => (typeof ep.id === 'string' && ep.id.trim()) ? ep.id.trim() : null)
+    .map((ep) => ep.id.trim())
     .filter((id): id is string => Boolean(id));
   const { getOfficialSceneBindingStatusByScene } = await import('./cloud-binding-summary');
   const sceneBindingMap = await getOfficialSceneBindingStatusByScene(sceneIdsForBinding);
 
   const videos: CollectionVideoItem[] = sortedEpisodes
     .map((ep, index): CollectionVideoItem | null => {
-      const id = typeof ep.id === 'string' && ep.id.trim() ? ep.id.trim() : null;
+      const id = ep.id.trim();
       if (!id) return null;
       const binding = sceneBindingMap[id];
+      const coverUri = resolveSeriesCoverUrl(seriesRow.manifest_url, ep.cover_file);
       return {
         id,
-        title: (typeof ep.episodeTitle === 'string' && ep.episodeTitle.trim())
-          || id,
-        coverImageUri: ep.coverImageUri,
-        durationSeconds: ep.durationSeconds > 0 ? ep.durationSeconds : undefined,
+        title: ep.title || id,
+        coverImageUri: coverUri,
+        durationSeconds: ep.duration_seconds && ep.duration_seconds > 0 ? ep.duration_seconds : undefined,
         episodeIndex: index + 1,
         source: 'official',
         // Official series always: pre-shipped subtitle, pre-shipped
@@ -649,12 +649,14 @@ async function getOfficialDetail(seriesId: string, forceRefresh: boolean): Promi
     })
     .filter((v): v is CollectionVideoItem => v !== null);
 
+  const seriesCoverUri = resolveSeriesCoverUrl(seriesRow.manifest_url, seriesRow.cover_url);
+
   return {
     id: encodeCollectionId('official', seriesId),
     kind: 'official',
-    title: series.title,
-    description: series.description,
-    coverImageUri: series.coverImageUri,
+    title: seriesRow.title,
+    description: seriesRow.description || undefined,
+    coverImageUri: seriesCoverUri,
     videoCount: videos.length,
     isLocked: true,
     videos,

@@ -8,7 +8,6 @@ import signal
 import subprocess
 import shutil
 import time
-import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -32,6 +32,275 @@ from PySide6.QtWidgets import (
 )
 
 from tabs.runtime_support import get_config_path, get_proxy_env, load_json_config, load_proxy_config, resolve_executable, resolve_ffmpeg_dir, save_json_config
+
+# ============================================================
+# Universal emoji + fullwidth detection
+# ============================================================
+# 之前用硬编码 codepoint 范围 (0x1F1E6..0x1F1FF / 0x1F300..0x1FAFF / ...),
+# 漏掉了一堆: 区域指示符 (🇬🇧 在 Unicode 14.0 不在 Extended_Pictographic),
+# CJK 全角标点 (？U+FF1F, ｜U+FF5C), 未来 Unicode 新增 emoji.
+# 通用方案:
+#   1) 优先用 `emoji` 库 (600KB, 跟 Unicode 官方 emoji-data.txt 同步,
+#      自动处理 ZWJ / flag pair / skin tone / 未来 emoji).
+#   2) Fallback 到 `regex` 库 (yt-dlp 自带, 项目里已有 v2.5.147),
+#      用 \p{Extended_Pictographic} Unicode property 显式加 regional
+#      indicator 和 keycap 序列, 避开 ASCII 数字误伤.
+#   3) 最后兜底: 硬编码范围 (不如 1+2 准, 但保证不报错).
+# 安装 emoji 库 (推荐): pip install emoji
+_EMOJI_BACKEND = 'builtin'  # 'emoji-lib' | 'regex' | 'builtin'
+_EMOJI_LIB = None
+_EMOJI_REGEX_PATTERN = None
+try:
+    import emoji as _EMOJI_LIB
+    _EMOJI_BACKEND = 'emoji-lib'
+except ImportError:
+    _EMOJI_LIB = None
+    try:
+        import regex as _regex_mod
+        # \p{Extended_Pictographic} 起步 (避开 \p{Emoji_Component}, 那个
+        # 会把 ASCII 数字 0-9 当 keycap 起始误伤). 区域指示符 + keycap
+        # 序列作为独立 alternation 显式处理.
+        _EMOJI_REGEX_PATTERN = _regex_mod.compile(
+            r'(?:\p{Extended_Pictographic}'
+            r'(?:\p{Emoji_Modifier}|\uFE0F)*'
+            r'(?:\u200D\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|\uFE0F)*)*)'
+            r'|[\U0001F1E6-\U0001F1FF]+'  # regional indicator (lone or pair)
+            r'|[0-9*#]\uFE0F?\u20E3'  # keycap sequence (0️⃣ *️⃣ #️⃣)
+        )
+        _EMOJI_BACKEND = 'regex'
+    except ImportError:
+        # 兜底: 硬编码范围, 不如 1+2 准
+        _EMOJI_BACKEND = 'builtin'
+
+# 全角 / CJK 标点 Unicode 块 (稳定, 不会随 emoji 标准变化)
+_FULLWIDTH_RANGES: tuple[tuple[int, int], ...] = (
+    (0x3000, 0x303F),  # CJK Symbols and Punctuation (、。「」)
+    (0xFF00, 0xFFEF),  # Halfwidth and Fullwidth Forms (？，！｜～)
+)
+
+
+def _is_fullwidth_punct(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _FULLWIDTH_RANGES)
+
+
+def _strip_emoji_and_fullwidth(name: str) -> str:
+    """通用: 清除字符串里所有 emoji 序列 + 全角/CJK 标点.
+
+    - 用 emoji 库 (Unicode emoji-data.txt 同步) 或 regex 库 (Unicode
+      property) 处理 emoji; 自动覆盖 ZWJ / flag pair / skin tone / 未来
+      Unicode 新增.
+    - 全角标点走稳定的 Unicode block 范围 (CJK Symbols / Halfwidth and
+      Fullwidth Forms).
+    - 不会误伤 ASCII 数字 / 拉丁字母 / CJK 汉字 / 平假名 / 片假名.
+    """
+    if not name:
+        return name
+    if _EMOJI_BACKEND == 'emoji-lib':
+        name = _EMOJI_LIB.replace_emoji(name, replace='')
+    elif _EMOJI_BACKEND == 'regex':
+        name = _EMOJI_REGEX_PATTERN.sub('', name)
+    else:
+        # 兜底: 单字符范围检查, 不处理 ZWJ / flag pair / skin tone
+        name = ''.join(
+            c for c in name
+            if not (
+                0x1F1E6 <= ord(c) <= 0x1F1FF
+                or 0x1F300 <= ord(c) <= 0x1FAFF
+                or 0x2600 <= ord(c) <= 0x27BF
+                or 0x200D == ord(c) or 0x20E3 == ord(c)
+                or 0xFE0E == ord(c) or 0xFE0F == ord(c)
+            )
+        )
+    name = ''.join(c for c in name if not _is_fullwidth_punct(ord(c)))
+    name = ' '.join(name.split())
+    return name.strip()
+
+
+def _is_emoji_or_fullwidth_char(char: str) -> bool:
+    """单字符判定, 用于日志里描述识别到哪些字符.
+
+    注意: 区域指示符 (🇬🇧) 单字符不在 Extended_Pictographic (Unicode 14.0),
+    但作为 flag pair 会被整体 strip; 这里返回 False, 因为单字符的 🇬
+    或 🇧 单独出现时确实无意义, 不应标为 'emoji-like char found'.
+    """
+    if not char or len(char) != 1:
+        return False
+    cp = ord(char)
+    if _is_fullwidth_punct(cp):
+        return True
+    if _EMOJI_BACKEND == 'emoji-lib':
+        # emoji.is_emoji 支持多 codepoint, 但单 char 时也能用
+        return _EMOJI_LIB.is_emoji(char)
+    if _EMOJI_BACKEND == 'regex':
+        return bool(_regex_mod.match(r'\p{Extended_Pictographic}', char))
+    # builtin fallback
+    return (
+        0x1F1E6 <= cp <= 0x1F1FF
+        or 0x1F300 <= cp <= 0x1FAFF
+        or 0x2600 <= cp <= 0x27BF
+    )
+
+
+def _dedupe_target_path(source: Path, cleaned_name: str) -> Path:
+    """如果目标名已存在, 加 _1 / _2 后缀避免覆盖."""
+    target = source.with_name(cleaned_name)
+    if target == source or not target.exists():
+        return target
+    suffix = ''.join(source.suffixes) if source.is_file() else ''
+    base_name = cleaned_name[:-len(suffix)] if suffix and cleaned_name.endswith(suffix) else cleaned_name
+    index = 1
+    while True:
+        candidate = source.with_name(f'{base_name}_{index}{suffix}')
+        if not candidate.exists() or candidate == source:
+            return candidate
+        index += 1
+
+
+def _scan_and_rename_emoji_files(
+    root_dir: Path,
+    log_line,
+    mtime_threshold: float | None,
+    label: str,
+) -> int:
+    """遍历目录, 把含 emoji / 全角标点的文件/目录名重命名. 返回重命名数量.
+
+    通用清理逻辑, DownloadWorker (post-download) 和 EmojiCleanupWorker
+    (历史文件) 都走这里, 区别只在 mtime_threshold:
+      - post-download: 只清理本次下载 (mtime >= self._started_at - 2)
+      - 历史文件清理: 不限 mtime, 把整个目录的脏名字都清掉
+    """
+    if not root_dir.exists():
+        log_line(f'[提示] {label} 目录不存在: {root_dir}')
+        return 0
+    renamed_paths: list[tuple[Path, Path]] = []
+    scanned_entries = 0
+    rename_candidates = 0
+    for root, dir_names, file_names in os.walk(root_dir, topdown=False):
+        root_path = Path(root)
+        for entry_name in [*file_names, *dir_names]:
+            scanned_entries += 1
+            source = root_path / entry_name
+            if mtime_threshold is not None:
+                try:
+                    if source.stat().st_mtime < mtime_threshold:
+                        continue
+                except OSError:
+                    continue
+            cleaned_name = _strip_emoji_and_fullwidth(entry_name)
+            if not cleaned_name or cleaned_name == entry_name:
+                continue
+            rename_candidates += 1
+            emoji_desc = _describe_emoji_in_name(entry_name)
+            if emoji_desc:
+                log_line(f'[调试] {label} 原始值: {entry_name}')
+                log_line(f'[调试] {label} 识别到的 emoji-like 字符: {emoji_desc}')
+                log_line(f'[调试] {label} 清理结果: {cleaned_name}')
+            elif entry_name != cleaned_name:
+                log_line(f'[调试] {label} 原始值: {entry_name}')
+                log_line(f'[调试] {label} 清理结果: {cleaned_name}')
+            target = _dedupe_target_path(source, cleaned_name)
+            if target == source:
+                continue
+            try:
+                source.rename(target)
+                renamed_paths.append((source, target))
+            except OSError as exc:
+                log_line(f'[提示] 文件名清理失败：{source.name} -> {target.name} ({exc})')
+    if not renamed_paths:
+        log_line(f'[调试] {label} 扫描完成：共扫描 {scanned_entries} 个文件/目录，命中 {rename_candidates} 个候选，实际重命名 0 个')
+        return 0
+    log_line(f'[调试] {label} 扫描完成：共扫描 {scanned_entries} 个文件/目录，命中 {rename_candidates} 个候选，实际重命名 {len(renamed_paths)} 个')
+    for source, target in renamed_paths[:12]:
+        try:
+            source_display = source.relative_to(root_dir)
+        except ValueError:
+            source_display = source
+        try:
+            target_display = target.relative_to(root_dir)
+        except ValueError:
+            target_display = target
+        log_line(f'[重命名] {source_display} -> {target_display}')
+    if len(renamed_paths) > 12:
+        log_line(f'[提示] 另有 {len(renamed_paths) - 12} 个文件/目录名已清理 Emoji')
+    return len(renamed_paths)
+
+
+def _describe_emoji_in_name(name: str) -> str:
+    """调试日志用: 列出被识别为 emoji-like 的字符. 单字符判定."""
+    parts = [f'{char}(U+{ord(char):04X})' for char in name if _is_emoji_or_fullwidth_char(char)]
+    return ', '.join(parts)
+
+
+def _scan_and_clean_info_json_metadata(
+    root_dir: Path,
+    log_line,
+    mtime_threshold: float | None,
+    label: str,
+) -> int:
+    """遍历目录里所有 .info.json, 清理掉 title / fulltitle / playlist / playlist_title
+    / uploader / channel 字段里的 emoji + 全角标点. 返回更新的文件数量.
+
+    这是 _scan_and_rename_emoji_files 的"内容"姊妹: 文件名是落盘外壳, info.json
+    是 yt-dlp 存的原始元数据. 用户在桌面 app 扫描 tab 看到的"标题"列, 实际
+    读的是 info.json 的 title 字段. 只改文件名不改 info.json 的话, 扫描结果
+    还是会显示原始的 emoji 标题, 看着像没清理干净.
+
+    DownloadWorker (post-download) 和 EmojiCleanupWorker (历史文件) 都走这个,
+    区别仍然是 mtime_threshold.
+    """
+    if not root_dir.exists():
+        log_line(f'[提示] {label} 目录不存在: {root_dir}')
+        return 0
+    candidate_fields = ('title', 'fulltitle', 'playlist', 'playlist_title', 'uploader', 'channel')
+    scanned_files = 0
+    updated_files = 0
+    for info_path in sorted(root_dir.rglob('*.info.json')):
+        if mtime_threshold is not None:
+            try:
+                if info_path.stat().st_mtime < mtime_threshold:
+                    continue
+            except OSError:
+                continue
+        scanned_files += 1
+        try:
+            payload = json.loads(info_path.read_text('utf-8'))
+        except Exception as exc:
+            log_line(f'[提示] 读取 info.json 失败：{info_path.name} ({exc})')
+            continue
+        if not isinstance(payload, dict):
+            continue
+        changed_fields: list[str] = []
+        for field in candidate_fields:
+            raw_value = payload.get(field)
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            cleaned_value = _strip_emoji_and_fullwidth(raw_value)
+            if not cleaned_value or cleaned_value == raw_value:
+                continue
+            emoji_desc = _describe_emoji_in_name(raw_value)
+            if emoji_desc:
+                log_line(f'[调试] {label} info.{field} 原始值: {raw_value}')
+                log_line(f'[调试] {label} info.{field} 识别到的 emoji-like 字符: {emoji_desc}')
+                log_line(f'[调试] {label} info.{field} 清理结果: {cleaned_value}')
+            payload[field] = cleaned_value
+            changed_fields.append(field)
+        if not changed_fields:
+            continue
+        try:
+            info_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), 'utf-8')
+            updated_files += 1
+            try:
+                display_path = info_path.relative_to(root_dir)
+            except ValueError:
+                display_path = info_path
+            log_line(f'[重写] {display_path} 已清理字段: {", ".join(changed_fields)}')
+        except OSError as exc:
+            log_line(f'[提示] 写回 info.json 失败：{info_path.name} ({exc})')
+    log_line(f'[调试] {label} info.json 内容清理完成：扫描 {scanned_files} 个文件，实际更新 {updated_files} 个')
+    return updated_files
+
+
+# ============================================================
 
 DOWNLOAD_TYPES = [
     ('单个视频', 'single', '粘贴单个 YouTube 视频 URL，例: https://www.youtube.com/watch?v=xxx'),
@@ -190,6 +459,62 @@ JS_RUNTIME_OPTIONS = [
 ]
 
 
+class EmojiCleanupWorker(QThread):
+    """清理整个下载目录里所有含 emoji / 全角标点的历史文件名.
+
+    跟 DownloadWorker._cleanup_download_names 走同一份清理逻辑
+    (_scan_and_rename_emoji_files), 区别是不限 mtime, 把整个目录
+    的脏名字都清掉. 用户痛点: 默认清理只清本次下载, 历史文件从来
+    没被处理过, 即使在 2026-08-19 重构 emoji 识别后, 老目录里仍然
+    一堆 🇬🇧🛒🍎？｜.
+    """
+    log_line = Signal(str)
+    finished_signal = Signal(int)  # renamed count
+
+    def __init__(self, download_dir: str) -> None:
+        super().__init__()
+        self.download_dir = download_dir
+
+    def run(self) -> None:
+        if _EMOJI_BACKEND == 'emoji-lib':
+            backend_msg = 'emoji 库 (Unicode emoji-data.txt 同步, 覆盖 ZWJ/flag/skin tone/未来 emoji)'
+        elif _EMOJI_BACKEND == 'regex':
+            backend_msg = 'regex 库 (Unicode Extended_Pictographic, 显式加 regional indicator / keycap)'
+        else:
+            backend_msg = '硬编码范围 (降级模式, 可能漏 Unicode 15+ emoji)'
+        self.log_line.emit(f'[清理] 后端: {backend_msg}')
+        if _EMOJI_BACKEND == 'builtin':
+            self.log_line.emit('[提示] 未检测到 emoji 库 / regex 库, 强烈建议 `pip install emoji` 提升识别准确率')
+
+        # Step 1: 重命名磁盘上的文件/目录名 (落盘外壳)
+        renamed = _scan_and_rename_emoji_files(
+            root_dir=Path(self.download_dir),
+            log_line=self.log_line.emit,
+            mtime_threshold=None,  # 历史文件: 不限 mtime
+            label='历史文件清理',
+        )
+
+        # Step 2: 清理 *.info.json 里的 title / fulltitle / playlist_title 等字段
+        # (扫描 tab 的"标题"列就是从这里读的, 不清的话扫描结果还是显示原 emoji 标题)
+        updated = _scan_and_clean_info_json_metadata(
+            root_dir=Path(self.download_dir),
+            log_line=self.log_line.emit,
+            mtime_threshold=None,  # 历史文件: 不限 mtime
+            label='历史 info.json',
+        )
+
+        summary_parts = []
+        if renamed:
+            summary_parts.append(f'重命名 {renamed} 个文件/目录')
+        if updated:
+            summary_parts.append(f'清理 {updated} 个 info.json')
+        if not summary_parts:
+            self.log_line.emit('[清理] 完成, 没有需要清理的文件')
+        else:
+            self.log_line.emit(f'[清理] 完成, {", ".join(summary_parts)}')
+        self.finished_signal.emit(renamed + updated)
+
+
 class DownloadWorker(QThread):
     log_line = Signal(str)
     finished_signal = Signal(int)
@@ -252,20 +577,12 @@ class DownloadWorker(QThread):
 
     @staticmethod
     def _is_emoji_like(char: str) -> bool:
-        codepoint = ord(char)
-        return (
-            codepoint == 0xFFFD
-            or codepoint in {0x200D, 0x20E3, 0xFE0E, 0xFE0F}
-            or 0x1F1E6 <= codepoint <= 0x1F1FF
-            or 0x1F300 <= codepoint <= 0x1FAFF
-            or 0x2600 <= codepoint <= 0x27BF
-            or 'EMOJI' in unicodedata.name(char, '')
-        )
+        """兼容旧调用点: 委托到模块级通用单字符判定."""
+        return _is_emoji_or_fullwidth_char(char)
 
     def _strip_emoji_from_name(self, name: str) -> str:
-        cleaned = ''.join(char for char in name if not self._is_emoji_like(char))
-        cleaned = ' '.join(cleaned.split())
-        return cleaned.strip()
+        """清理文件名/目录名: 委托到模块级通用函数 (emoji + 全角标点)."""
+        return _strip_emoji_and_fullwidth(name)
 
     def _sanitize_path_component(self, name: str) -> str:
         cleaned = self._strip_emoji_from_name(name)
@@ -275,7 +592,8 @@ class DownloadWorker(QThread):
         return cleaned or 'untitled'
 
     def _describe_emoji_like_chars(self, name: str) -> str:
-        parts = [f'{char}(U+{ord(char):04X})' for char in name if self._is_emoji_like(char)]
+        """调试日志用: 列出被识别为 emoji-like 的字符. 走通用单字符判定."""
+        parts = [f'{char}(U+{ord(char):04X})' for char in name if _is_emoji_or_fullwidth_char(char)]
         return ', '.join(parts)
 
     def _log_sanitize_mapping(self, label: str, raw_name: str, cleaned_name: str) -> None:
@@ -288,113 +606,29 @@ class DownloadWorker(QThread):
             self.log_line.emit(f'[调试] {label} 原始值: {raw_name}')
             self.log_line.emit(f'[调试] {label} 清理结果: {cleaned_name}')
 
-    @staticmethod
-    def _dedupe_target_path(source: Path, cleaned_name: str) -> Path:
-        target = source.with_name(cleaned_name)
-        if target == source or not target.exists():
-            return target
-        suffix = ''.join(source.suffixes) if source.is_file() else ''
-        base_name = cleaned_name[:-len(suffix)] if suffix and cleaned_name.endswith(suffix) else cleaned_name
-        index = 1
-        while True:
-            candidate = source.with_name(f'{base_name}_{index}{suffix}')
-            if not candidate.exists() or candidate == source:
-                return candidate
-            index += 1
-
     def _cleanup_download_names(self) -> None:
+        """post-download 清理: 只清本次下载产生的文件 (mtime 窗口)."""
         if not self.strip_emoji:
             return
-        renamed_paths: list[tuple[Path, Path]] = []
-        root_dir = Path(self.download_dir)
-        scanned_entries = 0
-        rename_candidates = 0
-        for root, dir_names, file_names in os.walk(root_dir, topdown=False):
-            root_path = Path(root)
-            for entry_name in [*file_names, *dir_names]:
-                scanned_entries += 1
-                source = root_path / entry_name
-                try:
-                    if source.stat().st_mtime < self._started_at - 2:
-                        continue
-                except OSError:
-                    continue
-                cleaned_name = self._strip_emoji_from_name(entry_name)
-                if not cleaned_name or cleaned_name == entry_name:
-                    continue
-                rename_candidates += 1
-                self._log_sanitize_mapping('落盘名称', entry_name, cleaned_name)
-                target = self._dedupe_target_path(source, cleaned_name)
-                if target == source:
-                    continue
-                try:
-                    source.rename(target)
-                    renamed_paths.append((source, target))
-                except OSError as exc:
-                    self.log_line.emit(f'[提示] 文件名清理失败：{source.name} -> {target.name} ({exc})')
-        if not renamed_paths:
-            self.log_line.emit(f'[调试] 下载后重命名扫描完成：共扫描 {scanned_entries} 个文件/目录，命中 {rename_candidates} 个候选，实际重命名 0 个')
+        renamed = _scan_and_rename_emoji_files(
+            root_dir=Path(self.download_dir),
+            log_line=self.log_line.emit,
+            mtime_threshold=self._started_at - 2,
+            label='下载后落盘名称',
+        )
+        if renamed == 0:
             self.log_line.emit('[提示] 文件名 Emoji 清理完成：本次下载未发现需要重命名的文件')
-            return
-        self.log_line.emit(f'[调试] 下载后重命名扫描完成：共扫描 {scanned_entries} 个文件/目录，命中 {rename_candidates} 个候选，实际重命名 {len(renamed_paths)} 个')
-        for source, target in renamed_paths[:12]:
-            try:
-                source_display = source.relative_to(root_dir)
-            except ValueError:
-                source_display = source
-            try:
-                target_display = target.relative_to(root_dir)
-            except ValueError:
-                target_display = target
-            self.log_line.emit(f'[重命名] {source_display} -> {target_display}')
-        if len(renamed_paths) > 12:
-            self.log_line.emit(f'[提示] 另有 {len(renamed_paths) - 12} 个文件/目录名已清理 Emoji')
 
     def _cleanup_info_json_metadata(self) -> None:
+        """post-download: 清理本次下载产生的 info.json 里 emoji/全角标点."""
         if not self.strip_emoji:
             return
-        root_dir = Path(self.download_dir)
-        scanned_files = 0
-        updated_files = 0
-        candidate_fields = ('title', 'fulltitle', 'playlist', 'playlist_title', 'uploader', 'channel')
-        for info_path in sorted(root_dir.rglob('*.info.json')):
-            try:
-                if info_path.stat().st_mtime < self._started_at - 2:
-                    continue
-            except OSError:
-                continue
-            scanned_files += 1
-            try:
-                payload = json.loads(info_path.read_text('utf-8'))
-            except Exception as exc:
-                self.log_line.emit(f'[提示] 读取 info.json 失败：{info_path.name} ({exc})')
-                continue
-            if not isinstance(payload, dict):
-                continue
-            changed_fields: list[str] = []
-            for field in candidate_fields:
-                raw_value = payload.get(field)
-                if not isinstance(raw_value, str) or not raw_value.strip():
-                    continue
-                cleaned_value = self._strip_emoji_from_name(raw_value)
-                if not cleaned_value or cleaned_value == raw_value:
-                    continue
-                self._log_sanitize_mapping(f'info.{field}', raw_value, cleaned_value)
-                payload[field] = cleaned_value
-                changed_fields.append(field)
-            if not changed_fields:
-                continue
-            try:
-                info_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), 'utf-8')
-                updated_files += 1
-                try:
-                    display_path = info_path.relative_to(root_dir)
-                except ValueError:
-                    display_path = info_path
-                self.log_line.emit(f'[重写] {display_path} 已清理字段: {", ".join(changed_fields)}')
-            except OSError as exc:
-                self.log_line.emit(f'[提示] 写回 info.json 失败：{info_path.name} ({exc})')
-        self.log_line.emit(f'[调试] info.json 内容清理完成：扫描 {scanned_files} 个文件，实际更新 {updated_files} 个')
+        _scan_and_clean_info_json_metadata(
+            root_dir=Path(self.download_dir),
+            log_line=self.log_line.emit,
+            mtime_threshold=self._started_at - 2,
+            label='下载后 info.json',
+        )
 
     def _probe_metadata_json(self, yt_dlp: str, cookies_args: list[str], js_runtime_args: list[str], remote_component_args: list[str]) -> dict:
         probe_cmd = [yt_dlp]
@@ -1179,6 +1413,7 @@ class DownloadTab(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.worker: DownloadWorker | None = None
+        self.cleanup_worker: EmojiCleanupWorker | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1251,9 +1486,26 @@ class DownloadTab(QWidget):
         js_runtime_row.addStretch(1)
         params_layout.addLayout(js_runtime_row)
 
+        strip_emoji_row = QHBoxLayout()
         self.strip_emoji_checkbox = QCheckBox('清理文件名中的 Emoji（推荐）')
         self.strip_emoji_checkbox.setChecked(True)
-        params_layout.addWidget(self.strip_emoji_checkbox)
+        strip_emoji_row.addWidget(self.strip_emoji_checkbox)
+        self.strip_emoji_row = strip_emoji_row
+        # 2026-08-24 新增: 历史文件清理按钮.
+        # 默认清理逻辑只处理 mtime 在 2s 窗口内的本次下载文件, 历史脏文件
+        # (例如 D:\yt-dlp\videos\English by Jay - Sprout\English Fluency
+        # Blueprint\ 下的 🇬🇧🛒🍎？｜) 永远碰不到. 这个按钮给用户手动
+        # 触发, 不限 mtime, 走同样的通用 emoji 识别 (emoji 库 / regex /
+        # 全角标点).
+        self.cleanup_existing_btn = QPushButton('清理历史文件')
+        self.cleanup_existing_btn.setToolTip(
+            '扫描整个下载目录, 把所有含 Emoji / 全角标点的历史文件/目录重命名.\n'
+            '默认清理逻辑只处理本次下载, 历史文件需要这个按钮手动清.'
+        )
+        self.cleanup_existing_btn.clicked.connect(self._on_cleanup_existing_clicked)
+        strip_emoji_row.addWidget(self.cleanup_existing_btn)
+        strip_emoji_row.addStretch(1)
+        params_layout.addLayout(strip_emoji_row)
         self.download_asr_audio_checkbox = QCheckBox('同时下载 ASR 音频 WAV（16kHz 单声道，推荐）')
         self.download_asr_audio_checkbox.setChecked(True)
         params_layout.addWidget(self.download_asr_audio_checkbox)
@@ -1489,6 +1741,7 @@ class DownloadTab(QWidget):
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
+        self.cleanup_existing_btn.setEnabled(False)
 
         ffmpeg_dir = self.ffmpeg_input.text().strip()
         cookies_browser = str(self.cookies_combo.currentData() or '')
@@ -1553,3 +1806,43 @@ class DownloadTab(QWidget):
             if self.strip_emoji_checkbox.isChecked():
                 self.log_box.appendPlainText('[提示] 本次下载未成功完成，文件名 Emoji 清理不会执行；保留当前名称可避免影响 .part 断点续传。')
         self.worker = None
+        self.cleanup_existing_btn.setEnabled(True)
+
+    def _on_cleanup_existing_clicked(self) -> None:
+        """用户点"清理历史文件"按钮: 不限 mtime 扫整个下载目录.
+
+        跑在独立 QThread 里, 避免 UI 卡死. 跟下载 worker 互斥 (不同时跑).
+        """
+        if self.cleanup_worker is not None and self.cleanup_worker.isRunning():
+            self.log_box.appendPlainText('[提示] 清理任务正在跑, 请等完成')
+            return
+        if self.worker is not None and self.worker.isRunning():
+            self.log_box.appendPlainText('[提示] 下载任务正在跑, 清理任务等下载完再触发')
+            return
+        download_dir = self.dir_input.text().strip()
+        if not download_dir:
+            QMessageBox.warning(self, '清理历史文件', '请先选择下载目录.')
+            return
+        if not Path(download_dir).exists():
+            QMessageBox.warning(self, '清理历史文件', f'下载目录不存在:\n{download_dir}')
+            return
+        # 二次确认: 历史清理可能改一堆名字
+        reply = QMessageBox.question(
+            self, '清理历史文件',
+            f'将扫描整个下载目录:\n{download_dir}\n\n'
+            '把所有含 Emoji / 全角标点的文件/目录重命名.\n'
+            '不会删除任何内容, 仅重命名.\n\n继续?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.cleanup_existing_btn.setEnabled(False)
+        self.log_box.appendPlainText(f'--- 开始清理历史文件 [{download_dir}] ---')
+        self.cleanup_worker = EmojiCleanupWorker(download_dir)
+        self.cleanup_worker.log_line.connect(self.log_box.appendPlainText)
+        self.cleanup_worker.finished_signal.connect(self._on_cleanup_finished)
+        self.cleanup_worker.start()
+
+    def _on_cleanup_finished(self, renamed_count: int) -> None:
+        self.cleanup_existing_btn.setEnabled(True)
+        self.cleanup_worker = None

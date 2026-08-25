@@ -81,18 +81,33 @@ function warnSupabaseTrace(message: string, payload?: unknown) {
  */
 export async function loadPublishedSeriesFromSupabase(
   forceRefresh: boolean = false,
+  pagination?: { limit: number; offset: number; level?: string | null },
 ): Promise<SupabaseSeriesRow[]> {
   try {
     // No long-lived cache here — the caller (video-series.ts) owns the
     // in-memory cache keyed by forceRefresh. We just hit Supabase each
     // cold call. Supabase PostgREST responses are HTTP-cacheable, so
     // a warm network layer will short-circuit if the row hasn't changed.
-    const { data, error } = await supabase
+    // 2026-08-21: 加分页参数, library 页面用数据库端 .range() 一次只取一页,
+    // 避免 series 多的时候一次性拉全表 + N+1 拉 manifest 慢。
+    let query = supabase
       .from('official_video_series')
       .select('id, title, level, category, type, description, cover_url, tags, sort_order, manifest_url, resource_base_url, is_published, updated_at')
-      .eq('is_published', true)
+      .eq('is_published', true);
+    if (pagination?.level) {
+      // 把 level 推到 server 端, 跟分页一起工作, 切 A1 时一次就只返 A1 系列
+      query = query.eq('level', pagination.level);
+    }
+    query = query
       .order('sort_order', { ascending: true })
       .order('title', { ascending: true });
+    if (pagination) {
+      // Supabase .range 是闭区间 [from, to], 需要 offset + limit - 1
+      const to = pagination.offset + pagination.limit - 1;
+      query = query.range(pagination.offset, to);
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       warnSupabaseTrace('loadPublishedSeries failed', { error: error.message });
@@ -102,6 +117,7 @@ export async function loadPublishedSeriesFromSupabase(
     logSupabaseTrace('loadPublishedSeries success', {
       count: rows.length,
       forceRefresh,
+      pagination,
     });
     return rows;
   } catch (err) {
@@ -109,6 +125,34 @@ export async function loadPublishedSeriesFromSupabase(
       error: err instanceof Error ? err.message : String(err),
     });
     return [];
+  }
+}
+
+/**
+ * 2026-08-21: library 页面分页用, 取 published series 总数, 用来判断 hasMore。
+ * 用 `count: 'exact'` + `head: true` 走 HEAD-style 请求, 只取 count 不取行,
+ * 避免下载完整表。
+ */
+export async function countPublishedSeries(level?: string | null): Promise<number> {
+  try {
+    let query = supabase
+      .from('official_video_series')
+      .select('id', { count: 'exact', head: true })
+      .eq('is_published', true);
+    if (level) {
+      query = query.eq('level', level);
+    }
+    const { count, error } = await query;
+    if (error) {
+      warnSupabaseTrace('countPublishedSeries failed', { error: error.message });
+      return 0;
+    }
+    return count ?? 0;
+  } catch (err) {
+    warnSupabaseTrace('countPublishedSeries threw', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return 0;
   }
 }
 

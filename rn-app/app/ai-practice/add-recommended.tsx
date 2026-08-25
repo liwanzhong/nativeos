@@ -18,11 +18,12 @@ import {
   View,
   Text,
   StyleSheet,
-  ScrollView,
+  FlatList,
   Pressable,
   ActivityIndicator,
   Alert,
   Modal,
+  ScrollView,
 } from 'react-native';
 import { Stack, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -72,6 +73,10 @@ export default function AiPracticeAddRecommendedPage() {
   const [isSceneSheetOpen, setIsSceneSheetOpen] = useState(false);
   const [addedTopicIds, setAddedTopicIds] = useState<Set<string>>(new Set());
 
+  // Pagination state
+  const [displayedCount, setDisplayedCount] = useState(20);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+
   const showToast = useCallback((message: string) => {
     if (toastTimer.current) {
       clearTimeout(toastTimer.current);
@@ -110,6 +115,8 @@ export default function AiPracticeAddRecommendedPage() {
       const groups = await listVideoAiTopicGroups(userLevel, false, effectivePickedIds);
       console.log('[AiPracticeAddRecommended] groups loaded', { count: groups.length, sample: groups.slice(0, 2).map(g => ({ sceneId: g.sceneId, sceneTitle: g.sceneTitle, topicCount: g.topicCount })) });
       setVideoGroups(groups);
+      // Reset pagination when data changes
+      setDisplayedCount(20);
     } catch (error) {
       console.warn('[AiPracticeAddRecommended] load failed', error);
       setVideoGroups([]);
@@ -158,6 +165,23 @@ export default function AiPracticeAddRecommendedPage() {
       })
       .sort((a, b) => b.fitScore - a.fitScore);
   }, [videoGroups, fitFilter, selectedCategories, userLevel]);
+
+  useEffect(() => {
+    setDisplayedCount(20);
+  }, [fitFilter, selectedCategories]);
+
+  const displayedItems = useMemo(() => {
+    return filteredItems.slice(0, displayedCount);
+  }, [filteredItems, displayedCount]);
+
+  const handleLoadMore = useCallback(() => {
+    if (isLoadingMore || displayedCount >= filteredItems.length) return;
+    setIsLoadingMore(true);
+    setTimeout(() => {
+      setDisplayedCount((prev) => Math.min(prev + 20, filteredItems.length));
+      setIsLoadingMore(false);
+    }, 100);
+  }, [isLoadingMore, displayedCount, filteredItems.length]);
 
   const handleAdd = useCallback(async (item: VideoAiTopicItem & { sceneId: string; sceneTitle: string }) => {
     if (addedTopicIds.has(item.topicId)) return;
@@ -262,7 +286,7 @@ export default function AiPracticeAddRecommendedPage() {
               </Text>
             </View>
           ) : (
-            filteredItems.map((item) => {
+            displayedItems.map((item) => {
               const added = addedTopicIds.has(item.topicId);
               return (
                 <View key={`recommended-${item.topicId}`} style={styles.recommendedCard}>
@@ -305,6 +329,23 @@ export default function AiPracticeAddRecommendedPage() {
               );
             })
           )}
+          {!isLoading && displayedCount < filteredItems.length ? (
+            <View style={styles.loadMoreContainer}>
+              {isLoadingMore ? (
+                <ActivityIndicator size="small" color={colors.primary} />
+              ) : (
+                <Pressable onPress={handleLoadMore} style={styles.loadMoreBtn}>
+                  <Text style={styles.loadMoreText}>
+                    加载更多 ({displayedCount} / {filteredItems.length})
+                  </Text>
+                </Pressable>
+              )}
+            </View>
+          ) : !isLoading && displayedCount >= filteredItems.length && filteredItems.length > 20 ? (
+            <View style={styles.endIndicator}>
+              <Text style={styles.endText}>已加载全部 {filteredItems.length} 个话题</Text>
+            </View>
+          ) : null}
         </ScrollView>
         {toast ? (
           <View style={styles.toast} pointerEvents="none">
@@ -386,6 +427,35 @@ const styles = StyleSheet.create({
   },
   filterRow: {
     marginBottom: spacing.sm,
+    paddingHorizontal: spacing.lg,
+  },
+  loadMoreContainer: {
+    paddingVertical: spacing.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: spacing.sm,
+  },
+  loadMoreBtn: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  loadMoreText: {
+    color: colors.primary,
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.medium,
+  },
+  endIndicator: {
+    paddingVertical: spacing.lg,
+    alignItems: 'center',
+    marginTop: spacing.sm,
+  },
+  endText: {
+    color: colors.text.tertiary,
+    fontSize: fontSize.sm,
   },
   headerSceneFilterBtn: {
     paddingHorizontal: 10,

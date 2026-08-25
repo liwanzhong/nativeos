@@ -31,10 +31,10 @@ import { useLocalSearchParams, useFocusEffect, useRouter } from 'expo-router';
 import {
   ActivityIndicator,
   Alert,
+  FlatList,
   Image,
   ImageBackground,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -142,6 +142,10 @@ export default function CollectionDetailPage() {
   // false there.
   const [isImportSheetVisible, setIsImportSheetVisible] = useState(false);
 
+  // Pagination state: display videos in pages of 10
+  const [displayedVideoCount, setDisplayedVideoCount] = useState(10);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+
   // Live download progress for any baidu-pan row in the list.
   // Keyed by entry id; value is the latest snapshot pushed by
   // `subscribeDownloadState`. Cleared on full page unmount and
@@ -179,6 +183,8 @@ export default function CollectionDetailPage() {
     try {
       const d = await getCollectionDetail(id, forceRefresh);
       setDetail(d);
+      // Reset pagination on new load
+      setDisplayedVideoCount(10);
       logDetailTrace('load success', {
         id,
         kind: d?.kind,
@@ -267,6 +273,24 @@ export default function CollectionDetailPage() {
     // already branches on scene.contentOrigin.
     router.push(`/scenario/video/${encodeURIComponent(videoId)}`);
   }, [router]);
+
+  const handleLoadMore = useCallback(() => {
+    if (!detail || isLoadingMore) return;
+    const totalVideos = detail.videos.length;
+    if (displayedVideoCount >= totalVideos) return;
+
+    setIsLoadingMore(true);
+    // Simulate async load (in case we want to add delay or animation)
+    setTimeout(() => {
+      setDisplayedVideoCount((prev) => Math.min(prev + 10, totalVideos));
+      setIsLoadingMore(false);
+    }, 100);
+  }, [detail, displayedVideoCount, isLoadingMore]);
+
+  const displayedVideos = useMemo(() => {
+    if (!detail) return [];
+    return detail.videos.slice(0, displayedVideoCount);
+  }, [detail, displayedVideoCount]);
 
   const handleUnpickOfficial = useCallback(async () => {
     if (!parsed || parsed.kind !== 'official') return;
@@ -679,47 +703,78 @@ export default function CollectionDetailPage() {
 
   return (
     <View style={styles.container}>
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={[styles.scrollContent, { paddingBottom: Math.max(120, insets.bottom + 96) }]}
-        showsVerticalScrollIndicator={false}
-      >
-        <View style={styles.headerRow}>
-          <Pressable style={styles.backBtn} onPress={() => router.back()} hitSlop={8}>
-            <ArrowLeft size={20} color={colors.text.primary} />
+      <View style={[styles.headerRow, { paddingTop: insets.top }]}>
+        <Pressable style={styles.backBtn} onPress={() => router.back()} hitSlop={8}>
+          <ArrowLeft size={20} color={colors.text.primary} />
+        </Pressable>
+        <View style={{ flex: 1 }} />
+        {detail ? (
+          <Pressable
+            style={styles.menuBtn}
+            hitSlop={8}
+            onPress={() => setMenuVisible((v) => !v)}
+          >
+            <MoreVertical size={20} color={colors.text.primary} />
           </Pressable>
-          <View style={{ flex: 1 }} />
-          {detail ? (
-            <Pressable
-              style={styles.menuBtn}
-              hitSlop={8}
-              onPress={() => setMenuVisible((v) => !v)}
-            >
-              <MoreVertical size={20} color={colors.text.primary} />
-            </Pressable>
-          ) : null}
-        </View>
+        ) : null}
+      </View>
 
-        {isLoading && !detail ? (
-          <View style={styles.center}>
-            <ActivityIndicator size="large" color={colors.primary} />
-          </View>
-        ) : !detail ? (
-          <View style={styles.center}>
-            <Text style={styles.errorText}>合集不存在或已被删除</Text>
-          </View>
-        ) : (
-          <>
-            {/* ── Header (cover-only) ──
-                No cover → no header at all. The card the user just
-                tapped already showed the title; showing a plain
-                "我的 / abc" text block here would just be a fake
-                cover. We drop straight to the video list, no
-                "视频" section title either — the list is the page.
-                With cover → hero treatment + the count meta + the
-                "视频列表" section title. The cover is the
-                orientation signal, the list is the body. */}
-            {detail.coverImageUri ? (
+      {isLoading && !detail ? (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={colors.primary} />
+        </View>
+      ) : !detail ? (
+        <View style={styles.center}>
+          <Text style={styles.errorText}>合集不存在或已被删除</Text>
+        </View>
+      ) : detail.videos.length === 0 ? (
+        <View style={styles.center}>
+          <Text style={styles.emptyText}>
+            {detail.kind === 'user' ? '这个合集还是空的' : '这个合集还没有内容'}
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          data={displayedVideos}
+          keyExtractor={(item) => item.id}
+          renderItem={({ item: video }) => (
+            <VideoRow
+              key={video.id}
+              video={video}
+              onPress={() => handleOpenVideo(video.id)}
+              onMorePress={
+                video.source && video.source !== 'official'
+                  ? () => handleOpenVideoActions(video)
+                  : undefined
+              }
+              onCachePress={
+                video.origin === 'baidu-pan' && video.cacheStatus !== 'cached'
+                  ? () => handleRowCachePress(video)
+                  : undefined
+              }
+              onBindingPress={
+                video.source === 'official' && video.bindingStatus && video.bindingStatus !== 'bound'
+                  ? () => handleRowBindingPress(video)
+                  : undefined
+              }
+              onSubtitlePress={
+                video.source === 'user-video'
+                && video.subtitleStatus
+                && video.subtitleStatus !== 'ready'
+                && video.subtitleStatus !== 'processing'
+                  ? () => handleRowSubtitlePress(video)
+                  : undefined
+              }
+              onAiTopicPress={
+                video.source === 'user-video' && video.aiTopicStatus === 'none'
+                  ? () => handleRowAiTopicPress(video)
+                  : undefined
+              }
+              downloadProgress={downloadProgress[video.id]}
+            />
+          )}
+          ListHeaderComponent={
+            detail.coverImageUri ? (
               <>
                 <View style={styles.coverBlock}>
                   <ImageBackground
@@ -750,77 +805,34 @@ export default function CollectionDetailPage() {
                   {detail.kind === 'official' ? '视频列表' : '视频'}
                 </Text>
               </>
-            ) : null}
-            {detail.videos.length === 0 ? (
-              <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>
-                  {detail.kind === 'user' ? '这个合集还是空的' : '这个合集还没有内容'}
-                </Text>
+            ) : null
+          }
+          ListFooterComponent={
+            displayedVideoCount < detail.videos.length ? (
+              <View style={styles.loadMoreContainer}>
+                {isLoadingMore ? (
+                  <ActivityIndicator size="small" color={colors.primary} />
+                ) : (
+                  <Pressable onPress={handleLoadMore} style={styles.loadMoreBtn}>
+                    <Text style={styles.loadMoreText}>
+                      加载更多 ({displayedVideoCount} / {detail.videos.length})
+                    </Text>
+                  </Pressable>
+                )}
               </View>
-            ) : (
-              <View style={styles.videoList}>
-                {detail.videos.map((video) => (
-                  <VideoRow
-                    key={video.id}
-                    video={video}
-                    onPress={() => handleOpenVideo(video.id)}
-                    onMorePress={
-                      // Only user-managed rows get a "..." affordance.
-                      // Official episodes are locked, packs and
-                      // user videos both support move / remove.
-                      video.source && video.source !== 'official'
-                        ? () => handleOpenVideoActions(video)
-                        : undefined
-                    }
-                    onCachePress={
-                      // Only the baidu cloud-reference rows light
-                      // up as actionable; everything else is a
-                      // static "已缓存" / "远端" badge.
-                      video.origin === 'baidu-pan' && video.cacheStatus !== 'cached'
-                        ? () => handleRowCachePress(video)
-                        : undefined
-                    }
-                    onBindingPress={
-                      // Official video rows: actionable whenever
-                      // the binding isn't already 'bound'. Tapping
-                      // either deep-links to the cloud-drives
-                      // sheet (no provider configured) or triggers
-                      // a fresh rescan (user might have dropped
-                      // the file since the last scan).
-                      video.source === 'official' && video.bindingStatus && video.bindingStatus !== 'bound'
-                        ? () => handleRowBindingPress(video)
-                        : undefined
-                    }
-                    onSubtitlePress={
-                      // 'none' / 'pending' / 'error' all light up
-                      // (the chip builder re-renders the label
-                      // and tint per state); 'ready' /
-                      // 'processing' are static.
-                      video.source === 'user-video'
-                      && video.subtitleStatus
-                      && video.subtitleStatus !== 'ready'
-                      && video.subtitleStatus !== 'processing'
-                        ? () => handleRowSubtitlePress(video)
-                        : undefined
-                    }
-                    onAiTopicPress={
-                      // User videos with no AI topics light up.
-                      // The handler itself gates on cache +
-                      // subtitle readiness; the chip stays
-                      // tappable either way so the user gets a
-                      // "what's blocking me" message.
-                      video.source === 'user-video' && video.aiTopicStatus === 'none'
-                        ? () => handleRowAiTopicPress(video)
-                        : undefined
-                    }
-                    downloadProgress={downloadProgress[video.id]}
-                  />
-                ))}
+            ) : displayedVideoCount >= detail.videos.length && detail.videos.length > 10 ? (
+              <View style={styles.endIndicator}>
+                <Text style={styles.endText}>已加载全部 {detail.videos.length} 个视频</Text>
               </View>
-            )}
-          </>
-        )}
-      </ScrollView>
+            ) : null
+          }
+          onEndReached={handleLoadMore}
+          onEndReachedThreshold={0.5}
+          contentContainerStyle={[styles.flatListContent, { paddingBottom: Math.max(120, insets.bottom + 96) }]}
+          ItemSeparatorComponent={() => <View style={{ height: spacing.xs }} />}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
 
       {menuVisible ? (
         <View style={styles.menuOverlay}>
@@ -1471,16 +1483,19 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
   scroll: { flex: 1 },
   scrollContent: { paddingHorizontal: spacing.md, paddingTop: spacing.md },
+  flatListContent: { paddingHorizontal: spacing.md },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: spacing.xl },
   errorText: { color: colors.text.secondary, fontSize: fontSize.base, marginBottom: spacing.md },
   errorBtn: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm, backgroundColor: colors.primary, borderRadius: borderRadius.md },
   errorBtnText: { color: '#FFFFFF', fontWeight: fontWeight.semibold },
+  emptyText: { color: colors.text.secondary, fontSize: fontSize.base, textAlign: 'center' },
 
   headerRow: {
     flexDirection: 'row',
     alignItems: 'center',
     marginBottom: spacing.md,
     gap: spacing.sm,
+    paddingHorizontal: spacing.md,
   },
   backBtn: {
     width: 36, height: 36, borderRadius: 18,
@@ -1530,6 +1545,34 @@ const styles = StyleSheet.create({
     color: colors.text.primary, marginBottom: spacing.sm,
   },
   videoList: { gap: spacing.xs },
+
+  // Pagination styles
+  loadMoreContainer: {
+    paddingVertical: spacing.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadMoreBtn: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  loadMoreText: {
+    color: colors.primary,
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.medium,
+  },
+  endIndicator: {
+    paddingVertical: spacing.lg,
+    alignItems: 'center',
+  },
+  endText: {
+    color: colors.text.tertiary,
+    fontSize: fontSize.sm,
+  },
 
   // ── Video row ──
   // Each row is a pressable surface with: a square cover

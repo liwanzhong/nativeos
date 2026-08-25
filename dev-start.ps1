@@ -74,7 +74,12 @@ if (Test-Path $DebugApk) {
     Write-Host "      debug APK not found, building now (this may take a few minutes)..." -ForegroundColor Yellow
     $AndroidDir = Join-Path $AppDir "android"
     Push-Location $AndroidDir
-    & ".\gradlew.bat" assembleDebug
+    # 2026-08-21: 显式加 x86_64. 网易 MuMu 模拟器是 x86_64 架构, gradle.properties 默认
+    # 只打 arm64-v8a + armeabi-v7a (注释: "为了减少编译内存压力"), 装到 MuMu 上
+    # 启动时 libreactnative.so 找不到直接闪退. dev 调试必须包含 x86_64, 编译时间
+    # 多 1-3 分钟, 但 release 用 abiFilters 单独控制不受影响.
+    # 用 --% 让 PowerShell 停止解析, -P 等参数原样透传给 gradlew.bat.
+    & ".\gradlew.bat" --% assembleDebug -PreactNativeArchitectures=armeabi-v7a,arm64-v8a,x86_64
     $buildExit = $LASTEXITCODE
     Pop-Location
 

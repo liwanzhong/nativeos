@@ -24,6 +24,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import {
   ActivityIndicator,
   Alert,
+  FlatList,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -36,8 +37,9 @@ import { ArrowLeft, Cloud, CloudOff, Link2, Settings2 } from 'lucide-react-nativ
 import { useCallback, useMemo, useState } from 'react';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../constants/theme';
 import {
-  getOfficialVideoSeriesListFromSupabase,
+  getOfficialVideoSeriesPageFromSupabase,
   invalidateVideoSeriesViewsCache,
+  type PaginatedSeriesResult,
 } from '../lib/content/video-series-supabase-views';
 import { listMyPickedSeriesIds, pickSeries, unpickSeries } from '../lib/content/user-picked-series';
 import { invalidateCollectionsCache } from '../lib/content/collections';
@@ -56,6 +58,17 @@ import {
 
 const LIBRARY_LOG_PREFIX = '[Library]';
 const LEVEL_ORDER = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+// 2026-08-21: 资源库分页加载。每页 10 个, 离底部 40% 时触发加载更多。
+const LIBRARY_PAGE_SIZE = 10;
+const LIBRARY_ON_END_REACHED_THRESHOLD = 0.4;
+
+// 2026-08-21: 计时助手。每步打 ms, 一眼看出哪步慢。
+// 用 performance.now() 而不是 Date.now() 更精确 (亚毫秒)。
+function logLibTiming(label: string, startMs: number): number {
+  const elapsed = performance.now() - startMs;
+  console.log(`${LIBRARY_LOG_PREFIX} [timing] ${label}: ${elapsed.toFixed(0)}ms`);
+  return performance.now();
+}
 
 function logLibTrace(message: string, payload?: unknown) {
   if (payload === undefined) {
@@ -91,48 +104,169 @@ export default function LibraryPage() {
   const [syncSummary, setSyncSummary] = useState<OfficialSceneSyncSummary | null>(null);
   const [isRescanning, setIsRescanning] = useState(false);
 
-  const load = useCallback(async (forceRefresh: boolean) => {
-    if (!forceRefresh) setIsLoading(true);
-    logLibTrace('load start', { forceRefresh });
-    try {
-      const [list, ids, configuredProviders] = await Promise.all([
-        getOfficialVideoSeriesListFromSupabase(forceRefresh),
-        listMyPickedSeriesIds(),
-        getConfiguredCloudProviders().catch(() => [] as ('baidu_pan')[]),
-      ]);
-      setSeries(list);
-      setPickedIdSet(ids);
-      const provider = configuredProviders[0] ?? 'baidu_pan';
+  // 2026-08-21: 分页状态。
+  // - total: 当前 level 筛选下 published series 总数 (server 端 count)
+  // - hasMore: 是否还有下一页
+  // - isLoadingMore: 上拉加载中
+  // - loadMoreError: 加载更多失败, footer 显示重试
+  // - page: 已加载的页数 (offset = page * PAGE_SIZE)
+  // - cloudProvider: 缓存当前选中的 provider, loadMore 算 binding status 用
+  const [total, setTotal] = useState(0);
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [page, setPage] = useState(0);
+  const [cloudProvider, setCloudProvider] = useState<'baidu_pan' | null>(null);
+
+  // 2026-08-21: 拉一页, level 走参数, fetchPage 引用稳定不依赖 state。
+  const fetchPage = useCallback(
+    async (offset: number, level: 'all' | string): Promise<PaginatedSeriesResult> => {
+      return await getOfficialVideoSeriesPageFromSupabase({
+        limit: LIBRARY_PAGE_SIZE,
+        offset,
+        level: level === 'all' ? null : level,
+      });
+    },
+    [],
+  );
+
+  // 计算当前 page 的 binding status, 累加到 bindingMap。
+  // 单独提出来, loadFirstPage / loadMore 都用, 避免重复代码。
+  const appendBindingForPage = useCallback(
+    async (items: OfficialVideoSeriesSummary[], provider: 'baidu_pan') => {
+      if (items.length === 0) return;
       const map = await getOfficialSceneBindingStatus(
-        list.map((s) => s.id),
+        items.map((s) => s.id),
         provider,
       );
-      setBindingMap(map);
-      setIsCloudReady(configuredProviders.length > 0);
-      logLibTrace('load success', { count: list.length, pickedCount: ids.size, provider });
-    } catch (err) {
-      logLibTrace('load failed', {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      setBindingMap((prev) => ({ ...prev, ...map }));
+    },
+    [],
+  );
+
+  // 2026-08-21: 加载第一页 (重置状态)。所有 reset 路径 (focus / pull refresh /
+  // 切 level) 都走这里, 行为一致。
+  // 2026-08-21 性能诊断: 每步打 timing, 看从打开到内容出来到底哪步慢。
+  // 之前用户报"打开页面到完全加载出内容用了将近一分钟", 找瓶颈用。
+  const loadFirstPage = useCallback(
+    async (level: 'all' | string) => {
+      const t0 = performance.now();
+      logLibTrace('loadFirstPage start', { level });
+      setIsLoading(true);
+      setLoadMoreError(null);
       setSeries([]);
-      setPickedIdSet(new Set());
-    } finally {
-      if (!forceRefresh) setIsLoading(false);
+      setTotal(0);
+      setHasMore(true);
+      setPage(0);
+      try {
+        let t = t0;
+        // 三件并发: series 列表 / picked ids / cloud providers 配置
+        const [r, ids, providers] = await Promise.all([
+          fetchPage(0, level),
+          listMyPickedSeriesIds(),
+          getConfiguredCloudProviders().catch(() => [] as ('baidu_pan')[]),
+        ]);
+        t = logLibTiming('series+picked+providers (parallel)', t);
+        const provider = providers[0] ?? 'baidu_pan';
+        setCloudProvider(provider);
+        setIsCloudReady(providers.length > 0);
+        setPickedIdSet(ids);
+        setSeries(r.items);
+        setTotal(r.total);
+        setHasMore(r.hasMore);
+        setPage(1);
+        logLibTiming('setState (series/picked/cloudProvider)', t);
+
+        // binding 状态: 对每个 series 查一次网盘绑定 (这是新怀疑点)
+        t = performance.now();
+        await appendBindingForPage(r.items, provider);
+        t = logLibTiming('appendBindingForPage', t);
+
+        logLibTiming('loadFirstPage total', t0);
+        logLibTrace('loadFirstPage success', {
+          level,
+          returned: r.items.length,
+          total: r.total,
+          hasMore: r.hasMore,
+          pickedCount: ids.size,
+        });
+      } catch (err) {
+        logLibTiming('loadFirstPage total (failed)', t0);
+        logLibTrace('loadFirstPage failed', {
+          level,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        setSeries([]);
+        setTotal(0);
+        setHasMore(false);
+        setPickedIdSet(new Set());
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [fetchPage, appendBindingForPage],
+  );
+
+  // 2026-08-21: 加载下一页。已加载 items 保留, append 新 items。
+  // 触发条件: 滚动到 FlatList 底部 (onEndReached), 由 UI 层调用。
+  const loadMore = useCallback(async () => {
+    if (!hasMore || isLoadingMore || isLoading) {
+      return;
     }
-  }, []);
+    if (!cloudProvider) {
+      // 还没拿到 provider (cloudProvider 在 loadFirstPage 后才设置),
+      // 不可能进 loadMore, 防御性返回
+      return;
+    }
+    setIsLoadingMore(true);
+    setLoadMoreError(null);
+    const nextOffset = page * LIBRARY_PAGE_SIZE;
+    const t0 = performance.now();
+    let t = t0;
+    logLibTrace('loadMore start', { nextOffset, level: levelFilter, page });
+    try {
+      const r = await fetchPage(nextOffset, levelFilter);
+      t = logLibTiming('loadMore fetchPage', t);
+      setSeries((prev) => {
+        // 防御: server 可能返回重复 id (offset 数据变化时), 用 Set 去重
+        const seen = new Set(prev.map((s) => s.id));
+        const fresh = r.items.filter((s) => !seen.has(s.id));
+        return [...prev, ...fresh];
+      });
+      setTotal(r.total);
+      setHasMore(r.hasMore);
+      setPage((p) => p + 1);
+      t = logLibTiming('loadMore setState', t);
+      await appendBindingForPage(r.items, cloudProvider);
+      t = logLibTiming('loadMore appendBindingForPage', t);
+      logLibTiming('loadMore total', t0);
+      logLibTrace('loadMore success', {
+        nextOffset,
+        returned: r.items.length,
+        total: r.total,
+        hasMore: r.hasMore,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logLibTrace('loadMore failed', { nextOffset, error: msg });
+      setLoadMoreError(msg);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }, [hasMore, isLoadingMore, isLoading, cloudProvider, page, fetchPage, appendBindingForPage, levelFilter]);
 
   useFocusEffect(useCallback(() => {
-    void load(false);
-  }, [load]));
+    void loadFirstPage(levelFilter);
+  }, [loadFirstPage, levelFilter]));
 
   const onPullRefresh = useCallback(async () => {
     setIsPullRefreshing(true);
     try {
-      await load(true);
+      await loadFirstPage(levelFilter);
     } finally {
       setIsPullRefreshing(false);
     }
-  }, [load]);
+  }, [loadFirstPage, levelFilter]);
 
   // Re-scan the user's configured cloud drive for matching
   // official-video files. Refreshes the binding map + summary
@@ -144,13 +278,13 @@ export default function LibraryPage() {
       const next = await rescanOfficialSceneSyncStatus(true);
       setSyncSummary(next);
       invalidateOfficialSceneBindingStatusCache();
-      await load(false);
+      await loadFirstPage(levelFilter);
     } catch (err) {
       Alert.alert('扫描失败', err instanceof Error ? err.message : String(err));
     } finally {
       setIsRescanning(false);
     }
-  }, [isRescanning, load]);
+  }, [isRescanning, loadFirstPage, levelFilter]);
 
   // Open the cloud-drive management sheet (auth / provider
   // configuration). When the user comes back, useFocusEffect
@@ -189,6 +323,18 @@ export default function LibraryPage() {
   const handleCachePress = useCallback((seriesId: string) => {
     router.push(`/library/${encodeURIComponent(seriesId)}`);
   }, [router]);
+
+  // 2026-08-21: 切 level 筛选时, 重置分页 (清空 series, page=0, 重新拉第一页)。
+  // 把 level 推到 server 端, 一次就只拉该 level 的 series, 不会出现
+  // "10 个里筛出 1 个"的糟糕 UX。
+  const handleLevelChange = useCallback(
+    (newLevel: 'all' | string) => {
+      if (newLevel === levelFilter) return;
+      setLevelFilter(newLevel);
+      void loadFirstPage(newLevel);
+    },
+    [levelFilter, loadFirstPage],
+  );
 
   // Summary numbers for the cloud-banner. Only built when a
   // provider is configured.
@@ -230,149 +376,181 @@ export default function LibraryPage() {
     }
   }, [pendingPickId, pickedIdSet]);
 
-  const visible = useMemo(() => {
-    if (levelFilter === 'all') return series;
-    return series.filter((s) => s.level === levelFilter);
-  }, [levelFilter, series]);
+  // 2026-08-21: 之前 client 端用 visible = series.filter(level) 筛, 现在
+  // server 端已经在 SQL 里 .eq('level', ...) 筛过, 不需要 client 再 filter。
+  // 留这个 useMemo 注释是为了让 review 时一眼看到这是有意删的, 避免后续
+  // 误以为漏写。
 
   return (
     <View style={styles.container}>
-      <ScrollView
+      <FlatList
+        data={series}
+        keyExtractor={(item) => item.id}
+        renderItem={({ item }) => (
+          <LibraryCard
+            series={item}
+            isPicked={pickedIdSet.has(item.id)}
+            isPicking={pendingPickId === item.id}
+            onTogglePick={() => handleTogglePick(item.id)}
+            onOpen={() => router.push(`/library/${encodeURIComponent(item.id)}`)}
+            binding={bindingMap[item.id]}
+            onBindingPress={() => handleBindingPress(item.id)}
+            onCachePress={() => handleCachePress(item.id)}
+          />
+        )}
         style={styles.scroll}
         contentContainerStyle={[
           styles.scrollContent,
           { paddingBottom: Math.max(120, insets.bottom + 96) },
         ]}
         showsVerticalScrollIndicator={false}
+        // 2026-08-21: 触发分页加载更多
+        onEndReached={loadMore}
+        onEndReachedThreshold={LIBRARY_ON_END_REACHED_THRESHOLD}
         refreshControl={
           <RefreshControl refreshing={isPullRefreshing} onRefresh={onPullRefresh} />
         }
-      >
-        <View style={styles.headerRow}>
-          <Pressable
-            style={styles.backBtn}
-            onPress={() => router.back()}
-            hitSlop={8}
-            accessibilityLabel="返回"
-          >
-            <ArrowLeft size={20} color={colors.text.primary} />
-          </Pressable>
-          <View style={styles.headerTitleWrap}>
-            <Text style={styles.headerTitle}>资源库</Text>
-          </View>
-        </View>
-
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.filterRow}
-        >
-          <Pressable
-            style={[styles.filterChip, levelFilter === 'all' && styles.filterChipActive]}
-            onPress={() => setLevelFilter('all')}
-          >
-            <Text style={[styles.filterChipText, levelFilter === 'all' && styles.filterChipTextActive]}>
-              全部
-            </Text>
-          </Pressable>
-          {LEVEL_ORDER.map((level) => {
-            const active = levelFilter === level;
-            return (
+        ListHeaderComponent={
+          <View>
+            <View style={styles.headerRow}>
               <Pressable
-                key={`library-level-${level}`}
-                style={[styles.filterChip, active && styles.filterChipActive]}
-                onPress={() => setLevelFilter(level)}
+                style={styles.backBtn}
+                onPress={() => router.back()}
+                hitSlop={8}
+                accessibilityLabel="返回"
               >
-                <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>
-                  {level}
-                </Text>
+                <ArrowLeft size={20} color={colors.text.primary} />
               </Pressable>
-            );
-          })}
-        </ScrollView>
-
-        {/* Cloud-drive status banner.
-            Three states:
-              1. No provider configured → call-to-action CTA pointing
-                 at /cloud-drives to authorise Baidu pan.
-              2. Provider configured, no series bound yet → soft hint
-                 with a "重新扫描" button so the user can retry.
-              3. Some series bound → summary numbers + scan button
-                 (rescan surfaces new files the user dropped in). */}
-        <View style={styles.cloudBanner}>
-          {!isCloudReady ? (
-            <Pressable
-              style={styles.cloudBannerActionable}
-              onPress={handleOpenCloudDrives}
-            >
-              <View style={styles.cloudBannerIcon}>
-                <CloudOff size={18} color={colors.primary} />
+              <View style={styles.headerTitleWrap}>
+                <Text style={styles.headerTitle}>资源库</Text>
               </View>
-              <View style={styles.cloudBannerBody}>
-                <Text style={styles.cloudBannerTitle}>授权百度网盘</Text>
-                <Text style={styles.cloudBannerDesc}>
-                  授权后可以扫描你的网盘,自动把推荐视频绑定到本地播放,免流量观看。
-                </Text>
-              </View>
-              <Settings2 size={16} color={colors.text.secondary} />
-            </Pressable>
-          ) : (
-            <View style={styles.cloudBannerRow}>
-              <View style={styles.cloudBannerIcon}>
-                <Cloud size={18} color={colors.primary} />
-              </View>
-              <View style={styles.cloudBannerBody}>
-                <Text style={styles.cloudBannerTitle}>百度网盘已授权</Text>
-                <Text style={styles.cloudBannerDesc}>
-                  {bindingSummary
-                    ? `已绑定 ${bindingSummary.bound} / ${bindingSummary.total} 集,已缓存 ${bindingSummary.cached} 集`
-                    : '正在读取绑定状态…'}
-                </Text>
-              </View>
-              <Pressable
-                style={styles.cloudBannerScanBtn}
-                onPress={handleRescan}
-                disabled={isRescanning}
-              >
-                {isRescanning ? (
-                  <ActivityIndicator size="small" color={colors.primary} />
-                ) : (
-                  <Text style={styles.cloudBannerScanBtnText}>重新扫描</Text>
-                )}
-              </Pressable>
             </View>
-          )}
-        </View>
 
-        {isLoading && series.length === 0 ? (
-          <View style={styles.loadingBanner}>
-            <ActivityIndicator size="small" color={colors.primary} />
-            <Text style={styles.loadingText}>资源库加载中…</Text>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={styles.filterRow}
+            >
+              <Pressable
+                style={[styles.filterChip, levelFilter === 'all' && styles.filterChipActive]}
+                onPress={() => handleLevelChange('all')}
+              >
+                <Text style={[styles.filterChipText, levelFilter === 'all' && styles.filterChipTextActive]}>
+                  全部
+                </Text>
+              </Pressable>
+              {LEVEL_ORDER.map((level) => {
+                const active = levelFilter === level;
+                return (
+                  <Pressable
+                    key={`library-level-${level}`}
+                    style={[styles.filterChip, active && styles.filterChipActive]}
+                    onPress={() => handleLevelChange(level)}
+                  >
+                    <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>
+                      {level}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+
+            {/* Cloud-drive status banner.
+                Three states:
+                  1. No provider configured → call-to-action CTA pointing
+                     at /cloud-drives to authorise Baidu pan.
+                  2. Provider configured, no series bound yet → soft hint
+                     with a "重新扫描" button so the user can retry.
+                  3. Some series bound → summary numbers + scan button
+                     (rescan surfaces new files the user dropped in). */}
+            <View style={styles.cloudBanner}>
+              {!isCloudReady ? (
+                <Pressable
+                  style={styles.cloudBannerActionable}
+                  onPress={handleOpenCloudDrives}
+                >
+                  <View style={styles.cloudBannerIcon}>
+                    <CloudOff size={18} color={colors.primary} />
+                  </View>
+                  <View style={styles.cloudBannerBody}>
+                    <Text style={styles.cloudBannerTitle}>授权百度网盘</Text>
+                    <Text style={styles.cloudBannerDesc}>
+                      授权后可以扫描你的网盘,自动把推荐视频绑定到本地播放,免流量观看。
+                    </Text>
+                  </View>
+                  <Settings2 size={16} color={colors.text.secondary} />
+                </Pressable>
+              ) : (
+                <View style={styles.cloudBannerRow}>
+                  <View style={styles.cloudBannerIcon}>
+                    <Cloud size={18} color={colors.primary} />
+                  </View>
+                  <View style={styles.cloudBannerBody}>
+                    <Text style={styles.cloudBannerTitle}>百度网盘已授权</Text>
+                    <Text style={styles.cloudBannerDesc}>
+                      {bindingSummary
+                        ? `已绑定 ${bindingSummary.bound} / ${bindingSummary.total} 集,已缓存 ${bindingSummary.cached} 集`
+                        : '正在读取绑定状态…'}
+                    </Text>
+                  </View>
+                  <Pressable
+                    style={styles.cloudBannerScanBtn}
+                    onPress={handleRescan}
+                    disabled={isRescanning}
+                  >
+                    {isRescanning ? (
+                      <ActivityIndicator size="small" color={colors.primary} />
+                    ) : (
+                      <Text style={styles.cloudBannerScanBtnText}>重新扫描</Text>
+                    )}
+                  </Pressable>
+                </View>
+              )}
+            </View>
+
+            {/* 首次加载且没数据时, header 底部显示加载中 (列表本身空) */}
+            {isLoading && series.length === 0 ? (
+              <View style={styles.loadingBanner}>
+                <ActivityIndicator size="small" color={colors.primary} />
+                <Text style={styles.loadingText}>资源库加载中…</Text>
+              </View>
+            ) : null}
           </View>
-        ) : visible.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyText}>
-              当前筛选下没有可加的视频。换一个等级试试,或者下拉刷新一下。
-            </Text>
+        }
+        ListEmptyComponent={
+          // series.length === 0 时显示 empty state。注意: 这个组件在没数据时
+          // 也会渲染, 但我们已经在 header 里处理了 isLoading, 这里只处理
+          // "加载完成但 0 条" 的情况。
+          isLoading ? null : (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyText}>
+                当前筛选下没有可加的视频。换一个等级试试,或者下拉刷新一下。
+              </Text>
+            </View>
+          )
+        }
+        ListFooterComponent={
+          // 列表底部分页状态指示器:
+          //   - 加载更多中: spinner
+          //   - 加载更多失败: 重试按钮
+          //   - 已加载全部: "— 已显示全部 —"
+          //   - 还未开始加载: 不显示
+          <View style={styles.footerContainer}>
+            {isLoadingMore ? (
+              <View style={styles.footerRow}>
+                <ActivityIndicator size="small" color={colors.primary} />
+                <Text style={styles.footerText}>加载更多…</Text>
+              </View>
+            ) : loadMoreError ? (
+              <Pressable style={styles.footerRetry} onPress={loadMore}>
+                <Text style={styles.footerRetryText}>加载失败, 点重试</Text>
+              </Pressable>
+            ) : !hasMore && series.length > 0 ? (
+              <Text style={styles.footerDone}>— 已显示全部 {total} 个合集 —</Text>
+            ) : null}
           </View>
-        ) : (
-          <View style={styles.cardList}>
-            {visible.map((s) => (
-              <LibraryCard
-                key={s.id}
-                series={s}
-                isPicked={pickedIdSet.has(s.id)}
-                isPicking={pendingPickId === s.id}
-                onTogglePick={() => handleTogglePick(s.id)}
-                onOpen={() => router.push(`/library/${encodeURIComponent(s.id)}`)}
-                binding={bindingMap[s.id]}
-                onBindingPress={() => handleBindingPress(s.id)}
-                onCachePress={() => handleCachePress(s.id)}
-              />
-            ))}
-          </View>
-        )}
-      </ScrollView>
+        }
+      />
     </View>
   );
 }
@@ -484,6 +662,38 @@ const styles = StyleSheet.create({
     lineHeight: 20,
   },
   cardList: { gap: spacing.md, paddingTop: spacing.sm },
+
+  // ── 列表 footer (分页状态) ──
+  // 加载更多中 / 失败重试 / 已到底, 三种状态
+  footerContainer: {
+    paddingVertical: spacing.lg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  footerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  footerText: {
+    color: colors.text.secondary,
+    fontSize: fontSize.sm,
+  },
+  footerRetry: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: borderRadius.md,
+    backgroundColor: 'rgba(15,118,110,0.10)',
+  },
+  footerRetryText: {
+    color: '#0F766E',
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.semibold,
+  },
+  footerDone: {
+    color: colors.text.secondary,
+    fontSize: fontSize.xs,
+  },
 
   // ── Cloud-drive status banner ──
   // Sits between the level filter row and the card list. Two

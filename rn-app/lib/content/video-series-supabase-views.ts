@@ -29,6 +29,7 @@
 
 import {
   loadPublishedSeriesFromSupabase,
+  countPublishedSeries,
   loadMyPickedSeriesFromSupabase,
   loadSeriesEpisodesFromSupabase,
   loadEpisodesForSeriesBatch,
@@ -228,6 +229,14 @@ function buildSummaryFromSupabase(
     : (manifest?.seriesMeta?.tags ?? [])
   ).filter((t) => typeof t === 'string' && t.trim()).slice(0, 4);
 
+  // 2026-08-21: list 页 (library / 我的合集) 传 manifest=null, 此时:
+  // - episodeCount = 0 (详情页 library/[id] 会单独查真值)
+  // - completedEpisodeCount = 0 (没有 episode 数据算不出来)
+  // - lastPracticedAt / resumeSceneId 也不可靠
+  // - 封面/标题/level/category/tags/description 仍然正常 (从 row 拿)
+  // 这样 list 页只查 official_video_series 单次 query, 不再 N+1 拉 episodes.
+  const isListOnlyMode = manifest == null;
+
   return {
     id: row.id,
     title: row.title,
@@ -240,11 +249,11 @@ function buildSummaryFromSupabase(
     coverImageUri: resolveSeriesCoverUrl(row.manifest_url, row.cover_url),
     tags,
     category: row.category,
-    episodeCount: sortedEpisodes.length,
-    completedEpisodeCount: practicedEpisodeCount,
-    lastPracticedAt,
-    resumeSceneId: resumeEpisode?.id,
-    resumeEpisodeIndex: resumeEpisode?.episodeIndex,
+    episodeCount: isListOnlyMode ? 0 : sortedEpisodes.length,
+    completedEpisodeCount: isListOnlyMode ? 0 : practicedEpisodeCount,
+    lastPracticedAt: isListOnlyMode ? undefined : lastPracticedAt,
+    resumeSceneId: isListOnlyMode ? undefined : resumeEpisode?.id,
+    resumeEpisodeIndex: isListOnlyMode ? undefined : resumeEpisode?.episodeIndex,
     firstSceneId: firstEpisode?.id,
     firstEpisodeIndex: firstEpisode?.episodeIndex,
     sortOrder: row.sort_order,
@@ -308,6 +317,87 @@ export async function getOfficialVideoSeriesListFromSupabase(
   });
   writeCache(libraryCache, summaries);
   return summaries;
+}
+
+// ── Public: 分页版 (library 页面用) ─────────────────────────────────
+
+/**
+ * 2026-08-21: library 页面分页加载专用。
+ *
+ * 跟 getOfficialVideoSeriesListFromSupabase 的区别:
+ *   - 这个**不缓存**, 每次调用都走 DB, 适合分页按需加载
+ *   - 数据库端 .range() 一次只取 limit 条, 避免拉全表
+ *   - 同样并发拉每条 series 的 manifest, 但 N+1 范围限制在 limit 个内
+ *
+ * Returns: { items, total, hasMore }
+ *   - items: 这一页的 OfficialVideoSeriesSummary (排序跟全量版一致: sortOrder, lastPracticedAt, level, title)
+ *   - total: published series 总数 (用于分页进度显示)
+ *   - hasMore: offset + items.length < total
+ *
+ * 失败返回空结果, total=0, hasMore=false. 不抛错 (UI 容错用)。
+ */
+export interface PaginatedSeriesResult {
+  items: OfficialVideoSeriesSummary[];
+  total: number;
+  hasMore: boolean;
+}
+
+export async function getOfficialVideoSeriesPageFromSupabase(
+  pagination: { limit: number; offset: number; level?: string | null },
+): Promise<PaginatedSeriesResult> {
+  const { limit, offset } = pagination;
+  const level = pagination.level ?? null;
+  try {
+    // 2026-08-21: list 页只查 official_video_series 单次 query, 不再 N+1 拉 episodes.
+    // 详情页 library/[id] 会通过 getOfficialVideoSeriesDetailFromSupabase(seriesId)
+    // 单独查 (走 episodes 表 + manifest, 单个 series 不存在 N+1 问题).
+    // user_meta 也要查, 因为 completedEpisodeCount / lastPracticedAt / resumeSceneId
+    // 需要它. 但 list 页传 manifest=null 时这些字段都填 0 / undefined, 所以
+    // user_meta 这次也省了 — 直接空数组.
+    const [rows, total] = await Promise.all([
+      loadPublishedSeriesFromSupabase(false, { limit, offset, level }),
+      countPublishedSeries(level),
+    ]);
+
+    if (rows.length === 0) {
+      // 一页都没有: 直接返空, 不走 legacy fallback
+      // (分页场景下没必要全量 fallback, 没数据就是没数据)
+      logViewsTrace('library page empty', { offset, limit, level, total });
+      return { items: [], total, hasMore: offset < total };
+    }
+
+    // 不再 N+1 调 fetchSeriesEpisodesFromSupabase. buildSummaryFromSupabase
+    // 接受 manifest=null 时 episodeCount/completedEpisodeCount 等填 0,
+    // UI 显示 "—" 即可, 真值在用户点进详情页时才查.
+    const items: OfficialVideoSeriesSummary[] = rows.map((row) =>
+      buildSummaryFromSupabase(row, null, []),
+    );
+
+    // 排序保留: sortOrder, title (lastPracticedAt 不可靠, list 模式下全 undefined)
+    items.sort((a, b) => {
+      if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+      return a.level.localeCompare(b.level, 'zh-Hans-CN') || a.title.localeCompare(b.title, 'zh-Hans-CN');
+    });
+
+    const hasMore = offset + items.length < total;
+    logViewsTrace('library page loaded', {
+      offset,
+      limit,
+      level,
+      returned: items.length,
+      total,
+      hasMore,
+    });
+    return { items, total, hasMore };
+  } catch (err) {
+    logViewsTrace('library page failed', {
+      offset,
+      limit,
+      level,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { items: [], total: 0, hasMore: false };
+  }
 }
 
 // ── Public: 我的跟练 (user-picked) ─────────────────────────────────
