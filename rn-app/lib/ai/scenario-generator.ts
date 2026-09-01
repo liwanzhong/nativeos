@@ -34,12 +34,59 @@ export interface ScriptNode {
   id: string;             // stable snake_case key, e.g. "check_documents"
   name: string;           // short Chinese label, e.g. "检查证件"
   description: string;    // abstract narrative (目标 + 行为边界, NO example dialogue)
+  /**
+   * Recommended minimum turns the NPC should spend on this stage before
+   * transitioning. The runtime does NOT hard-cap this — it's a soft hint
+   * surfaced to the LLM via the system prompt so it knows to extend the
+   * conversation with sub-beats (follow-up questions, clarifications,
+   * micro-pushback) rather than jumping to the next stage after one
+   * user reply. Typical values: 2-4.
+   */
+  minTurns?: number;
 }
 
 export interface ScriptEnding {
   type: 'success' | 'failure' | 'branch';
   trigger: string;        // abstract trigger description (not a hard counter)
   npcFinalLine?: string;  // optional literal line; usually omit so Qwen can improvise
+  /**
+   * When the ending is `branch`, this describes what new storyline the
+   * NPC should open. E.g. "open secondary inspection scene with a new
+   * officer who asks the same questions in a different order". Branches
+   * let the conversation escape a dead-end rather than terminating in
+   * a flat success/failure.
+   */
+  branchSetup?: string;
+}
+
+/**
+ * ConversationGoal (2026-09-01) — replaces "script stage" with "goal".
+ *
+ * A goal is a TOPIC to discuss, NOT a stage to perform in order. The NPC
+ * is told "you need to cover these N topics" but the ORDER, DEPTH, and
+ * TIMING of when to bring each one up is decided by the LLM each turn
+ * based on the live conversation state.
+ *
+ * Static layer: defined in the scenario card. Never changes after
+ * generation. The prompt engine surfaces these to the LLM as
+ * "you need to discuss these topics" — not as a sequence to follow.
+ */
+export interface ConversationGoal {
+  id: string;                // stable snake_case key, e.g. "verify_purpose"
+  name: string;              // short label, e.g. "确认访问目的"
+  description: string;       // abstract: what the NPC must eventually know / cover
+  /**
+   * Optional priority hint. LLM is free to ignore. Higher = more important
+   * (NPC should push harder to cover this). Lower = can be skipped if the
+   * conversation goes off in a different direction.
+   */
+  priority?: number;         // 0-3, default 1
+  /**
+   * Edge cases / real-life frictions to bring up if the learner gives an
+   * opening. Optional. NPC can use these to "test" the learner with
+   * believable follow-ups.
+   */
+  edgeCases?: string[];
 }
 
 export interface ScenarioCard {
@@ -69,7 +116,15 @@ export interface ScenarioCard {
   npcPersona?: string;            // 3-5 sentences: who they are, mood, behavior pattern
   learnerPersona?: string;        // 2-3 sentences: learner's identity, level, emotional state
   interactionRules?: string[];    // 3-5 hard rules (e.g. "一次只问一个问题")
-  scriptNodes?: ScriptNode[];     // ordered narrative beats
+  scriptNodes?: ScriptNode[];     // ordered narrative beats (legacy — kept for back-compat; new cards should use conversationGoals)
+  /**
+   * Conversation goals (2026-09-01) — the topics the NPC must cover.
+   * Unlike scriptNodes, these are NOT a sequence to follow in order; the
+   * LLM decides each turn which to advance, defer, or skip. Prefer this
+   * over scriptNodes for new cards. ScriptNode-derived cards fall back
+   * to the legacy "ordered stage" behavior.
+   */
+  conversationGoals?: ConversationGoal[];
   endings?: ScriptEnding[];       // possible endings
 }
 
@@ -211,7 +266,7 @@ export async function generateDailyScenariosStream(
   // If this is a custom query (single free-text description, not a domain tag), use dedicated prompt
   const isCustomQuery = interests.length === 1 && interests[0].length > 10;
   const prompt = isCustomQuery
-    ? buildCustomQueryPrompt(count, userLevel, interests[0], npcFirstCount, userFirstCount)
+    ? buildCustomQueryPrompt(count, userLevel, interests[0], npcFirstCount, userFirstCount, undefined)
     : buildScenarioPrompt(count, userLevel, interests, npcFirstCount, userFirstCount, excludeTitles);
 
   console.log('[ScenarioGenerator] ===== FULL PROMPT =====\n' + prompt + '\n[ScenarioGenerator] ===== END PROMPT =====');
@@ -482,6 +537,11 @@ Return ONLY valid JSON, no markdown:
 /**
  * Prompt builder for free-text custom queries (e.g. "我的小狗走丢了，向保安询问").
  * Unlike the domain-based prompt, ALL scenarios must revolve around the described scene.
+ *
+ * scriptSchema (optional): when provided, the generator treats this as a THEME
+ * and generates ${count} DIFFERENT variants of the same theme — each with a
+ * distinct NPC, setting detail, and situational twist. The schema itself
+ * contains NO example dialogue (千问会把 example 照抄).
  */
 function buildCustomQueryPrompt(
   count: number,
@@ -489,14 +549,15 @@ function buildCustomQueryPrompt(
   query: string,
   npcFirstCount: number,
   userFirstCount: number,
+  scriptSchema: string | undefined,
 ): string {
   return `You are NativeOS, an immersive English learning scenario designer.
 
-The learner described this specific real-life situation in Chinese:
+The learner wants to practice this situation:
 「${query}」
 
-Your job: Generate exactly ${count} English conversation practice scenarios that are ALL directly based on this exact situation. Do NOT invent unrelated scenarios. Every scenario must involve the same core situation described above, but approach it from different angles, different NPCs, or different stages of the interaction.
-
+Your job: Generate exactly ${count} English conversation practice scenarios.${scriptSchema ? ' These must be DIFFERENT VARIANTS of the same theme — each variant should be the same core scenario but with a unique NPC, setting, and twist.' : ' Every scenario must involve the same core situation described above, but approach it from different angles, different NPCs, or different stages of the interaction.'}
+${scriptSchema ? '\n' + scriptSchema + '\n' : ''}
 User profile:
 - CEFR level: ${userLevel}
 
@@ -505,7 +566,7 @@ Every scenario belongs to one of two tracks:
 
 ### Track A — npc_first (${npcFirstCount} scenarios): NPC speaks first
 - userInitiates = false
-- openingLine = NPC's first English sentence (in-character)
+- openingLine = NPC's first English sentence (in-character, original)
 - openingLineZh = accurate Chinese translation of openingLine
 - environmentalCue = null
 - environmentalCueEn = null
@@ -517,17 +578,74 @@ Every scenario belongs to one of two tracks:
 - environmentalCue = Chinese-only narration (2-3 sentences): describe the scene vividly
 - environmentalCueEn = English-only narration: same content as environmentalCue in English
 
-### npcSystemPrompt (both tracks)
-1-2 English sentences: NPC's role + learner's role + scenario friction.
+### Script-Driven Fields (both tracks, 2026-09-01 schema with depth upgrade)
+**MANDATORY — response is INVALID if any of these 5 fields is missing or empty.**
+The runtime detects missing fields and falls back to a worse experience; the
+scenario will feel "dry" and the NPC will parrot a 1-line reply. You MUST
+populate all 5 for EVERY scenario. The NPC will use these as their "character
+sheet" to play the role. Write them as if directing an actor.
 
-### taskContract (both tracks)
-Return a structured contract with objective, learnerGoal, npcRole, sceneFrame, initialStage, requiredSlots, allowedTopicExtensions, outOfScopeTopics, and completionCriteria so the scenario can remain stable over multiple turns.
+**Depth requirements (CRITICAL — fix the "1-2 turn then done" problem):**
+- **npcPersona** (5-8 sentences): NOT a role label. A BEHAVIOR MODEL. Include:
+  WHO (1-2 sentences), CURRENT STATE (fatigued? rushed? curious?), then 3-5
+  concrete "When X happens, the NPC does Y" behavior patterns. Generic
+  descriptions like "You are a helpful person" are REJECTED.
+- **learnerPersona** (2-3 sentences): The learner's identity, language level,
+  emotional state, and motivation in this scenario. Write in English.
+- **interactionRules** (array of 5-8 short rules): MUST include at least these
+  three "depth" rules:
+    - "After the learner answers, ask 1-2 follow-up sub-beat questions before moving on"
+    - "Bridge naturally between script stages — never say 'next question' or similar meta-commentary"
+    - "If the learner says thanks/ok/that's-all, do NOT close — add a 'By the way...' or 'Wait, one more...' angle"
+  Plus 2-5 scenario-specific rules (ask one question per turn, speak English only, etc.).
+- **conversationGoals** (array of 3-6 goals, NEW 2026-09-01 model — REPLACES
+  the old "scriptNodes in order" thinking): These are TOPICS the NPC must
+  eventually cover, NOT a sequence to follow. The LLM runs an agent loop
+  each turn and decides WHEN to dig deeper, WHEN to advance, WHEN to
+  handle friction. Each goal has:
+  - id: snake_case key
+  - name: short label
+  - description: 1-2 sentences describing what the NPC must eventually
+    know / cover. **DO NOT write sub-beats.** The LLM decides the rhythm
+    per turn.
+  - priority: 0-3 (default 1). Higher = more important, NPC pushes harder
+    to cover it. Lower = can be skipped if the conversation goes elsewhere.
+  - edgeCases: array of 1-3 realistic frictions the NPC can use to test
+    the learner, e.g. "Learner fumbles searching for passport" or
+    "Learner says 'in my bag' without specifying which" or "Learner
+    contradicts an earlier answer".
+  CRITICAL: DO NOT write example dialogue in any field. DO NOT write
+  sub-beats. Just describe the goal's topic and 1-3 edge cases. The LLM
+  will improvise everything else per turn.
+- **endings** (array of 2-3 endings): Each has {type, trigger, npcFinalLine,
+  branchSetup?}.
+  - type: 'success' | 'failure' | 'branch'
+  - trigger: abstract condition (not a hard counter)
+  - npcFinalLine: leave null — the NPC will improvise
+  - For 'branch' type, branchSetup is REQUIRED: describe the new storyline
+    the NPC opens. Include a branch when the scenario naturally has one
+    (customs, police, interview, etc.) so the conversation can escape a
+    dead-end.
+
+### Legacy taskContract (optional, for fallback)
+You MAY also return the legacy taskContract block. If you do, keep it brief
+(1-2 required slots). The runtime falls back to it only if the new script
+fields are missing or malformed.
 
 ## Other field rules
 **desc**: English task description, CEFR-matched for ${userLevel}.
 **descZh**: Chinese translation of desc (≤30 chars).
 **category**: 2-4 Chinese chars summarizing this scenario variant.
 **npcStatus**: short Chinese phrase for what NPC is doing.
+
+## 千问 DIVERSITY CHECKLIST (read carefully before generating)
+The model is Qwen, which tends to copy example patterns. To force diversity:
+1. NPC names: do NOT reuse names across variants. Use culturally appropriate names.
+2. Opening lines: structure-wise different (e.g. one is a question, one is a
+   statement, one is a request). NOT all "Hi, can I see your X?"
+3. Setting details: vary time of day, queue length, weather, season, mood.
+4. Twists: each variant should have at least one unique complication or surprise.
+5. Do NOT include any example dialogue in the scriptNodes descriptions.
 
 CRITICAL: ALL ${count} scenarios MUST be about the situation: 「${query}」
 
@@ -550,7 +668,27 @@ Return ONLY valid JSON, no markdown:
       "openingLineZh": "<Chinese translation, or null>",
       "environmentalCue": "<Chinese narration, or null>",
       "environmentalCueEn": "<English narration, or null>",
-      "npcSystemPrompt": "<1-2 English sentences>",
+      "npcSystemPrompt": "<1-2 English sentences (legacy, optional)>",
+      "npcPersona": "<5-8 English sentences: BEHAVIOR MODEL with 3-5 concrete 'When X, the NPC does Y' patterns, NOT a generic role label>",
+      "learnerPersona": "<2-3 English sentences>",
+      "interactionRules": ["<rule>", "<rule>", "<MUST include the 3 depth rules: ask 1-2 follow-up sub-beats, bridge naturally, refuse to close on thanks/ok>"],
+      "conversationGoals": [
+        {
+          "id": "<snake_case_id>",
+          "name": "<short Chinese label>",
+          "description": "<1-2 sentences: what the NPC must eventually know / cover. DO NOT write sub-beats.>",
+          "priority": 2,
+          "edgeCases": ["<1-3 realistic frictions the NPC can use to test the learner, e.g. 'Learner fumbles searching for passport' or 'Learner contradicts earlier answer'>"]
+        }
+      ],
+      "endings": [
+        {
+          "type": "success|failure|branch",
+          "trigger": "<abstract condition>",
+          "npcFinalLine": null,
+          "branchSetup": "<required when type=branch: describe the new storyline the NPC opens>"
+        }
+      ],
       "taskContract": {
         "objective": "<one-sentence task objective>",
         "learnerGoal": "<what the learner wants>",
@@ -634,6 +772,77 @@ function mapRawToCard(s: any, id: string, userLevel: string): ScenarioCard {
   const environmentalCue = userInitiates ? (s.environmentalCue || undefined) : undefined;
   const environmentalCueEn = userInitiates ? (s.environmentalCueEn || undefined) : undefined;
 
+  // ── Parse new script-driven fields (2026-09-01) ─────────────────────────
+  // Be defensive: AI may return partial / malformed data. Validate shape and
+  // log what we got vs what we used. The post-validation is intentionally
+  // per-field so we can pinpoint exactly which field the LLM failed to fill.
+  const npcPersona = typeof s.npcPersona === 'string' && s.npcPersona.trim() ? s.npcPersona.trim() : undefined;
+  const learnerPersona = typeof s.learnerPersona === 'string' && s.learnerPersona.trim() ? s.learnerPersona.trim() : undefined;
+  const interactionRules = Array.isArray(s.interactionRules)
+    ? (s.interactionRules as unknown[])
+        .filter((r): r is string => typeof r === 'string' && r.trim().length > 0)
+        .map(r => r.trim())
+    : undefined;
+  const scriptNodes = Array.isArray(s.scriptNodes)
+    ? s.scriptNodes
+        .filter((n: any) => n && typeof n.id === 'string' && typeof n.description === 'string')
+        .map((n: any) => ({
+          id: n.id,
+          name: typeof n.name === 'string' ? n.name : n.id,
+          description: n.description,
+        }))
+    : undefined;
+  const endings = Array.isArray(s.endings)
+    ? s.endings
+        .filter((e: any) => e && (e.type === 'success' || e.type === 'failure' || e.type === 'branch'))
+        .map((e: any) => ({
+          type: e.type,
+          trigger: typeof e.trigger === 'string' ? e.trigger : '',
+          npcFinalLine: typeof e.npcFinalLine === 'string' && e.npcFinalLine.trim() ? e.npcFinalLine : undefined,
+        }))
+    : undefined;
+
+  const hasScriptData = Boolean(npcPersona && learnerPersona && interactionRules && scriptNodes && scriptNodes.length > 0 && endings);
+
+  // Post-validation: log EXACTLY which field is missing so we can spot
+  // LLM under-fill at a glance. `level` is one of "ok" (5/5), "partial"
+  // (some but not all), or "empty" (none of the 5).
+  const missingFields: string[] = [];
+  if (!npcPersona) missingFields.push('npcPersona');
+  if (!learnerPersona) missingFields.push('learnerPersona');
+  if (!interactionRules || interactionRules.length === 0) missingFields.push('interactionRules');
+  if (!scriptNodes || scriptNodes.length === 0) missingFields.push('scriptNodes');
+  if (!endings || endings.length === 0) missingFields.push('endings');
+
+  const completeness = !hasScriptData && missingFields.length === 5
+    ? 'empty'
+    : hasScriptData
+      ? 'ok'
+      : 'partial';
+
+  if (completeness !== 'ok') {
+    // Loud warn so logcat | grep "ScriptIncomplete" surfaces failures fast.
+    console.warn('[ScenarioGenerator] ScriptIncomplete', {
+      id,
+      completeness,
+      missingFields,
+      npcPersonaPresent: !!npcPersona,
+      learnerPersonaPresent: !!learnerPersona,
+      interactionRulesCount: interactionRules?.length ?? 0,
+      scriptNodesCount: scriptNodes?.length ?? 0,
+      endingsCount: endings?.length ?? 0,
+    });
+  } else {
+    console.log('[ScenarioGenerator] mapRawToCard parsed (script path OK)', {
+      id,
+      npcPersonaLen: npcPersona!.length,
+      learnerPersonaLen: learnerPersona!.length,
+      interactionRulesCount: interactionRules!.length,
+      scriptNodesCount: scriptNodes!.length,
+      endingsCount: endings!.length,
+    });
+  }
+
   return {
     id,
     sourceType: 'ai_scenario',
@@ -663,6 +872,13 @@ function mapRawToCard(s: any, id: string, userLevel: string): ScenarioCard {
       environmentalCueEn,
     }, s.taskContract),
     userInitiates,
+    // New script fields — only set if AI provided them; otherwise the runtime
+    // falls back to the legacy npcSystemPrompt + deriveTaskContract path.
+    ...(npcPersona ? { npcPersona } : {}),
+    ...(learnerPersona ? { learnerPersona } : {}),
+    ...(interactionRules ? { interactionRules } : {}),
+    ...(scriptNodes ? { scriptNodes } : {}),
+    ...(endings ? { endings } : {}),
   };
 }
 

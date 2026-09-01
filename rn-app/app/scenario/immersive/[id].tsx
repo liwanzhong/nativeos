@@ -10,12 +10,12 @@ import * as Haptics from 'expo-haptics';
 import {
   ChevronLeft, Settings, Mic, Lightbulb,
   Volume2, X, CheckCircle2, SlidersHorizontal,
-  Zap, Activity, RotateCcw, Star,
+  Zap, Activity, RotateCcw, Star, Send,
 } from 'lucide-react-native';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../../constants/theme';
 import { createCard, deleteCard, findWordCardByTopic, findSentenceCardByTopic, getCardsBySource } from '../../../lib/database';
 import { enterSandbox, recordTurn, exitSandbox } from '../../../lib/session/session-manager';
-import { getSelectedScenario, type ScenarioSourceType } from '../../../lib/ai/scenario-generator';
+import { getSelectedScenario, selectScenario as selectScenarioSave, type ScenarioSourceType } from '../../../lib/ai/scenario-generator';
 import { getNPCReply, generateHints, translateText } from '../../../lib/ai/npc-chat';
 import type { ChatTurn, HintSuggestion, NPCReplyResult } from '../../../lib/ai/npc-chat';
 import { DictionaryLookupSheet, type SaveWordToHistoryPayload } from '../../../components/dictionary/DictionaryLookupSheet';
@@ -33,6 +33,7 @@ import {
   type ConversationRuntimeState,
   type ScenarioTaskContract,
 } from '../../../lib/ai/conversation-runtime';
+import { backfillScriptFields, isLegacyScriptCard } from '../../../lib/ai/script-backfill';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,15 @@ interface ScenarioData {
   environmentalCue?: string;    // Chinese environmental narration
   environmentalCueEn?: string;  // English environmental narration (default display)
   npcStatus?: string;
+
+  // ── Script-driven fields (2026-09-01) ────────────────────────────────────
+  npcPersona?: string;
+  learnerPersona?: string;
+  interactionRules?: string[];
+  scriptNodes?: Array<{ id: string; name: string; description: string; minTurns?: number }>;
+  // 2026-09-01: new agent-loop goal model — preferred over scriptNodes
+  conversationGoals?: Array<{ id: string; name: string; description: string; priority?: number; edgeCases?: string[] }>;
+  endings?: Array<{ type: 'success' | 'failure' | 'branch'; trigger: string; npcFinalLine?: string; branchSetup?: string }>;
 }
 
 interface Message {
@@ -469,10 +479,61 @@ export default function ImmersiveScenarioScreen() {
           title: staged.title,
           npcName: staged.npcName,
           hasPrompt: !!staged.npcSystemPrompt,
+          hasScriptFields: !!(card.npcPersona && card.scriptNodes?.length),
           initMessageRole: staged.initMessages[0]?.role,
           initMessagePreview: staged.initMessages[0]?.text?.slice(0, 80),
         });
         setScenario(staged);
+        // ── Lazy backfill (2026-09-01) ────────────────────────────────────
+        // 老卡（缺 5 字段）异步调 LLM 补全，补完 merge 进 state + 存盘。
+        // 首次进老话题会等 1-3 秒，之后就是新 schema 体验。
+        if (isLegacyScriptCard(card)) {
+          console.log('[Immersive] 老卡检测到, 触发 lazy backfill', {
+            id: card.id,
+            title: card.title,
+          });
+          backfillScriptFields(card).then((result) => {
+            if (cancelled) return;
+            if (!result.success) {
+              console.warn('[Immersive] backfill 失败, 保持 legacy 体验', {
+                id: card.id,
+                reason: result.reason,
+                elapsedMs: result.elapsedMs,
+              });
+              return;
+            }
+            console.log('[Immersive] backfill 成功, 升级到 script-driven', {
+              id: card.id,
+              elapsedMs: result.elapsedMs,
+            });
+            // merge 进 state，让当前对话立刻用上新 prompt
+            setScenario((prev) => prev ? {
+              ...prev,
+              npcPersona: result.npcPersona,
+              learnerPersona: result.learnerPersona,
+              interactionRules: result.interactionRules,
+              scriptNodes: result.scriptNodes,
+              conversationGoals: result.conversationGoals,
+              endings: result.endings,
+            } : prev);
+            // 持久化到 AsyncStorage，下次不再重做
+            selectScenarioSave({
+              ...card,
+              npcPersona: result.npcPersona,
+              learnerPersona: result.learnerPersona,
+              interactionRules: result.interactionRules,
+              scriptNodes: result.scriptNodes,
+              conversationGoals: result.conversationGoals,
+              endings: result.endings,
+            }).catch((e) => {
+              console.warn('[Immersive] backfill 持久化失败', { id: card.id, error: e });
+            });
+          }).catch((e) => {
+            console.error('[Immersive] backfill 异常', { id: card.id, error: e });
+          });
+        } else {
+          console.log('[Immersive] 已带 5 字段, 跳过 backfill', { id: card.id });
+        }
         let restored = await loadHistory(staged.initMessages);
         // Always keep the opening message in sync with the current card (text + translation)
         if (restored.length >= 1 && (restored[0].role === 'npc' || restored[0].role === 'system')) {
@@ -653,6 +714,14 @@ export default function ImmersiveScenarioScreen() {
       taskContract: scenario.taskContract!,
       runtimeState: conversationRuntime,
       npcSystemPrompt: scenario.npcSystemPrompt,
+      // Script-driven fields (2026-09-01) — pass through if present.
+      // npc-chat.ts buildSystemPrompt will route to script path when all 5 are filled.
+      npcPersona: scenario.npcPersona,
+      learnerPersona: scenario.learnerPersona,
+      interactionRules: scenario.interactionRules,
+      scriptNodes: scenario.scriptNodes,
+      conversationGoals: scenario.conversationGoals,
+      endings: scenario.endings,
       history,
       userMessage: text,
       userLevel,
@@ -773,7 +842,27 @@ export default function ImmersiveScenarioScreen() {
     setIsHintLoading(true);
     const history: ChatTurn[] = messagesRef.current.filter(m => m.role !== 'system').map(m => ({ role: m.role as 'npc' | 'user', text: m.text }));
     try {
-      const hints = await generateHints({ scenarioTitle: scenario.title, scenarioCategory: scenario.category, scenarioDesc: scenario.desc, history, taskContract: scenario.taskContract, runtimeState: conversationRuntime, userLevel, environmentalCue: scenario.environmentalCueEn || scenario.environmentalCue });
+      const hints = await generateHints({
+        scenarioTitle: scenario.title,
+        scenarioCategory: scenario.category,
+        scenarioDesc: scenario.desc,
+        history,
+        taskContract: scenario.taskContract,
+        runtimeState: conversationRuntime,
+        userLevel,
+        environmentalCue: scenario.environmentalCueEn || scenario.environmentalCue,
+        // 2026-09-01: pass script-driven fields so hint prompt can target
+        // the current stage and pending slots (instead of producing 3
+        // variations of the same beat). When absent (legacy card before
+        // backfill completes), generateHints falls back to the legacy
+        // "language coach" prompt.
+        npcPersona: scenario.npcPersona,
+        learnerPersona: scenario.learnerPersona,
+        interactionRules: scenario.interactionRules,
+        scriptNodes: scenario.scriptNodes,
+        conversationGoals: scenario.conversationGoals,
+        endings: scenario.endings,
+      });
       setHintOptions(hints);
     } catch { setHintOptions([]); }
     finally { setIsHintLoading(false); }
@@ -918,6 +1007,13 @@ export default function ImmersiveScenarioScreen() {
       taskContract: scenario.taskContract!,
       runtimeState: conversationRuntime,
       npcSystemPrompt: scenario.npcSystemPrompt,
+      // Script-driven fields (2026-09-01)
+      npcPersona: scenario.npcPersona,
+      learnerPersona: scenario.learnerPersona,
+      interactionRules: scenario.interactionRules,
+      scriptNodes: scenario.scriptNodes,
+      conversationGoals: scenario.conversationGoals,
+      endings: scenario.endings,
       history,
       userMessage: textToSend,
       userLevel,
@@ -1512,21 +1608,38 @@ export default function ImmersiveScenarioScreen() {
                 bounces={false}
               >
                 {hintOptions.map(opt => (
-                  <Pressable
+                  <View
                     key={opt.id}
                     style={styles.hintOption}
-                    onPress={() => handleOptionSelect(opt.text)}
                   >
                     <View style={styles.hintOptionMeta}>
                       <Text style={styles.hintOptionTag}>{opt.style}</Text>
                     </View>
                     <Text style={styles.hintOptionText}>{opt.text}</Text>
                     {opt.translation ? <Text style={styles.hintOptionTranslation}>{opt.translation}</Text> : null}
-                    <View style={styles.shadowingBadge}>
-                      <Mic size={11} color="#60A5FA" />
-                      <Text style={styles.shadowingBadgeText}>点击进入全屏跟读</Text>
+                    {/* 底部两按钮:左边进入全屏跟读,右边直接回复(绕过 ASR,用于评估 LLM 实时行为) */}
+                    <View style={styles.hintActionsRow}>
+                      <Pressable
+                        style={styles.shadowingBadge}
+                        onPress={() => handleOptionSelect(opt.text)}
+                        hitSlop={6}
+                      >
+                        <Mic size={11} color="#60A5FA" />
+                        <Text style={styles.shadowingBadgeText}>点击进入全屏跟读</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.sendHintBtn}
+                        onPress={() => {
+                          setShowHintSheet(false);
+                          sendUserMessage(opt.text);
+                        }}
+                        hitSlop={6}
+                      >
+                        <Send size={11} color="#FCD34D" />
+                        <Text style={styles.sendHintBtnText}>按这个回复</Text>
+                      </Pressable>
                     </View>
-                  </Pressable>
+                  </View>
                 ))}
               </ScrollView>
             )}
@@ -1925,6 +2038,10 @@ const styles = StyleSheet.create({
   hintOptionTranslation: { fontSize: 12, color: 'rgba(255,255,255,0.4)', lineHeight: 18 },
   shadowingBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(37,99,235,0.2)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, alignSelf: 'flex-start', marginTop: 4, borderWidth: 1, borderColor: 'rgba(96,165,250,0.3)' },
   shadowingBadgeText: { fontSize: 11, fontWeight: '700' as any, color: '#60A5FA' },
+  // 2026-09-01: hint 卡片底部并排两按钮——左边跟读,右边直接回复(绕过 ASR)
+  hintActionsRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, gap: 8 },
+  sendHintBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(245,158,11,0.18)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999, borderWidth: 1, borderColor: 'rgba(252,211,77,0.35)' },
+  sendHintBtnText: { fontSize: 11, fontWeight: '700' as any, color: '#FCD34D' },
 
   teleprompter: { flex: 1, backgroundColor: 'rgba(15,23,42,0.99)', justifyContent: 'space-between' },
   teleCloseBtn: { marginTop: 52, marginLeft: 20, width: 40, height: 40, borderRadius: 20, backgroundColor: GLASS, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: GLASS_BORDER },

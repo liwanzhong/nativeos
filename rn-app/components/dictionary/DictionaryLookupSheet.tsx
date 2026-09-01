@@ -224,18 +224,26 @@ export function DictionaryLookupSheet({
                         <Text style={styles.senseNumber}>{idx + 1}.</Text>
                       ) : null}
                       <View style={styles.senseBody}>
+                        {/* 2026-09-01: English definition hidden per user request.
+                            Also drop the "译" divider — when only the Chinese
+                            translation is shown, the divider becomes a dead
+                            empty band between the meta row and the translation. */}
+                        {/*
                         {defLines.length > 0 ? (
                           <View style={styles.definitionBlock}>
                             {renderSenseLines(defLines, styles.definitionText)}
                           </View>
                         ) : null}
-                        {defLines.length > 0 && trLines.length > 0 ? (
+                        */}
+                        {/*
+                        {trLines.length > 0 ? (
                           <View style={styles.trDivider}>
                             <View style={styles.trDividerLine} />
                             <Text style={styles.trDividerLabel}>译</Text>
                             <View style={styles.trDividerLine} />
                           </View>
                         ) : null}
+                        */}
                         {trLines.length > 0 ? (
                           <View style={styles.translationBlock}>
                             {renderSenseLines(trLines, styles.definitionZh)}

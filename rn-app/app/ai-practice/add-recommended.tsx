@@ -25,15 +25,17 @@ import {
   Modal,
   ScrollView,
 } from 'react-native';
-import { Stack, useRouter } from 'expo-router';
+import { Stack, useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Plus, X } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../constants/theme';
 import { sectionStyles } from '../../constants/sectionStyles';
 import {
+  buildAiPracticeTopicId,
   buildAiPracticeTopicSnapshot,
   addAiTopicToHome,
+  listHomeAiTopics,
   type AiPracticeHomeOrigin,
 } from '../../lib/ai/ai-practice-user-meta';
 import {
@@ -85,6 +87,31 @@ export default function AiPracticeAddRecommendedPage() {
     setToast(message);
     toastTimer.current = setTimeout(() => setToast(''), 1800);
   }, []);
+
+  // 2026-09-01 bugfix: when user opens this page AFTER having already
+  // added some topics to the home grid (e.g. via /ai-practice/add custom
+  // generator or video-chip push), the [+] button still shows "Add" for
+  // them. The previous code only mutated `addedTopicIds` locally on click,
+  // never re-hydrated from the persistent store on (re-)focus. Pull the
+  // current home topicIds from listHomeAiTopics and seed the Set.
+  useFocusEffect(
+    useCallback(() => {
+      let cancelled = false;
+      (async () => {
+        try {
+          const homeTopics = await listHomeAiTopics();
+          if (cancelled) return;
+          const ids = homeTopics.map((t) => t.topicId);
+          setAddedTopicIds(new Set(ids));
+        } catch (err) {
+          console.warn('[AiPracticeAddRecommended] sync addedTopicIds failed', err);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, []),
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -196,8 +223,26 @@ export default function AiPracticeAddRecommendedPage() {
     }, 100);
   }, [isLoadingMore, displayedCount, filteredItems.length]);
 
+  // 2026-09-01 bugfix: the recommended-page item.topicId is a pre-generated
+  // video id ("video::scene::videosceneenCARDID") from ai-practice-hub. The
+  // home DB, however, stores the snapshot.topicId produced by
+  // buildAiPracticeTopicId — and because handleAdd passes origin='from_recommended'
+  // (NOT 'video'), that id goes through the recommended branch and is
+  // "recommended::level::category::title". Two different keys, no overlap,
+  // every [+] stays "Add" forever. Use the same builder the home write path
+  // uses, so both sides agree on the key.
+  const getItemHomeKey = useCallback((item: VideoAiTopicItem & { sceneId: string; sceneTitle: string }) => {
+    return buildAiPracticeTopicId({
+      card: item.card,
+      origin: 'from_recommended',
+      sourceType: 'recommended_topic',
+      sourceId: item.sceneId,
+    });
+  }, []);
+
   const handleAdd = useCallback(async (item: VideoAiTopicItem & { sceneId: string; sceneTitle: string }) => {
-    if (addedTopicIds.has(item.topicId)) return;
+    const homeKey = getItemHomeKey(item);
+    if (addedTopicIds.has(homeKey)) return;
     try {
       const snapshot = buildAiPracticeTopicSnapshot({
         card: item.card,
@@ -210,7 +255,7 @@ export default function AiPracticeAddRecommendedPage() {
       await addAiTopicToHome({ ...snapshot, homeOrigin: 'from_recommended' as AiPracticeHomeOrigin });
       setAddedTopicIds((prev) => {
         const next = new Set(prev);
-        next.add(item.topicId);
+        next.add(homeKey);
         return next;
       });
       showToast('已加入');
@@ -218,7 +263,7 @@ export default function AiPracticeAddRecommendedPage() {
       console.warn('[AiPracticeAddRecommended] add failed', error);
       Alert.alert('加入失败', '请稍后再试。');
     }
-  }, [addedTopicIds, showToast]);
+  }, [addedTopicIds, showToast, getItemHomeKey]);
 
   return (
     <>
@@ -300,7 +345,8 @@ export default function AiPracticeAddRecommendedPage() {
             </View>
           ) : (
             displayedItems.map((item) => {
-              const added = addedTopicIds.has(item.topicId);
+              const homeKey = getItemHomeKey(item);
+              const added = addedTopicIds.has(homeKey);
               return (
                 <View key={`recommended-${item.topicId}`} style={styles.recommendedCard}>
                   <View style={styles.recommendedCardBody}>
