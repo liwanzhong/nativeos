@@ -104,15 +104,38 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            // ⭐ 2026-08-25: switch release to a real release keystore so OTA
+            // updates don't fail with "chain validation failed" on devices
+            // that were sideloaded with a different debug keystore.
+            // - `release.keystore` is git-ignored (see android/.gitignore).
+            // - Credentials are in `keystore.properties`, also git-ignored.
+            // - For multi-machine builds, mount the keystore via CI secret
+            //   store or copy it to `android/app/release.keystore` on each
+            //   dev box from 1Password / internal secret.
+            if (rootProject.file('keystore.properties').exists()) {
+                def keystoreProperties = new Properties()
+                rootProject.file('keystore.properties').withInputStream { keystoreProperties.load(it) }
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            } else {
+                storeFile file('release.keystore')
+                storePassword 'android'
+                keyAlias 'nativeos'
+                keyPassword 'android'
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            // ⭐ 2026-08-25: sign release with the real release keystore (not
+            // debug.keystore) so devices can verify the OTA update chain.
+            signingConfig signingConfigs.release
             def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
             shrinkResources enableShrinkResources.toBoolean()
             minifyEnabled enableMinifyInReleaseBuilds

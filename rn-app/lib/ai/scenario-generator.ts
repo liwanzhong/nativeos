@@ -4,6 +4,13 @@
  * Integrates invisible FSRS injection (due words → NPC system prompt).
  *
  * PRD §2.3 + §3.2: Feed dynamic task tiles (10-20 per day)
+ *
+ * Script-driven schema (2026-09-01):
+ *   - npcPersona / learnerPersona / interactionRules / scriptNodes / endings
+ *   - Replace the 1-line npcSystemPrompt with a full narrative script so the
+ *     NPC has a real character to play, not just a role label.
+ *   - taskContract is kept as a fallback (deriveTaskContract still runs)
+ *     so any old card without the new fields still works.
  */
 
 import { callAIProxy, callAIProxyStream } from '../api-client';
@@ -16,6 +23,23 @@ export interface StagedScenarioRef {
   id: string;
   sourceType: ScenarioSourceType;
   stagedAt: number;
+}
+
+/**
+ * Script node — narrative description of one beat in the scene.
+ * IMPORTANT: `description` MUST be abstract (约束 + 目标), not example lines.
+ * 千问会把 prompt 里的 example 台词当真实选项照抄。
+ */
+export interface ScriptNode {
+  id: string;             // stable snake_case key, e.g. "check_documents"
+  name: string;           // short Chinese label, e.g. "检查证件"
+  description: string;    // abstract narrative (目标 + 行为边界, NO example dialogue)
+}
+
+export interface ScriptEnding {
+  type: 'success' | 'failure' | 'branch';
+  trigger: string;        // abstract trigger description (not a hard counter)
+  npcFinalLine?: string;  // optional literal line; usually omit so Qwen can improvise
 }
 
 export interface ScenarioCard {
@@ -34,10 +58,19 @@ export interface ScenarioCard {
   openingLineZh?: string;      // Chinese translation of openingLine (pre-generated)
   environmentalCue?: string;   // 环境旁白 (user_first only): Chinese scene narration
   environmentalCueEn?: string; // English version of environmentalCue (default display)
-  npcSystemPrompt?: string;    // Carries invisible FSRS injection + NPC persona
+  npcSystemPrompt?: string;    // Carries invisible FSRS injection + NPC persona (legacy 1-2 line)
   taskContract?: ScenarioTaskContract;
   userInitiates?: boolean;     // true = user speaks first, environmentalCue shown instead
   modelUrl?: string;           // Live2D model path (assets-relative for Android)
+
+  // ── Script-driven fields (2026-09-01) ────────────────────────────────────
+  // If present, npc-chat uses these to build the system prompt. If absent,
+  // it falls back to the legacy npcSystemPrompt + deriveTaskContract path.
+  npcPersona?: string;            // 3-5 sentences: who they are, mood, behavior pattern
+  learnerPersona?: string;        // 2-3 sentences: learner's identity, level, emotional state
+  interactionRules?: string[];    // 3-5 hard rules (e.g. "一次只问一个问题")
+  scriptNodes?: ScriptNode[];     // ordered narrative beats
+  endings?: ScriptEnding[];       // possible endings
 }
 
 interface GeneratorInput {
