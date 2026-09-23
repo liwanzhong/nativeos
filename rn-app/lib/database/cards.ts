@@ -19,6 +19,16 @@ export interface VideoContext {
   thumbUri?: string;
   /** Local file:// URI of an ffmpeg-trimmed video clip for this segment. */
   clipUri?: string;
+  /** V2 — groups N contiguous sentence cards into one review unit. */
+  rangeGroupId?: string;
+  /** V2 — start of the range clip (typically the first segment's startMs). */
+  rangeStartMs?: number;
+  /** V2 — end of the range clip (typically the last segment's endMs). */
+  rangeEndMs?: number;
+  /** V2 — shared ffmpeg clip URI for the whole range. */
+  rangeClipUri?: string;
+  /** V2 — 0-based position within the range group (0..N-1). */
+  rangeOrder?: number;
 }
 
 export interface PracticeContext {
@@ -281,6 +291,148 @@ export async function findSentenceCardByTopic(
 export async function deleteCard(id: string): Promise<void> {
   const db = await getDatabase();
   await db.runAsync('DELETE FROM learning_cards WHERE id = ?', [id]);
+}
+
+// ── V2 range-group API ───────────────────────────────────────────────
+//
+// A range group = N sentence cards created together from one contiguous
+// selection. All cards share `videoContext.rangeGroupId`. Review treats
+// the group as one unit: same clip, same review session, same rating.
+//
+// `getRangeGroupById` returns the group's cards ordered by rangeOrder
+// (falling back to startMs when rangeOrder is missing for migrated rows).
+
+export interface RangeGroup {
+  groupId: string;
+  videoId: string | null;
+  rangeStartMs: number | null;
+  rangeEndMs: number | null;
+  rangeClipUri: string | null;
+  cards: LearningCard[];
+}
+
+/** Pull every card in a range group, sorted by rangeOrder asc. */
+export async function getRangeGroupById(groupId: string): Promise<RangeGroup | null> {
+  const db = await getDatabase();
+  const rows: any[] = await db.getAllAsync(
+    `SELECT id, type, source, content, translation, notes,
+            video_context, practice_context, created_at
+       FROM learning_cards
+      WHERE json_extract(video_context, '$.rangeGroupId') = ?
+      ORDER BY json_extract(video_context, '$.rangeOrder') ASC,
+               json_extract(video_context, '$.startMs') ASC`,
+    [groupId],
+  );
+  if (rows.length === 0) return null;
+  const cards = rows.map((row) => mapRowToCard(row));
+  const first = cards[0];
+  const vc = first.videoContext;
+  return {
+    groupId,
+    videoId: vc?.videoId ?? null,
+    rangeStartMs: vc?.rangeStartMs ?? null,
+    rangeEndMs: vc?.rangeEndMs ?? null,
+    rangeClipUri: vc?.rangeClipUri ?? null,
+    cards,
+  };
+}
+
+/**
+ * Mark every card in a range group reviewed with the same FSRS rating.
+ *
+ * Plan b implementation: each card's initial FSRS state is identical
+ * (createEmptyCard on insert), so calling scheduleReview() in series
+ * with the same rating produces identical due/state/reps. This keeps
+ * the underlying fsrs_reviews table consistent with non-group cards.
+ *
+ * Rating is 1..4 matching scheduleReview().
+ */
+export async function scheduleRangeReview(
+  groupId: string,
+  rating: number,
+): Promise<{ cardIds: string[] }> {
+  const group = await getRangeGroupById(groupId);
+  if (!group) return { cardIds: [] };
+  const { scheduleReview } = await import('./fsrs');
+  for (const card of group.cards) {
+    await scheduleReview(card.id, rating);
+  }
+  return { cardIds: group.cards.map((c) => c.id) };
+}
+
+/**
+ * Get all range groups that are due now (or have no FSRS state yet).
+ * Returns one entry per unique rangeGroupId, plus all non-grouped
+ * sentence cards as their own synthetic groups (groupId = card.id).
+ * Used by the review list + due-count.
+ */
+export async function getDueRangeGroups(opts?: {
+  videoId?: string;
+  type?: 'word' | 'sentence';
+  limit?: number;
+}): Promise<Array<RangeGroup & { dueAt: number | null }>> {
+  const db = await getDatabase();
+  const limit = opts?.limit ?? 500;
+  const now = Date.now();
+  const type = opts?.type ?? 'sentence';
+  const videoFilter = opts?.videoId;
+
+  // Pull every sentence-type card (filtered by video if requested).
+  const rows: any[] = await db.getAllAsync(
+    `SELECT c.id, c.type, c.source, c.content, c.translation, c.notes,
+            c.video_context, c.practice_context, c.created_at,
+            r.due as fsrs_due
+       FROM learning_cards c
+       LEFT JOIN fsrs_reviews r ON r.card_id = c.id
+      WHERE c.type = ?
+        ${videoFilter ? 'AND json_extract(c.video_context, \'$.videoId\') = ?' : ''}
+      ORDER BY c.created_at ASC`,
+    videoFilter ? [type, videoFilter] : [type],
+  );
+  if (rows.length === 0) return [];
+
+  const groups = new Map<string, { cards: LearningCard[]; due: number | null }>();
+  for (const row of rows) {
+    const card = mapRowToCard(row);
+    const vc = card.videoContext;
+    const gid = vc?.rangeGroupId ?? card.id; // synthetic group for singletons
+    const dueRaw = row.fsrs_due as number | null | undefined;
+    const due = dueRaw == null ? 0 : dueRaw;
+    const existing = groups.get(gid);
+    if (!existing) {
+      groups.set(gid, { cards: [card], due });
+    } else {
+      existing.cards.push(card);
+      // Group is due when the EARLIEST card in it is due (worst case).
+      existing.due = Math.min(existing.due ?? due, due);
+    }
+  }
+
+  const out: Array<RangeGroup & { dueAt: number | null }> = [];
+  for (const [gid, { cards: cs, due }] of groups) {
+    const dueMs = due ?? 0;
+    if (dueMs > now) continue; // skip fully-future groups
+    cs.sort((a, b) => {
+      const ao = a.videoContext?.rangeOrder ?? 0;
+      const bo = b.videoContext?.rangeOrder ?? 0;
+      if (ao !== bo) return ao - bo;
+      return (a.videoContext?.startMs ?? 0) - (b.videoContext?.startMs ?? 0);
+    });
+    const first = cs[0];
+    const vc = first.videoContext;
+    out.push({
+      groupId: gid,
+      videoId: vc?.videoId ?? null,
+      rangeStartMs: vc?.rangeStartMs ?? vc?.startMs ?? null,
+      rangeEndMs: vc?.rangeEndMs ?? vc?.endMs ?? null,
+      rangeClipUri: vc?.rangeClipUri ?? null,
+      cards: cs,
+      dueAt: due || null,
+    });
+    if (out.length >= limit) break;
+  }
+  out.sort((a, b) => (a.dueAt ?? 0) - (b.dueAt ?? 0));
+  return out;
 }
 
 export async function updateCardNotes(id: string, notes: string): Promise<void> {

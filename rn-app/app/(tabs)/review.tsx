@@ -13,9 +13,10 @@ import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../const
 import { sectionStyles } from '../../constants/sectionStyles';
 import {
   getAllCards, getDueCards, getCardCount, getDueCardCount,
-  deleteCard, updateCardNotes,
+  deleteCard, updateCardNotes, getDueRangeGroups,
 } from '../../lib/database';
 import type { LearningCard } from '../../lib/database/cards';
+import type { RangeGroup } from '../../lib/database/cards';
 
 export default function ReviewScreen() {
   const router = useRouter();
@@ -26,6 +27,7 @@ export default function ReviewScreen() {
   const filtered = Boolean(videoFilter);
 
   const [cards, setCards] = useState<LearningCard[]>([]);
+  const [groups, setGroups] = useState<Array<RangeGroup & { dueAt: number | null }>>([]);
   const [dueCount, setDueCount] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -40,16 +42,19 @@ export default function ReviewScreen() {
           getDueCardCountByVideo(videoFilter, typeFilter),
         ]);
         setCards(all);
+        setGroups([]);
         setDueCount(dueN);
         setTotalCount(all.length);
       } else {
-        const [all, dueN, totalN] = await Promise.all([
+        const [all, dueGroups, dueN, totalN] = await Promise.all([
           getAllCards(),
+          getDueRangeGroups({ type: typeFilter ?? 'sentence', limit: 500 }),
           getDueCardCount(),
           getCardCount(),
         ]);
         setCards(all);
-        setDueCount(dueN);
+        setGroups(dueGroups);
+        setDueCount(dueGroups.length);
         setTotalCount(totalN);
       }
     } finally {
@@ -109,6 +114,12 @@ export default function ReviewScreen() {
       },
     ]);
   }, [refresh]);
+
+  // V2 — jump straight into group-mode review session.
+  const handleOpenGroup = useCallback((g: RangeGroup & { dueAt: number | null }) => {
+    const query: Record<string, string> = { groupId: g.groupId };
+    router.push('/review-session', query);
+  }, [router]);
 
   return (
     <View style={styles.container}>
@@ -181,14 +192,29 @@ export default function ReviewScreen() {
           ) : cards.length === 0 ? (
             <EmptyState />
           ) : (
-            cards.map((c) => (
-              <CardRow
-                key={c.id}
-                card={c}
-                onEdit={beginEdit}
-                onDelete={handleDelete}
-              />
-            ))
+            <>
+              {/* V2 — collapse N contiguous cards in the same range group
+                  into one row so review treats them as a single unit. */}
+              {groups.map((g) => (
+                <GroupRow
+                  key={`g_${g.groupId}`}
+                  group={g}
+                  onEdit={beginEdit}
+                  onDelete={handleDelete}
+                  onOpen={handleOpenGroup}
+                />
+              ))}
+              {cards
+                .filter((c) => !c.videoContext?.rangeGroupId)
+                .map((c) => (
+                  <CardRow
+                    key={c.id}
+                    card={c}
+                    onEdit={beginEdit}
+                    onDelete={handleDelete}
+                  />
+                ))}
+            </>
           )}
         </View>
       </ScrollView>
@@ -328,6 +354,87 @@ function CardRow({
   );
 }
 
+// V2 — one row per range group. Same swipe-to-edit/delete as CardRow,
+// but the row represents N sentences and the content preview joins the
+// first sentence with "…(N-1 more)". Tapping the row jumps straight to
+// the group-mode review session.
+function GroupRow({
+  group, onEdit, onDelete, onOpen,
+}: {
+  group: RangeGroup & { dueAt: number | null };
+  onEdit: (c: LearningCard) => void;
+  onDelete: (c: LearningCard) => void;
+  onOpen: (g: RangeGroup & { dueAt: number | null }) => void;
+}) {
+  const due = group.dueAt;
+  const first = group.cards[0];
+  const showTranslation = !(first.source === 'ai_practice' && first.type === 'sentence');
+  const swipeRef = useRef<Swipeable>(null);
+  const thumbUri = first.videoContext?.thumbUri;
+  const coverUri = first.videoContext?.coverUri;
+  const heroUri = thumbUri ?? coverUri ?? null;
+  const n = group.cards.length;
+  const isRangeGroup = n > 1;
+  const previewContent = isRangeGroup
+    ? `${first.content} · 等 ${n} 句`
+    : first.content;
+
+  const renderRightActions = () => (
+    <View style={styles.swipeActions}>
+      <Pressable
+        style={[styles.swipeAction, styles.swipeEdit]}
+        onPress={() => { swipeRef.current?.close(); onEdit(first); }}
+      >
+        <Edit3 size={18} color="#fff" />
+      </Pressable>
+      <Pressable
+        style={[styles.swipeAction, styles.swipeDelete]}
+        onPress={() => { swipeRef.current?.close(); onDelete(first); }}
+      >
+        <Trash2 size={18} color="#fff" />
+      </Pressable>
+    </View>
+  );
+
+  return (
+    <Swipeable ref={swipeRef} renderRightActions={renderRightActions} overshootRight={false}>
+      <Pressable
+        style={[styles.row, isRangeGroup && styles.rowGroup]}
+        onPress={() => onOpen(group)}
+      >
+        <View style={{ flex: 1 }}>
+          <View style={styles.rowMetaRow}>
+            <Text style={styles.rowType}>
+              {isRangeGroup ? `区间 ${n} 句` : (first.type === 'word' ? '单词' : '句子')}
+            </Text>
+            <View style={styles.sourceTag}>
+              {first.source === 'video'
+                ? <Video size={10} color={colors.text.tertiary} />
+                : <MessageCircle size={10} color={colors.text.tertiary} />
+              }
+              <Text style={styles.sourceTagText}>
+                {first.source === 'video' ? '视频' : '陪练'}
+              </Text>
+            </View>
+            {typeof due === 'number' ? (
+              <Text style={styles.rowDue}>{formatDueRelative(due)}</Text>
+            ) : null}
+          </View>
+          <Text style={styles.rowContent} numberOfLines={2}>{previewContent}</Text>
+          {showTranslation ? (
+            <Text style={styles.rowTranslation} numberOfLines={1}>
+              {first.translation || '(未填翻译)'}
+            </Text>
+          ) : null}
+        </View>
+        {heroUri ? (
+          <Image source={{ uri: heroUri }} style={styles.rowThumb} resizeMode="cover" />
+        ) : null}
+      </Pressable>
+    </Swipeable>
+  );
+}
+
 function formatDueRelative(dueMs: number): string {
   const now = Date.now();
   const diffMs = dueMs - now;
@@ -394,9 +501,18 @@ const styles = StyleSheet.create({
   listSection: { gap: 12 },
 
   row: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: colors.surface, padding: 14, borderRadius: 12, marginBottom: 8,
-    borderWidth: 1, borderColor: colors.border.light,
+    flexDirection: 'row',
+    backgroundColor: colors.surface,
+    padding: 14,
+    borderRadius: 12,
+    marginBottom: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: colors.border.light,
+  },
+  rowGroup: {
+    borderColor: '#CBD5E1',
+    backgroundColor: '#F8FAFC',
   },
   rowMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   rowType: { fontSize: 10, color: colors.text.tertiary, fontWeight: '700' as any, letterSpacing: 0.5 },

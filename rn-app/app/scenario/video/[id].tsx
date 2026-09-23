@@ -1,14 +1,14 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Alert, AppState, type AppStateStatus, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ScrollView, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem } from 'react-native';
+import { Alert, AppState, type AppStateStatus, View, Text, StyleSheet, Pressable, FlatList, ActivityIndicator, Platform, Modal, useWindowDimensions, Image, ScrollView, ToastAndroid, type StyleProp, type TextStyle, type ListRenderItem, TextInput, KeyboardAvoidingView } from 'react-native';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { VideoView, useVideoPlayer } from 'expo-video';
 import * as Haptics from 'expo-haptics';
-import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RefreshCw, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical, BarChart3 } from 'lucide-react-native';
+import { ChevronDown, ChevronLeft, ChevronUp, PlayCircle, PauseCircle, RefreshCw, RotateCcw, Clapperboard, Languages, Gauge, SkipBack, SkipForward, Star, Maximize, Minimize, Mic, Headphones, MessageCircle, X, MoreVertical, BarChart3, Repeat, BookmarkPlus } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { colors, spacing, borderRadius, fontSize, fontWeight } from '../../../constants/theme';
 import { getVideoSceneById, getVideoSceneSummaryById, invalidateVideoSceneCaches, type VideoSceneDetail, type VideoSceneSegment, type WordTiming } from '../../../lib/content/video-scenes';
-import { getOrCreateClipThumb } from '../../../lib/clip-thumbnail';
-import { extractVideoClip, deleteClipSegment } from '../../../lib/media/ffmpeg-clip';
+import { getOrCreateClipThumb, getOrCreateRangeStartThumb } from '../../../lib/clip-thumbnail';
+import { extractVideoClip, deleteClipSegment, extractRangeClip, deleteRangeClip, getCachedRangeClipUri } from '../../../lib/media/ffmpeg-clip';
 import { selectScenario, type ScenarioCard } from '../../../lib/ai/scenario-generator';
 import { buildAiPracticeTopicSnapshot, markAiPracticeTopicUsed } from '../../../lib/ai/ai-practice-user-meta';
 import { startVolcASR, type ASRHandle } from '../../../lib/volcengine/asr';
@@ -185,6 +185,18 @@ function formatClipRelativeTime(ms: number, clipStartMs: number) {
   return formatPlaybackTime(Math.max(0, ms - clipStartMs));
 }
 
+// V2 — deterministic id for a range group. Same video + same start/end
+// ms always hashes to the same id, so a re-favorite or repeat import
+// naturally joins existing rows instead of creating duplicates.
+function rangeGroupIdFor(videoId: string, startMs: number, endMs: number): string {
+  const key = `${videoId}|${Math.round(startMs)}|${Math.round(endMs)}`;
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) {
+    h = ((h << 5) + h + key.charCodeAt(i)) | 0;
+  }
+  return `rg_${(h >>> 0).toString(36)}`;
+}
+
 type SubtitlePanelTabKey = 'subtitles' | 'words' | 'favorites';
 
 type WebOrientationLock =
@@ -333,9 +345,12 @@ const SegmentCard = memo(function SegmentCard({
   isFavorited,
   subtitleMode,
   positionMs,
+  isInRangeStart,
+  isInRangeEnd,
   onSeek,
   onMeasure,
   onToggleFavorite,
+  onLongPressRow,
   onWordPress,
   onShadowingPress,
 }: {
@@ -346,17 +361,32 @@ const SegmentCard = memo(function SegmentCard({
   isFavorited: boolean;
   subtitleMode: 'bilingual' | 'english';
   positionMs: number;
+  isInRangeStart?: boolean;
+  isInRangeEnd?: boolean;
   onSeek: (index: number) => void;
   onMeasure: (index: number, y: number) => void;
   onToggleFavorite: (segmentId: string) => void;
+  onLongPressRow?: (index: number) => void;
   onWordPress?: (word: WordTiming, segmentText: string, segmentId?: string) => void;
   onShadowingPress?: () => void;
 }) {
+  const isInSelection = isInRangeStart || isInRangeEnd;
   return (
     <Pressable
-      style={[styles.segmentCard, isActive && styles.segmentCardActive]}
+      style={[
+        styles.segmentCard,
+        isActive && styles.segmentCardActive,
+        isInSelection && styles.segmentCardInRange,
+        isInRangeStart && styles.segmentCardRangeStart,
+        isInRangeEnd && styles.segmentCardRangeEnd,
+      ]}
       onLayout={(e) => { onMeasure(index, e.nativeEvent.layout.y); }}
       onPress={() => onSeek(index)}
+      onLongPress={onLongPressRow ? (event) => {
+        event.stopPropagation?.();
+        onLongPressRow(index);
+      } : undefined}
+      delayLongPress={350}
     >
       <View style={styles.segmentCardTopRow}>
         <Text style={[styles.segmentTime, isActive && styles.segmentTimeActive]}>{formatClipRelativeTime(segment.startMs, clipStartMs)}</Text>
@@ -590,8 +620,26 @@ function VideoLearningPlayer({
   const [playbackRate, setPlaybackRate] = useState(1);
   const [isRateSheetOpen, setIsRateSheetOpen] = useState(false);
   const [isBackgroundAudioEnabled, setIsBackgroundAudioEnabled] = useState(false);
+  const [isRepeatCountSheetOpen, setIsRepeatCountSheetOpen] = useState(false);
+  const [customRepeatInput, setCustomRepeatInput] = useState('');
   const [repeatSentence, setRepeatSentence] = useState(false);
   const [lockedRepeatRange, setLockedRepeatRange] = useState<{ startSeconds: number; endSeconds: number } | null>(null);
+  // ── V1 selection / repeat-count ───────────────────────────────────────
+  // selectedRange: contiguous slice of scene.segments picked by the user
+  // via long-press + tap. null when no selection is active.
+  const [selectedRange, setSelectedRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  // 'off' | 'loop' (∞) | 'count' (N times). Independent of repeatSentence
+  // so the toolbar can render the upcoming mode even before the user
+  // commits to a count.
+  type RepeatMode = 'off' | 'loop' | 'count';
+  const [repeatMode, setRepeatMode] = useState<RepeatMode>('off');
+  // Remaining count for 'count' mode. null when 'loop' or 'off'.
+  // Held in a ref so the timeUpdate listener (whose deps array already
+  // has 11 entries) does NOT re-subscribe on every decrement.
+  const remainingRepeatCountRef = useRef<number | null>(null);
+  // Active count shown to the user via the toolbar button label.
+  const [activeRepeatCount, setActiveRepeatCount] = useState<number | null>(null);
+  // ──────────────────────────────────────────────────────────────────────
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isFullscreenHudVisible, setIsFullscreenHudVisible] = useState(true);
   const [fullscreenHudBottomHeight, setFullscreenHudBottomHeight] = useState(0);
@@ -1343,18 +1391,71 @@ function VideoLearningPlayer({
   const clearRepeatSentence = useCallback(() => {
     setRepeatSentence(false);
     setLockedRepeatRange(null);
+    remainingRepeatCountRef.current = null;
+    setActiveRepeatCount(null);
   }, []);
 
+  // Repeats the current selection (if any) or falls back to the active
+  // segment. Mode comes from `repeatMode` (off | loop | count).
   const handleToggleRepeatSentence = useCallback(() => {
     if (repeatSentence) {
       clearRepeatSentence();
       return;
     }
-    const nextRange = getSegmentRepeatRange(activeSegmentIndex);
-    if (!nextRange) return;
-    setLockedRepeatRange(nextRange);
+    const sIdx = selectedRange?.startIndex ?? activeSegmentIndex;
+    const eIdx = selectedRange?.endIndex ?? activeSegmentIndex;
+    const startSeg = scene.segments[sIdx];
+    const endSeg = scene.segments[eIdx];
+    if (!startSeg || !endSeg) return;
+    setLockedRepeatRange({
+      startSeconds: startSeg.startMs / 1000,
+      endSeconds: endSeg.endMs / 1000,
+    });
+    if (repeatMode === 'count' && activeRepeatCount && activeRepeatCount > 0) {
+      remainingRepeatCountRef.current = activeRepeatCount;
+    } else {
+      // 'loop' or 'off' treated as infinite for this commit
+      remainingRepeatCountRef.current = null;
+      setRepeatMode('loop');
+    }
     setRepeatSentence(true);
-  }, [activeSegmentIndex, clearRepeatSentence, getSegmentRepeatRange, repeatSentence]);
+  }, [activeRepeatCount, activeSegmentIndex, clearRepeatSentence, repeatMode, repeatSentence, scene.segments, selectedRange]);
+
+  // Toolbar handler that cycles between off / loop (∞) / count (open sheet).
+  const handleOpenRepeatModeSheet = useCallback(() => {
+    if (repeatSentence) {
+      // Tapping while repeating: loop → open count sheet; count → off.
+      if (repeatMode === 'loop') {
+        setIsRepeatCountSheetOpen(true);
+      } else {
+        clearRepeatSentence();
+      }
+    } else {
+      // Off → turn on loop (∞) with the current selection or active segment.
+      setRepeatMode('loop');
+      handleToggleRepeatSentence();
+    }
+  }, [clearRepeatSentence, handleToggleRepeatSentence, repeatMode, repeatSentence]);
+
+  // Apply user-typed N (1..999). Bounded so the count stays sane for
+  // V1; 0 / negative / non-numeric all silently fall back to no-op.
+  const applyCustomRepeatCount = useCallback((raw: string) => {
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n < 1 || n > 999) {
+      if (Platform.OS === 'android') {
+        ToastAndroid.show('请输入 1–999 之间的整数', ToastAndroid.SHORT);
+      } else {
+        Alert.alert('次数无效', '请输入 1–999 之间的整数');
+      }
+      return;
+    }
+    setRepeatMode('count');
+    setActiveRepeatCount(n);
+    remainingRepeatCountRef.current = n;
+    setCustomRepeatInput('');
+    setIsRepeatCountSheetOpen(false);
+    if (!repeatSentence) handleToggleRepeatSentence();
+  }, [handleToggleRepeatSentence, repeatSentence]);
 
   useEffect(() => {
     const statusSub = player.addListener('statusChange', (event: any) => {
@@ -1472,6 +1573,25 @@ function VideoLearningPlayer({
       }
       if (player.playing && nextCurrentTime >= effectiveEnd) {
         if (repeatSentence && shadowingReplayEnd === null) {
+          // N-count mode: decrement first; if we just played the last
+          // allowed loop, park at rangeEnd and clear repeat state.
+          const r = remainingRepeatCountRef.current;
+          if (typeof r === 'number') {
+            if (r <= 1) {
+              pausePlayerSafely(player);
+              player.currentTime = effectiveEnd;
+              setRepeatSentence(false);
+              setLockedRepeatRange(null);
+              remainingRepeatCountRef.current = null;
+              setActiveRepeatCount(null);
+              shadowingReplayRangeRef.current = null;
+              return;
+            }
+            remainingRepeatCountRef.current = r - 1;
+            setActiveRepeatCount(r - 1);
+            player.currentTime = rewindStart;
+            return;
+          }
           player.currentTime = rewindStart;
           return;
         }
@@ -1778,6 +1898,32 @@ function VideoLearningPlayer({
     segmentYPositions.current[index] = y;
   }, []);
 
+  // ── V1 selection handlers ────────────────────────────────────────────
+  // Long-press a row: set selection anchor. If a selection already
+  // exists, treat the long-press as a cancel+restart (user wants a
+  // new range).
+  const handleSegmentLongPress = useCallback((index: number) => {
+    setSelectedRange({ startIndex: index, endIndex: index });
+  }, []);
+
+  // When a row is tapped while a selection is open, the tap becomes
+  // the range end. The existing `onSeek` callback is left untouched
+  // because other call sites (prev/next buttons, word cards, dict
+  // sheet) still want seek behavior.
+  const handleSegmentTapWithRange = useCallback((index: number) => {
+    setSelectedRange((prev) => {
+      if (!prev) return null;
+      const startIndex = Math.min(prev.startIndex, index);
+      const endIndex = Math.max(prev.startIndex, index);
+      return { startIndex, endIndex };
+    });
+  }, []);
+
+  const handleClearSelectedRange = useCallback(() => {
+    setSelectedRange(null);
+  }, []);
+  // ─────────────────────────────────────────────────────────────────────
+
   // Toggles a sentence card in FSRS for the given segment. The star UI on
   // both the subtitle card and the dictionary sheet's "当前字幕" box goes
   // through this — they reflect the same SQLite state.
@@ -1886,6 +2032,112 @@ function VideoLearningPlayer({
     }
     await loadVideoCards();
   }, [scene, sentenceCardBySegmentId, loadVideoCards, videoPlaybackUri]);
+
+  // ── V1 range favorite ────────────────────────────────────────────────
+  // Mirror of handleToggleSentenceCard but for a contiguous range. One
+  // ffmpeg clip is produced for the whole range, and every sentence in
+  // the range that isn't already favorited gets its own learning_cards
+  // row pointing at the shared clipUri / thumbUri.
+  const handleToggleRangeFavorite = useCallback(async (startIndex: number, endIndex: number) => {
+    const s = Math.max(0, Math.min(startIndex, endIndex));
+    const e = Math.min(scene.segments.length - 1, Math.max(startIndex, endIndex));
+    const segments = scene.segments.slice(s, e + 1);
+    if (segments.length === 0) return;
+
+    // Only operate on sentences not already favorited.
+    const pending = segments
+      .map((seg, i) => ({ ...seg, rangeOrder: i }))
+      .filter((seg) => !sentenceCardBySegmentId.has(seg.id));
+    if (pending.length === 0) {
+      // Entire range already favorited → no-op for V1. (V2: bulk un-favorite.)
+      if (Platform.OS === 'android') {
+        ToastAndroid.show('已收藏过这一段', ToastAndroid.SHORT);
+      } else {
+        Alert.alert('已收藏', '这一段中的每句话都已经收藏过了');
+      }
+      return;
+    }
+
+    const rangeStartMs = segments[0].startMs;
+    const rangeEndMs = segments[segments.length - 1].endMs;
+
+    let ffmpegSourceUri: string | null = null;
+    if (videoPlaybackUri && videoPlaybackUri.startsWith('file://')) {
+      ffmpegSourceUri = videoPlaybackUri;
+    } else if (scene.videoUri) {
+      ffmpegSourceUri = await getCachedVideoUri(scene.id, scene.videoUri);
+    }
+    const isLocalCached = !!ffmpegSourceUri;
+
+    let rangeThumbUri: string | undefined;
+    let rangeClipUri: string | undefined;
+    let needDownloadHint = false;
+
+    if (isLocalCached && ffmpegSourceUri) {
+      const cachedClip = await getCachedRangeClipUri(scene.id, rangeStartMs, rangeEndMs);
+      if (cachedClip) {
+        rangeClipUri = cachedClip;
+      } else {
+        const captured = await getOrCreateRangeStartThumb(scene.id, rangeStartMs, ffmpegSourceUri);
+        rangeThumbUri = captured ?? undefined;
+        const clipped = await extractRangeClip({
+          videoId: scene.id,
+          startMs: rangeStartMs,
+          endMs: rangeEndMs,
+          sourceUri: ffmpegSourceUri,
+        });
+        rangeClipUri = clipped ?? undefined;
+      }
+    } else {
+      needDownloadHint = true;
+    }
+
+    for (const seg of pending) {
+      await createCard({
+        type: 'sentence',
+        source: 'video',
+        content: seg.text,
+        translation: seg.textZh ?? '',
+        videoContext: {
+          videoId: scene.id,
+          sceneId: scene.id,
+          segmentId: seg.id,
+          startMs: seg.startMs,
+          endMs: seg.endMs,
+          coverUri: scene.coverImageUri ?? undefined,
+          thumbUri: rangeThumbUri,
+          clipUri: rangeClipUri,
+          // V2 — tag every card in the range with the same group id so
+          // review can treat them as one unit. groupId = deterministic
+          // hash of videoId + rangeStartMs + rangeEndMs; stable across
+          // re-runs so a repeat import / re-favorite produces the same
+          // id and naturally merges with existing rows.
+          rangeGroupId: rangeGroupIdFor(scene.id, rangeStartMs, rangeEndMs),
+          rangeStartMs,
+          rangeEndMs,
+          rangeClipUri,
+          rangeOrder: seg.rangeOrder,
+        },
+      });
+    }
+
+    if (needDownloadHint) {
+      if (Platform.OS === 'android') {
+        ToastAndroid.show(
+          `已加入 FSRS ${pending.length} 条,下载视频后可补封面`,
+          ToastAndroid.SHORT,
+        );
+      } else {
+        Alert.alert(
+          '已加入 FSRS',
+          `已收藏 ${pending.length} 条句子。视频尚未下载到本地,卡片中暂不包含视频片段。下载视频后重新收藏即可补上。`,
+        );
+      }
+    }
+
+    await loadVideoCards();
+  }, [scene, sentenceCardBySegmentId, loadVideoCards, videoPlaybackUri]);
+  // ─────────────────────────────────────────────────────────────────────
 
   const handleWordPress = useCallback((word: WordTiming, segmentText: string, segmentId?: string) => {
     wasPlayingBeforeLookupRef.current = isPlaying;
@@ -2425,6 +2677,8 @@ function VideoLearningPlayer({
 
   const renderSegmentItem = useCallback<ListRenderItem<VideoSceneSegment>>(({ item, index }) => {
     const isActive = index === activeSegmentIndex;
+    const isInRangeStart = selectedRange?.startIndex === index;
+    const isInRangeEnd = selectedRange?.endIndex === index;
     return (
       <SegmentCard
         segment={item}
@@ -2434,18 +2688,23 @@ function VideoLearningPlayer({
         isFavorited={sentenceCardBySegmentId.has(item.id)}
         subtitleMode={subtitleMode}
         positionMs={isActive ? listActivePositionMs : 0}
-        onSeek={handleSeekSentence}
+        isInRangeStart={isInRangeStart}
+        isInRangeEnd={isInRangeEnd}
+        onSeek={selectedRange ? handleSegmentTapWithRange : handleSeekSentence}
         onMeasure={handleMeasureSegment}
         onToggleFavorite={handleToggleSentenceCard}
+        onLongPressRow={handleSegmentLongPress}
         onWordPress={handleWordPress}
         onShadowingPress={() => handleOpenShadowing(index)}
       />
     );
-  }, [activeSegmentIndex, clipStartMs, sentenceCardBySegmentId, handleMeasureSegment, handleOpenShadowing, handleSeekSentence, handleToggleSentenceCard, handleWordPress, listActivePositionMs, subtitleMode]);
+  }, [activeSegmentIndex, clipStartMs, sentenceCardBySegmentId, handleMeasureSegment, handleOpenShadowing, handleSegmentLongPress, handleSegmentTapWithRange, handleSeekSentence, handleToggleSentenceCard, handleWordPress, listActivePositionMs, selectedRange, subtitleMode]);
 
   const renderFavoriteSegmentItem = useCallback<ListRenderItem<VideoSceneSegment>>(({ item }) => {
     const originalIndex = segmentIndexById.get(item.id) ?? 0;
     const isActive = originalIndex === activeSegmentIndex;
+    const isInRangeStart = selectedRange?.startIndex === originalIndex;
+    const isInRangeEnd = selectedRange?.endIndex === originalIndex;
     return (
       <SegmentCard
         segment={item}
@@ -2455,14 +2714,17 @@ function VideoLearningPlayer({
         isFavorited={sentenceCardBySegmentId.has(item.id)}
         subtitleMode={subtitleMode}
         positionMs={isActive ? listActivePositionMs : 0}
-        onSeek={handlePlaySegmentOnce}
+        isInRangeStart={isInRangeStart}
+        isInRangeEnd={isInRangeEnd}
+        onSeek={selectedRange ? handleSegmentTapWithRange : handlePlaySegmentOnce}
         onMeasure={() => {}}
         onToggleFavorite={handleToggleSentenceCard}
+        onLongPressRow={handleSegmentLongPress}
         onWordPress={handleWordPress}
         onShadowingPress={() => handleOpenShadowing(originalIndex)}
       />
     );
-  }, [activeSegmentIndex, clipStartMs, sentenceCardBySegmentId, handleOpenShadowing, handlePlaySegmentOnce, handleToggleSentenceCard, handleWordPress, listActivePositionMs, segmentIndexById, subtitleMode]);
+  }, [activeSegmentIndex, clipStartMs, sentenceCardBySegmentId, handleOpenShadowing, handleSegmentLongPress, handleSegmentTapWithRange, handlePlaySegmentOnce, handleToggleSentenceCard, handleWordPress, listActivePositionMs, selectedRange, segmentIndexById, subtitleMode]);
 
   // Tap a word card → seek to its source segment + open dictionary sheet
   const handleOpenWordCard = useCallback((card: any) => {
@@ -2707,6 +2969,24 @@ function VideoLearningPlayer({
         </View>
       ) : null}
 
+      {selectedRange ? (
+        <View style={styles.selectionBar}>
+          <Text style={styles.selectionBarText}>
+            已选 {selectedRange.endIndex - selectedRange.startIndex + 1} 句
+            {(() => {
+              const startSeg = scene.segments[selectedRange.startIndex];
+              const endSeg = scene.segments[selectedRange.endIndex];
+              if (!startSeg || !endSeg) return '';
+              const totalSec = Math.max(0, Math.round((endSeg.endMs - startSeg.startMs) / 1000));
+              return `  ·  ${formatClipRelativeTime(startSeg.startMs, clipStartMs)}–${formatClipRelativeTime(endSeg.endMs, clipStartMs)}  ·  ${totalSec}s`;
+            })()}
+          </Text>
+          <Pressable hitSlop={8} onPress={handleClearSelectedRange}>
+            <X size={16} color="#475569" />
+          </Pressable>
+        </View>
+      ) : null}
+
       <View style={styles.subtitlePanelTabWrap}>
         <View style={styles.subtitlePanelTabRow}>
           <Pressable
@@ -2896,6 +3176,38 @@ function VideoLearningPlayer({
               <Mic size={16} color="#334155" />
               <Text style={[styles.toolText, !hasSubtitleSegments && styles.toolTextDisabled]}>{hasSubtitleSegments ? '视频跟练' : '等待字幕'}</Text>
             </Pressable>
+            <Pressable
+              style={[styles.toolBtn, repeatSentence && styles.toolBtnActive, !hasSubtitleSegments && styles.toolBtnDisabled]}
+              onPress={handleOpenRepeatModeSheet}
+              onLongPress={hasSubtitleSegments ? () => setIsRepeatCountSheetOpen(true) : undefined}
+              delayLongPress={400}
+              disabled={!hasSubtitleSegments}
+            >
+              <Repeat size={16} color={repeatSentence ? '#2563EB' : '#334155'} />
+              <Text style={[styles.toolText, repeatSentence && styles.toolTextActive, !hasSubtitleSegments && styles.toolTextDisabled]}>
+                {repeatSentence
+                  ? repeatMode === 'count' && activeRepeatCount != null
+                    ? `再播 ${activeRepeatCount} 遍`
+                    : '循环这一段'
+                  : selectedRange
+                    ? '循环所选'
+                    : '循环当前'}
+              </Text>
+            </Pressable>
+            <Pressable
+              style={[styles.toolBtn, !selectedRange && styles.toolBtnDisabled]}
+              onPress={() => {
+                if (selectedRange) {
+                  void handleToggleRangeFavorite(selectedRange.startIndex, selectedRange.endIndex);
+                }
+              }}
+              disabled={!selectedRange}
+            >
+              <BookmarkPlus size={16} color={selectedRange ? '#334155' : '#94A3B8'} />
+              <Text style={[styles.toolText, !selectedRange && styles.toolTextDisabled]}>
+                {selectedRange ? `收藏 ${selectedRange.endIndex - selectedRange.startIndex + 1} 句` : '收藏一段'}
+              </Text>
+            </Pressable>
             <Pressable style={[styles.toolBtn, isGeneratingVideoAiPractice && styles.toolBtnDisabled]} onPress={() => {
               if (isGeneratingVideoAiPractice) {
                 setIsVideoAiPickerVisible(true);
@@ -2969,6 +3281,85 @@ function VideoLearningPlayer({
           </View>
         </View>
       ) : null}
+
+      <Modal
+        visible={isRepeatCountSheetOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIsRepeatCountSheetOpen(false)}
+      >
+        <KeyboardAvoidingView
+          style={styles.sheetOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        >
+          <Pressable style={{ flex: 1 }} onPress={() => setIsRepeatCountSheetOpen(false)} />
+          <View style={styles.customSheet}>
+            <View style={styles.customSheetHandle} />
+            <View style={styles.customSheetHeader}>
+              <Text style={styles.customSheetTitle}>循环次数</Text>
+              <Pressable onPress={() => setIsRepeatCountSheetOpen(false)}>
+                <X size={20} color={colors.text.secondary} />
+              </Pressable>
+            </View>
+            <View style={{ paddingHorizontal: spacing.md, paddingBottom: spacing.lg, gap: spacing.sm }}>
+              <Text style={{ color: colors.text.secondary, fontSize: fontSize.sm }}>
+                {selectedRange
+                  ? `当前已选 ${selectedRange.endIndex - selectedRange.startIndex + 1} 句`
+                  : '当前循环当前句'}
+              </Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: spacing.sm }}>
+                {[2, 3, 5, 10].map((n) => (
+                  <Pressable
+                    key={n}
+                    style={[styles.repeatCountChip, activeRepeatCount === n && styles.repeatCountChipActive]}
+                    onPress={() => {
+                      setRepeatMode('count');
+                      setActiveRepeatCount(n);
+                      remainingRepeatCountRef.current = n;
+                      setIsRepeatCountSheetOpen(false);
+                      if (!repeatSentence) handleToggleRepeatSentence();
+                    }}
+                  >
+                    <Text style={[styles.repeatCountChipText, activeRepeatCount === n && styles.repeatCountChipTextActive]}>{n} 次</Text>
+                  </Pressable>
+                ))}
+                <Pressable
+                  style={[styles.repeatCountChip, repeatMode === 'loop' && styles.repeatCountChipActive]}
+                  onPress={() => {
+                    setRepeatMode('loop');
+                    setActiveRepeatCount(null);
+                    remainingRepeatCountRef.current = null;
+                    setIsRepeatCountSheetOpen(false);
+                    if (!repeatSentence) handleToggleRepeatSentence();
+                  }}
+                >
+                  <Text style={[styles.repeatCountChipText, repeatMode === 'loop' && styles.repeatCountChipTextActive]}>无限</Text>
+                </Pressable>
+              </View>
+              <View style={styles.repeatCustomRow}>
+                <TextInput
+                  style={styles.repeatCustomInput}
+                  value={customRepeatInput}
+                  onChangeText={setCustomRepeatInput}
+                  keyboardType="number-pad"
+                  placeholder="自定义 1–999"
+                  placeholderTextColor="#94A3B8"
+                  maxLength={3}
+                  returnKeyType="done"
+                  onSubmitEditing={() => applyCustomRepeatCount(customRepeatInput)}
+                />
+                <Pressable
+                  style={[styles.repeatCustomApplyBtn, !customRepeatInput && styles.repeatCustomApplyBtnDisabled]}
+                  onPress={() => applyCustomRepeatCount(customRepeatInput)}
+                  disabled={!customRepeatInput}
+                >
+                  <Text style={[styles.repeatCustomApplyBtnText, !customRepeatInput && styles.repeatCustomApplyBtnTextDisabled]}>确定</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
 
       {lookupWord ? (
         <DictionaryLookupSheet
@@ -4170,6 +4561,60 @@ const styles = StyleSheet.create({
     fontWeight: fontWeight.bold,
     textDecorationLine: 'underline',
   },
+  repeatCountChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: borderRadius.full,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    backgroundColor: '#F8FAFC',
+  },
+  repeatCountChipActive: {
+    borderColor: colors.primary,
+    backgroundColor: '#EFF6FF',
+  },
+  repeatCountChipText: {
+    color: '#475569',
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.bold,
+  },
+  repeatCountChipTextActive: {
+    color: colors.primary,
+  },
+  repeatCustomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  repeatCustomInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    borderRadius: borderRadius.full,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    color: '#0F172A',
+    fontSize: fontSize.sm,
+    backgroundColor: '#F8FAFC',
+  },
+  repeatCustomApplyBtn: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.sm,
+    borderRadius: borderRadius.full,
+    backgroundColor: colors.primary,
+  },
+  repeatCustomApplyBtnText: {
+    color: '#FFFFFF',
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.bold,
+  },
+  repeatCustomApplyBtnDisabled: {
+    backgroundColor: '#CBD5E1',
+  },
+  repeatCustomApplyBtnTextDisabled: {
+    color: '#F1F5F9',
+  },
   loadingContainer: {
     flex: 1,
     backgroundColor: '#F5F7FB',
@@ -4893,6 +5338,22 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 1.4,
   },
+  selectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    backgroundColor: '#F0FDF4',
+    borderBottomWidth: 1,
+    borderBottomColor: '#86EFAC',
+  },
+  selectionBarText: {
+    color: '#166534',
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.bold,
+    flex: 1,
+  },
   subtitlePanelTabWrap: {
     marginBottom: spacing.xs,
   },
@@ -4947,6 +5408,18 @@ const styles = StyleSheet.create({
   segmentCardActive: {
     backgroundColor: '#EFF6FF',
     borderColor: '#93C5FD',
+  },
+  segmentCardInRange: {
+    backgroundColor: '#F0FDF4',
+    borderColor: '#86EFAC',
+  },
+  segmentCardRangeStart: {
+    borderTopWidth: 2,
+    borderTopColor: '#16A34A',
+  },
+  segmentCardRangeEnd: {
+    borderBottomWidth: 2,
+    borderBottomColor: '#16A34A',
   },
   segmentCardTopRow: {
     flexDirection: 'row',
@@ -5122,6 +5595,9 @@ const styles = StyleSheet.create({
     color: '#0F172A',
     fontSize: fontSize.xs,
     fontWeight: fontWeight.bold,
+  },
+  toolTextActive: {
+    color: '#2563EB',
   },
   toolTextDisabled: {
     color: '#94A3B8',

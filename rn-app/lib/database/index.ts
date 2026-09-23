@@ -77,6 +77,25 @@ export async function deleteCard(id: string) {
   return fn(id);
 }
 
+export async function getRangeGroupById(groupId: string) {
+  const { getRangeGroupById: fn } = await import('./cards');
+  return fn(groupId);
+}
+
+export async function scheduleRangeReview(groupId: string, rating: number) {
+  const { scheduleRangeReview: fn } = await import('./cards');
+  return fn(groupId, rating);
+}
+
+export async function getDueRangeGroups(opts?: {
+  videoId?: string;
+  type?: 'word' | 'sentence';
+  limit?: number;
+}) {
+  const { getDueRangeGroups: fn } = await import('./cards');
+  return fn(opts);
+}
+
 export async function updateCardNotes(id: string, notes: string) {
   const { updateCardNotes: fn } = await import('./cards');
   return fn(id, notes);

@@ -42,6 +42,11 @@ function getThumbKey(videoId: string, segmentId: string): string {
   return `${safeVid}__${safeSid}.jpg`;
 }
 
+function getRangeThumbKey(videoId: string, startMs: number): string {
+  const safeVid = videoId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `${safeVid}__range_${Math.round(startMs)}.jpg`;
+}
+
 /**
  * If a cached thumbnail exists for this (videoId, segmentId), return
  * its file URI. Otherwise return null (caller may or may not want to
@@ -136,6 +141,65 @@ export async function getOrCreateClipThumb(
     return target.uri;
   } catch (err) {
     console.warn('[ClipThumb] expo-video-thumbnails failed', { error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
+}
+
+/**
+ * Same shape as `getOrCreateClipThumb` but keyed by `startMs` instead of
+ * `segmentId`. Used when a multi-segment selection (range) is being
+ * favorited and every sentence card in the range should share the same
+ * still-frame preview.
+ */
+export async function getOrCreateRangeStartThumb(
+  videoId: string,
+  startMs: number,
+  sourceUrl: string,
+): Promise<string | null> {
+  console.log('[ClipThumb] getOrCreateRangeStartThumb start', { videoId, startMs, sourceUrl: sourceUrl.slice(0, 120) });
+
+  const dir = ensureClipThumbsDir();
+  const target = new File(dir, getRangeThumbKey(videoId, startMs));
+  const targetUri = target.uri;
+  const isRemote = sourceUrl.startsWith('http://') || sourceUrl.startsWith('https://');
+
+  if (target.exists && (target.size ?? 0) > 0) {
+    console.log('[ClipThumb] range thumb cache hit', { targetUri });
+    return targetUri;
+  }
+
+  if (isRemote) {
+    try {
+      await extractVideoFrame({
+        sourceUri: sourceUrl,
+        targetUri,
+        captureMs: Math.max(0, Math.floor(startMs)),
+        logLabel: 'ClipThumb.range',
+      });
+      const saved = new File(targetUri);
+      if (saved.exists && (saved.size ?? 0) > 0) {
+        return targetUri;
+      }
+    } catch (err) {
+      console.warn('[ClipThumb] range ffmpeg failed', { error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  try {
+    const result = await getThumbnailAsync(sourceUrl, {
+      time: Math.max(0, Math.floor(startMs)),
+      quality: 0.7,
+    });
+    if (!result?.uri) return null;
+    if (target.exists) target.delete();
+    const srcFile = new File(result.uri);
+    if (!srcFile.exists) {
+      return result.uri;
+    }
+    srcFile.move(target);
+    return target.uri;
+  } catch (err) {
+    console.warn('[ClipThumb] range expo-video-thumbnails failed', { error: err instanceof Error ? err.message : String(err) });
     return null;
   }
 }
