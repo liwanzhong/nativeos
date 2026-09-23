@@ -1,0 +1,43 @@
+name: Sync from Gitee (cron)
+
+on:
+  # Every 5 minutes
+  schedule:
+    - cron: '*/5 * * * *'
+  # Manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Gitee & push if ahead
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -e
+          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/kanglefu/nativeos.git
+          git fetch gitee master
+          GH_SHA=$(git rev-parse HEAD)
+          GT_SHA=$(git rev-parse gitee/master)
+          echo "GitHub HEAD: $GH_SHA"
+          echo "Gitee  HEAD: $GT_SHA"
+          if [ "$GH_SHA" = "$GT_SHA" ]; then
+            echo "Already in sync, nothing to do."
+            exit 0
+          fi
+          # Fast-forward only. If GitHub has divergent commits we stop and log.
+          if git merge-base --is-ancestor HEAD gitee/master; then
+            git merge gitee/master --ff-only
+            git push origin master
+            echo "Synced Gitee -> GitHub."
+          else
+            echo "ERROR: GitHub HEAD is not an ancestor of Gitee/master."
+            echo "Resolve manually before next sync."
+            exit 1
+          fi
