@@ -51,26 +51,13 @@ NativeOS 想做一件不一样的事:把"看"变成"用"。
 
 ## 看图
 
-![](docs/imgs/01.jpg)
-![](docs/imgs/02.jpg)
-![](docs/imgs/03.jpg)
-![](docs/imgs/04.jpg)
+<p><img src="docs/imgs/01.jpg" width="22%" alt=""><img src="docs/imgs/02.jpg" width="22%" alt=""><img src="docs/imgs/03.jpg" width="22%" alt=""><img src="docs/imgs/04.jpg" width="22%" alt=""></p>
 
-![](docs/imgs/05.jpg)
-![](docs/imgs/06.jpg)
-![](docs/imgs/07.jpg)
-![](docs/imgs/08.jpg)
+<p><img src="docs/imgs/05.jpg" width="22%" alt=""><img src="docs/imgs/06.jpg" width="22%" alt=""><img src="docs/imgs/07.jpg" width="22%" alt=""><img src="docs/imgs/08.jpg" width="22%" alt=""></p>
 
-![](docs/imgs/09.jpg)
-![](docs/imgs/10.jpg)
-![](docs/imgs/11.jpg)
-![](docs/imgs/12.jpg)
+<p><img src="docs/imgs/09.jpg" width="22%" alt=""><img src="docs/imgs/10.jpg" width="22%" alt=""><img src="docs/imgs/11.jpg" width="22%" alt=""><img src="docs/imgs/12.jpg" width="22%" alt=""></p>
 
-![](docs/imgs/13.jpg)
-![](docs/imgs/14.jpg)
-![](docs/imgs/15.jpg)
-![](docs/imgs/16.jpg)
-
+<p><img src="docs/imgs/13.jpg" width="22%" alt=""><img src="docs/imgs/14.jpg" width="22%" alt=""><img src="docs/imgs/15.jpg" width="22%" alt=""><img src="docs/imgs/16.jpg" width="22%" alt=""></p>
 
 ## 怎么开始
 
@@ -87,8 +74,16 @@ NativeOS 想做一件不一样的事:把"看"变成"用"。
 
 跑 App 的命令:`setup.ps1`(一次),然后 `dev-start.ps1`(日常)。
 
-## 现在到哪了
+**源代码**:
+[GitHub](https://github.com/liwanzhong/nativeos) · [Gitee](https://gitee.com/kanglefu/nativeos)(国内镜像)
 
-App 已经上生产,`versionName 1.0.49 / versionCode 151`。开发分支在做 V2 pivot:把"一段收藏生成多张卡"改成"一段=一张卡",更符合用户对收藏的直觉。
+## 下一步
+
+我们要做的:
+
+- **网页版**。在浏览器里也能练口语,不用装 App。
+- **Pad 版**。大屏适配,跟读和 AI 对练更舒服。
+- **更多英语学习视频资源**。官方内容库继续扩,导入自己的视频也更容易。
+- **优化划词词典**。让点词查词更快、更准,覆盖更多词。
 
 
